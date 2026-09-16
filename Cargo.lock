@@ -37,6 +37,7 @@ dependencies = [
  "axum",
  "chrono",
  "futures",
+ "libc",
  "reqwest",
  "rusqlite",
  "serde",

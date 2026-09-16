@@ -27,6 +27,12 @@
 # What is run is the LAUNCHER, not the agent (hard constraint #14): the fetch
 # happens first, and the launcher ends in `exec`, so the payload replaces this
 # shell and the loop below restarts it when it exits.
+#
+# The agent starts and stops its own `goose serve`, under this: the agent owns
+# goose (goose.acp.serve: own), and this loop owns the agent. One restart
+# mechanism per level. A goose this agent did not start is a refusal at boot,
+# not something to adopt - so if this host ran goose by hand before, stop it
+# before the first run of a payload that owns goose.
 set -uo pipefail
 
 # Where this host keeps its checkout of the repository. Overridable so the same

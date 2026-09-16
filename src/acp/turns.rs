@@ -232,6 +232,15 @@ async fn die(connection: &Connection) {
     let mut slot = connection.client.lock().await;
     *slot = None;
     connection.live.store(false, Ordering::Relaxed);
+    discard_sessions(connection);
+}
+
+/// Empties the session pool, for a caller that already holds the client lock.
+///
+/// A session is only meaningful on the connection that opened it, so the two
+/// always go together - and both the paths that lose a connection take them
+/// together here rather than one of them forgetting to.
+fn discard_sessions(connection: &Connection) {
     let discarded = connection.pool.lock().expect(POOL_POISONED).clear();
     if discarded > 0 {
         tracing::info!(
@@ -448,7 +457,23 @@ async fn connect_or_reuse(
 ) -> Result<Arc<AcpClient>, TurnError> {
     let mut slot = connection.client.lock().await;
     if let Some(client) = slot.as_ref() {
-        return Ok(Arc::clone(client));
+        if client.is_alive() {
+            return Ok(Arc::clone(client));
+        }
+        // The connection-level stream has ended, so goose has forgotten this
+        // connection id: it is not that a request failed, it is that this
+        // connection no longer exists, and the next request on it would be
+        // answered `404` over healthy HTTP. A supervised `goose serve` restart
+        // is the ordinary way that happens now, so the turn that follows one
+        // reconnects here rather than surfacing a 404 to its caller.
+        tracing::info!(
+            "the ACP connection has ended (goose restarted?): reconnecting, which starts a fresh \
+             session per context - the conversation stays in goose's own sessions.db, but the \
+             model does not carry it into the new session"
+        );
+        *slot = None;
+        connection.live.store(false, Ordering::Relaxed);
+        discard_sessions(connection);
     }
     // Held across the connect on purpose: two turns arriving on a cold cache
     // should produce one connection, not two racing `initialize`s. Nothing needs

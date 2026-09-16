@@ -10,7 +10,9 @@
 # Startup fails loudly - never partially - on: a loopback `server.publicUrl`, a
 # missing `goose.defaults.allowedRoots`, an unrecognised `card.protocolVersion`,
 # an empty resolvable skill set, duplicate skill ids, a `skills.default` naming
-# an unknown id, a malformed recipe, and `goose` not being found on PATH.
+# an unknown id, a malformed recipe, `goose` not being found on PATH, and — with
+# `goose.acp.serve: own` — a `goose.acp.url` goose could not be started on, no
+# key to start it with, or an address something is already listening on.
 
 server:
   # Loopback by default. A Tailscale address is the usual override: the dialer is
@@ -59,17 +61,53 @@ skills:
 
 goose:
   acp:
-    # The ACP endpoint on the host's `goose serve`. Either spelling works and
-    # both are dialled the same: with the path (as here) or as the bare origin
-    # `http://127.0.0.1:3284`. A path prefix survives, so a proxy in front of
-    # goose is spelled and dialled as written.
+    # The ACP endpoint. Either spelling works and both are dialled the same:
+    # with the path (as here) or as the bare origin `http://127.0.0.1:3284`. A
+    # path prefix survives, so a proxy in front of goose is spelled and dialled
+    # as written.
+    #
+    # With `serve: own` below this is also the *address the agent starts goose
+    # on* - it is read as `--host`/`--port` - so it is held to what goose will
+    # actually bind: plain http, an IPv4 loopback (`127.0.0.1`: goose answers
+    # `invalid socket address syntax` to `localhost` and to `::1`), and the bare
+    # `/acp` endpoint with no prefix and no query. A URL that fails any of those
+    # is a startup refusal naming the field, because the alternative is a child
+    # serving on one address while every turn dials another.
     url: "http://127.0.0.1:3284/acp"
     # Name of the variable holding goose's X-Secret-Key (GOOSE_SERVER__SECRET_KEY).
-    # This is read, and sent as `X-Secret-Key` on every ACP request. Unset or
-    # empty means no header, which is right for a goose started with
-    # `--dangerously-unauthenticated`; goose answers 401 if it wanted one.
+    # This is read and sent as `X-Secret-Key` on every ACP request - and, with
+    # `serve: own`, the value is also handed to the child as goose's own
+    # GOOSE_SERVER__SECRET_KEY, because goose reads it from the environment and
+    # accepts no other name. Unset or empty means no header, which is right for a
+    # goose started with `--dangerously-unauthenticated`; goose answers 401 if it
+    # wanted one.
     secretEnv: "GOOSE_SERVER__SECRET_KEY"
+    # Who starts `goose serve`.
+    #
+    # `own` (the default) means this agent starts it, restarts it when it dies
+    # (1s, doubling, capped at 30s), and **refuses to start** if something is
+    # already listening on the address above. Nothing is served until goose has
+    # answered `initialize`, so "the agent is up, goose is not" is not a state a
+    # caller can reach. A host that already runs a goose by hand is told so at
+    # boot instead of being quietly served by a process the agent does not
+    # control.
+    #
+    # `external` means the host starts goose itself (an init unit, systemd, by
+    # hand) and this agent only dials it. That is the configuration in which the
+    # agent really can come up with goose missing and answer every turn with an
+    # error, and it is only right when something else owns goose's lifecycle.
+    serve: "own"
+    # Only meaningful with `serve: own`, and only for a goose with no key.
+    # goose refuses to start without GOOSE_SERVER__SECRET_KEY unless it is given
+    # `--dangerously-unauthenticated`, and "no key and no flag" is a startup
+    # refusal here too (the message quotes goose). Setting this passes that flag,
+    # so anything able to reach the loopback bind is accepted and the bind is the
+    # whole boundary. A deliberate act, not a fallback.
+    unauthenticated: false
     timeouts:
+      # The ceiling on `initialize` - and, with `serve: own`, the readiness
+      # deadline for a starting goose (measured: 74ms from spawn to answering,
+      # so this is headroom, not a wait).
       initializeSecs: 10
       # A turn is an agent loop, not a request: this is the ceiling for a whole
       # `session/prompt`, so it is minutes, not seconds.

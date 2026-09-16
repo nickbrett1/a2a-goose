@@ -25,10 +25,11 @@ is quoted in each file; the sanitised S3 frames are committed as
 | [S11](S11.md) | Does the emitted launcher resolve the right triple and fail open? | **NOT RUN** — needs a host and a real release |
 | [S12](S12.md) | Does the published binary run on the target host? | **NOT RUN** — needs both hosts and a release |
 | [S13](S13.md) | Is `a2a-rs` wire-compatible with LiteLLM's A2A routes? | **PASS** — the framing agrees; the *card* needs work on our side |
+| [S14](S14.md) | Does the agent really own `goose serve`? | **PASS on this box** — starts, gates, restarts, refuses; a host is [S8](S8.md)/[S12](S12.md) |
 
 ## What the spikes changed
 
-Six spikes changed the plan or this repo. They are the ones worth reading:
+Seven spikes changed the plan or this repo. They are the ones worth reading:
 
 - **S2** — cost control changes shape, twice over. goose 1.50.x cannot carry a
   per-session trace id upstream, **and** LiteLLM 1.103.0 silently drops
@@ -60,6 +61,15 @@ Six spikes changed the plan or this repo. They are the ones worth reading:
   legacy `/.well-known/agent.json`) could not be confirmed — the container has no
   route to the agent, which is [S9](S9.md)'s question. Not a §12.6 escalation;
   the card work is ours.
+- **S14** — the deploy tree shipped one unit, the launcher's, and **nothing
+  started `goose serve`**: on reboot the agent came back, served a card, accepted
+  calls and failed every turn with `connection refused` on `:3284` — a
+  healthy-looking agent that could not answer. The fix is not a second unit (one
+  restart mechanism per level): the **agent owns goose as a child**, checks the
+  address before it binds, and refuses to start rather than adopt a server it did
+  not start. It also turned `goose.acp.url` into a contract — the address is
+  *dialled* and the child is *started from it*, so with `serve: own` it must be
+  `http` on an IPv4 loopback with the bare `/acp` path.
 - **S7** — `A2A-Version` is **decorative**: the pinned server never reads it, so
   a caller without the header is indistinguishable from one with it. That voids
   the risk it was gating — and also voids the plan's implied "a wrong version

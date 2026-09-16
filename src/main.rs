@@ -16,9 +16,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use a2a_goose::acp::AcpTurns;
-use a2a_goose::config::Config;
+use a2a_goose::config::{Config, ServeMode};
 use a2a_goose::goose::{Goose, MIN_GOOSE_VERSION};
 use a2a_goose::registry::Registry;
+use a2a_goose::serve::{ServeState, ServeStatus, Supervisor};
 use a2a_goose::server::Agent;
 use a2a_goose::skills::SkillSet;
 use a2a_goose::turn::Turns;
@@ -68,6 +69,26 @@ async fn run() -> anyhow::Result<()> {
     // "authenticated" and means it (constraint #3).
     let token: Arc<str> = Arc::from(config.bearer_token()?.as_str());
 
+    // The ACP server this agent runs on, started *before* a port is bound and
+    // not returned from until goose answers `initialize`. That ordering is the
+    // point of owning the process: an agent that binds first and finds out
+    // later can advertise skills and accept calls while failing every turn,
+    // which is exactly what the first host did after a reboot (nothing had
+    // started `goose serve`, and nothing said so).
+    let supervisor = match config.goose.acp.serve {
+        ServeMode::Own => Some(Supervisor::start(&config, &goose).await?),
+        ServeMode::External => {
+            tracing::info!(
+                acp = %config.goose.acp.url,
+                "goose.acp.serve is external: this host starts goose itself. Nothing is spawned \
+                 and nothing is checked, so an agent that comes up without it will answer every \
+                 turn with an error"
+            );
+            None
+        }
+    };
+    let serve_status = supervisor.as_ref().map(Supervisor::status);
+
     let addr: std::net::SocketAddr = config.server.bind.parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, url = %config.server.public_url, "a2a-goose listening");
@@ -87,6 +108,7 @@ async fn run() -> anyhow::Result<()> {
     let turns: Arc<dyn Turns> = Arc::new(AcpTurns::new(Arc::clone(&config)));
     tracing::info!(
         acp = %config.goose.acp.url,
+        serve = config.goose.acp.serve.as_str(),
         // Whether goose will want a key is only knowable by asking it, but
         // whether this process *has* one is knowable now — and a host that is
         // about to run every turn into a 401 should hear about it at boot
@@ -101,6 +123,10 @@ async fn run() -> anyhow::Result<()> {
         config.card.protocol_version.clone(),
     );
 
+    if let Some(status) = &serve_status {
+        give_up_if_goose_will_not_stay_up(Arc::clone(status));
+    }
+
     let agent = Arc::new(Agent {
         config: (*config).clone(),
         skills: Arc::new(skills),
@@ -109,6 +135,7 @@ async fn run() -> anyhow::Result<()> {
         goose,
         registry: registry.clone(),
         turns,
+        serve: serve_status,
         started: Instant::now(),
     });
 
@@ -116,10 +143,47 @@ async fn run() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
+    // Stop the process this one started, before this one goes. The watcher is
+    // what stops it; this is what makes the *attempt*, so a shutdown does not
+    // leave a goose holding the port (and the host's recipes) under a dead
+    // agent. `SIGTERM` first, then a grace period - see `serve::stop_child`.
+    if let Some(supervisor) = supervisor {
+        supervisor.shutdown().await;
+    }
+
     // Clean shutdown only, and never a liveness mechanism: OOM, a host sleep or
     // a wedged process all skip this, which is exactly why the sweeper exists.
     registry.deregister().await;
     Ok(())
+}
+
+/// Ends this process when the goose it started is given up on.
+///
+/// A goose that cannot stay up means an agent that cannot serve, and a card
+/// nobody can call is worse than an agent that is visibly down - so this is a
+/// deliberate `exit(1)` rather than a degraded mode that keeps advertising
+/// skills. The restart is the init system's job (launchd `KeepAlive`, DSM's
+/// boot wrapper), and its throttle is what paces the attempt: hard constraint
+/// #9's split, this process supervising goose and the init system supervising
+/// this process.
+///
+/// Abrupt on purpose: goose is already gone, the A2A surface has nothing to
+/// deregister *with*, and a graceful path here would only be a slower way to
+/// the same exit code.
+fn give_up_if_goose_will_not_stay_up(status: Arc<ServeStatus>) {
+    tokio::spawn(async move {
+        let mut states = status.subscribe();
+        while states.changed().await.is_ok() {
+            if let ServeState::GaveUp { exits, window_secs } = *states.borrow() {
+                tracing::error!(
+                    exits,
+                    window_secs,
+                    "goose serve is gone for good: exiting so the init system starts this host over"
+                );
+                std::process::exit(1);
+            }
+        }
+    });
 }
 
 /// Resolves when the supervisor asks us to stop.

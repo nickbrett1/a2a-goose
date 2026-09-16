@@ -48,9 +48,10 @@
   <string>/Users/nick/Projects/a2a-goose</string>
 
   <!-- goose has to be resolvable from this PATH: the agent's first act is to
-       verify it (src/goose.rs), and a launchd job does not inherit the shell's
-       PATH. Both install locations are listed because the goose installer and
-       Homebrew disagree about where goose goes. -->
+       verify it (src/goose.rs), and with goose.acp.serve: own the agent then
+       spawns it - the child inherits this environment, so this PATH is the one
+       the ACP server is started from. Both install locations are listed because
+       the goose installer and Homebrew disagree about where goose goes. -->
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
@@ -61,7 +62,13 @@
   <true/>
 
   <!-- Restart on any exit, which is also what makes a crash-restart re-run the
-       fetch: the payload is `exec`ed, so its exit is this process's exit. -->
+       fetch: the payload is `exec`ed, so its exit is this process's exit.
+
+       The agent starts and stops its own `goose serve` underneath this, which is
+       the other half of the boot story: launchd supervises the agent, the agent
+       supervises goose. launchd's default (AbandonProcessGroup unset) is to kill
+       the job's remaining processes when the job exits, which is the backstop
+       for an agent that was SIGKILLed and never got to stop its child. -->
   <key>KeepAlive</key>
   <true/>
 
