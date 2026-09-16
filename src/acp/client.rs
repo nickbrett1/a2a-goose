@@ -99,6 +99,26 @@ pub fn resolve_cwd(config: &Config, requested: Option<&str>) -> Result<PathBuf, 
     })
 }
 
+/// Resolves `goose.acp.secretEnv` to the key goose is expecting, if this process
+/// has one.
+///
+/// The config names the variable and never holds the value (secrets are only ever
+/// named — `*Env` fields), so this lookup *is* the feature. It was missing until
+/// mac-studio (2026-09-16): the field parsed, nothing read it, no `X-Secret-Key`
+/// was ever sent, and the only way to run the release against a key-protected
+/// `goose serve` was `--dangerously-unauthenticated`.
+///
+/// `None` is a legitimate answer, not a misconfiguration to refuse: whether goose
+/// wants a key is goose's decision, and it says so with a 401 that names the
+/// header — which beats this process guessing and refusing to start.
+pub fn secret_key(acp: &AcpConfig) -> Option<String> {
+    let name = acp.secret_env.trim();
+    if name.is_empty() {
+        return None;
+    }
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
 /// The connection to `goose serve`, plus the timeouts from config.
 pub struct AcpClient {
     transport: Arc<Transport>,
@@ -110,7 +130,9 @@ impl AcpClient {
     pub async fn connect(acp: &AcpConfig) -> Result<Self, AcpError> {
         let timeout = Duration::from_secs(acp.timeouts.initialize_secs);
         Ok(Self {
-            transport: Arc::new(Transport::connect(&acp.url, timeout).await?),
+            transport: Arc::new(
+                Transport::connect(&acp.url, secret_key(acp).as_deref(), timeout).await?,
+            ),
             timeouts: acp.timeouts.clone(),
         })
     }
@@ -242,6 +264,58 @@ mod tests {
         config.goose.defaults.allowed_roots = vec![root.to_path_buf()];
         config.goose.defaults.cwd = root.to_path_buf();
         config
+    }
+
+    /// `secretEnv` names a variable, and this is the lookup that turns the name
+    /// into the key. It is tested because it was *missing*: the field parsed and
+    /// nothing read it, so no request ever carried `X-Secret-Key` and a
+    /// key-protected goose answered 401 to every turn (mac-studio, 2026-09-16).
+    #[test]
+    fn the_named_variable_is_what_is_read_not_the_name_itself() {
+        // `PATH` rather than a variable this test invents: a process that got as
+        // far as running cargo has one, it is not a secret, and reading it needs
+        // no `set_var` — which is unsafe in edition 2024 and would race every
+        // other test in this binary.
+        let path = std::env::var("PATH").expect("a process running cargo has a PATH");
+        let named = AcpConfig {
+            secret_env: "PATH".to_string(),
+            ..AcpConfig::default()
+        };
+        assert_eq!(
+            secret_key(&named).as_deref(),
+            Some(path.as_str()),
+            "the value behind the name is the key, never the name"
+        );
+
+        // The name is trimmed, because it comes from a YAML file a human edits.
+        let padded = AcpConfig {
+            secret_env: "  PATH  ".to_string(),
+            ..AcpConfig::default()
+        };
+        assert_eq!(
+            secret_key(&padded).as_deref(),
+            Some(path.as_str()),
+            "surrounding whitespace is not part of a variable's name"
+        );
+    }
+
+    #[test]
+    fn a_name_that_resolves_to_nothing_is_no_key() {
+        // Naming a blank variable, or one that is not set, is how a host says
+        // "goose here is unauthenticated". It is not a reason to refuse to
+        // start: whether goose wants a key is goose's answer to give, and a 401
+        // names the header and settles it faster than this process guessing.
+        let blank = AcpConfig {
+            secret_env: "   ".to_string(),
+            ..AcpConfig::default()
+        };
+        assert_eq!(secret_key(&blank), None, "whitespace names no variable");
+
+        let unset = AcpConfig {
+            secret_env: "A2A_GOOSE_SURELY_NOT_SET_9f3a".to_string(),
+            ..AcpConfig::default()
+        };
+        assert_eq!(secret_key(&unset), None, "an unset variable is no key");
     }
 
     /// A unique scratch directory, removed when the test ends.

@@ -174,6 +174,12 @@ pub fn status_payload(agent: &Agent) -> Value {
             },
             "inFlight": agent.turns.in_flight(),
             "url": agent.config.goose.acp.url,
+            // Whether this process found the key `secretEnv` names. Not the key
+            // — whether there is one. A host that is about to send every turn
+            // into a 401 can see that here rather than inferring it from a log
+            // it may not be reading; the header is only attached when this is
+            // true.
+            "secretSet": crate::acp::secret_key(&agent.config.goose.acp).is_some(),
         },
         "registry": agent.registry.state(),
         "sessions": {

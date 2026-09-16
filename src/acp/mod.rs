@@ -29,9 +29,10 @@ pub mod pool;
 pub mod transport;
 pub mod turns;
 
-pub use client::{AcpClient, CwdError, Session, resolve_cwd};
+pub use client::{AcpClient, CwdError, Session, resolve_cwd, secret_key};
 pub use pool::{Acquired, Claim, Idle, Pool};
 pub use transport::{
-    ACP_PATH, AcpError, CONNECTION_ID_HEADER, SESSION_ID_HEADER, Scope, Transport,
+    ACP_PATH, AcpError, CONNECTION_ID_HEADER, SECRET_HEADER, SESSION_ID_HEADER, Scope, Transport,
+    acp_endpoint,
 };
 pub use turns::AcpTurns;

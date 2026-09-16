@@ -63,6 +63,17 @@ fi
 # uploaded and fetched and then quietly never packed.
 for target in aarch64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
   if [ -d "build/$target" ]; then
+    # The payload has to be executable at the far end, and the bit does not
+    # survive the trip here: the build step's `cp` and the release step's
+    # `curl -o` both create the file under this machine's umask. A tarball
+    # packed without this shipped `-rw-r--r--`, and the launcher on a cold host
+    # refused to start it — "nothing executable at
+    # .../current/bin/a2a-goose" (mac-studio, 2026-09-16). Pack time is the
+    # durable place to normalise it: this file is app-owned and never
+    # regenerated, unlike the generated step that produced the file.
+    if [ -d "build/$target/bin" ]; then
+      find "build/$target/bin" -type f -exec chmod 0755 {} +
+    fi
     tar -czf "$OUT_DIR/a2a-goose-$target.tar.gz" -C "build/$target" .
     echo "packaged build/$target/ as a2a-goose-$target.tar.gz"
   else

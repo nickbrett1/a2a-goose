@@ -31,7 +31,11 @@ steps:
         rustup target add "aarch64-apple-darwin"
         cargo build --release --locked --target "aarch64-apple-darwin"
         if [ -f "target/aarch64-apple-darwin/release/a2a-goose" ]; then
-          cp "target/aarch64-apple-darwin/release/a2a-goose" "build/aarch64-apple-darwin/bin/"
+          # `install -m` rather than `cp`: the mode has to still be there when the
+          # tarball is packed, and the release step fetches this artifact back
+          # over HTTP, which carries no permissions at all (mac-studio,
+          # 2026-09-16 — the launcher refused a payload it could not exec).
+          install -m 0755 "target/aarch64-apple-darwin/release/a2a-goose" "build/aarch64-apple-darwin/bin/"
         else
           echo "target/aarch64-apple-darwin/release/a2a-goose was not produced. Name the cargo package a2a-goose, or copy your binary into build/aarch64-apple-darwin/bin/ here." >&2
         fi
@@ -73,7 +77,7 @@ steps:
         apt-get update && apt-get install -y --no-install-recommends musl-tools:amd64
         cargo build --release --locked --target "x86_64-unknown-linux-musl"
         if [ -f "target/x86_64-unknown-linux-musl/release/a2a-goose" ]; then
-          cp "target/x86_64-unknown-linux-musl/release/a2a-goose" "build/x86_64-unknown-linux-musl/bin/"
+          install -m 0755 "target/x86_64-unknown-linux-musl/release/a2a-goose" "build/x86_64-unknown-linux-musl/bin/"
         else
           echo "target/x86_64-unknown-linux-musl/release/a2a-goose was not produced. Name the cargo package a2a-goose, or copy your binary into build/x86_64-unknown-linux-musl/bin/ here." >&2
         fi
@@ -114,7 +118,7 @@ steps:
         apt-get update && apt-get install -y --no-install-recommends musl-tools:arm64
         cargo build --release --locked --target "aarch64-unknown-linux-musl"
         if [ -f "target/aarch64-unknown-linux-musl/release/a2a-goose" ]; then
-          cp "target/aarch64-unknown-linux-musl/release/a2a-goose" "build/aarch64-unknown-linux-musl/bin/"
+          install -m 0755 "target/aarch64-unknown-linux-musl/release/a2a-goose" "build/aarch64-unknown-linux-musl/bin/"
         else
           echo "target/aarch64-unknown-linux-musl/release/a2a-goose was not produced. Name the cargo package a2a-goose, or copy your binary into build/aarch64-unknown-linux-musl/bin/ here." >&2
         fi

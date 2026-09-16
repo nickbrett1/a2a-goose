@@ -34,7 +34,7 @@ async fn one_connection_demultiplexes_a_real_session() {
         panic!("set A2A_GOOSE_LIVE_ACP to a running goose serve, e.g. http://127.0.0.1:3284");
     };
 
-    let transport = Transport::connect(&url, Duration::from_secs(20))
+    let transport = Transport::connect(&url, None, Duration::from_secs(20))
         .await
         .expect("initialize");
     assert!(
