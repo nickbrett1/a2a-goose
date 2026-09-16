@@ -149,6 +149,7 @@ async fn boot() -> Fixture {
         },
         registry: Registry::new(&Config::default()),
         turns: turns.clone(),
+        serve: None,
         started: Instant::now(),
     });
 

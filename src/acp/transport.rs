@@ -23,7 +23,7 @@
 //! connection either way.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -61,6 +61,129 @@ pub fn acp_endpoint(url: &str) -> String {
     let base = url.trim_end_matches('/');
     let base = base.strip_suffix(ACP_PATH).unwrap_or(base);
     format!("{base}{ACP_PATH}")
+}
+
+/// The bind address that agrees with a configured `goose.acp.url`.
+///
+/// Only `goose.acp.serve: own` needs this: an owned `goose serve` has to be
+/// started with a `--host`/`--port` that is *the same server* as the endpoint
+/// every request goes to. Taking the address out of the URL rather than asking
+/// for it twice is the point — two spellings of one address is how a child ends
+/// up serving on 3285 while every turn dials 3284, and the symptom is a host
+/// where the server is up and nothing works.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpAddress {
+    /// Lowercased, without the `://`.
+    pub scheme: String,
+    /// As written. Whether a *name* is usable is a policy question that
+    /// [`crate::config`] answers; this only takes the URL apart.
+    pub host: String,
+    pub port: u16,
+}
+
+impl std::fmt::Display for AcpAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}://{}:{}", self.scheme, self.host, self.port)
+    }
+}
+
+/// Why a `goose.acp.url` cannot be turned into an address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcpAddressError {
+    /// No `scheme://` at all, so there is nothing to read a host out of.
+    NoScheme {
+        url: String,
+    },
+    /// A scheme and then nothing (`http:///acp`).
+    NoHost {
+        url: String,
+    },
+    /// No port. There is no default to fall back on: the URL's own default
+    /// would be 80, which is not where goose serves.
+    NoPort {
+        url: String,
+    },
+    BadPort {
+        url: String,
+        port: String,
+    },
+}
+
+impl std::fmt::Display for AcpAddressError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoScheme { url } => {
+                write!(f, "{url:?} has no scheme, so there is no host to read")
+            }
+            Self::NoHost { url } => write!(f, "{url:?} names no host"),
+            Self::NoPort { url } => write!(
+                f,
+                "{url:?} carries no port. There is nothing to fall back to: the URL default \
+                 (80) is not where goose serves, so an owned goose needs it written out"
+            ),
+            Self::BadPort { url, port } => {
+                write!(f, "{url:?} has {port:?} where a port should be")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AcpAddressError {}
+
+/// Reads host and port out of a configured `goose.acp.url`.
+///
+/// Deliberately forgiving about what a URL may carry (`/acp`, a trailing slash,
+/// a path prefix, userinfo, a query) and strict about what an address needs
+/// (a scheme, a host and a port). What is *acceptable* for an owned server is
+/// [`crate::config`]'s call — see `goose.acp.serve`.
+pub fn acp_address(url: &str) -> Result<AcpAddress, AcpAddressError> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| AcpAddressError::NoScheme {
+            url: url.to_string(),
+        })?;
+
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    // Userinfo is not this project's business, and `@` cannot appear in the host.
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+
+    // Brackets are how a URL writes an IPv6 literal, and the only way to tell
+    // `[::1]:3284` from a host called `[:`.
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(bracketed) => {
+            let (host, tail) =
+                bracketed
+                    .split_once(']')
+                    .ok_or_else(|| AcpAddressError::NoHost {
+                        url: url.to_string(),
+                    })?;
+            (host, tail.strip_prefix(':'))
+        }
+        None => match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        },
+    };
+
+    if host.is_empty() {
+        return Err(AcpAddressError::NoHost {
+            url: url.to_string(),
+        });
+    }
+
+    let port = port.ok_or_else(|| AcpAddressError::NoPort {
+        url: url.to_string(),
+    })?;
+    let port = port.parse::<u16>().map_err(|_| AcpAddressError::BadPort {
+        url: url.to_string(),
+        port: port.to_string(),
+    })?;
+
+    Ok(AcpAddress {
+        scheme: scheme.to_ascii_lowercase(),
+        host: host.to_string(),
+        port,
+    })
 }
 
 /// Carries the connection id: a response header on `initialize`, a request header
@@ -154,7 +277,11 @@ impl AcpError {
             // shut down.
             Self::Request(_) | Self::Closed | Self::NoConnectionId => true,
             // goose answered and refused, so the connection carried a reply and
-            // is therefore alive.
+            // is therefore alive - with one case that is not an error's job to
+            // decide: a `404` on a request carrying a *stale* connection id, which
+            // is what a restarted goose answers. HTTP is healthy and the id is
+            // not, so the connection's own fate is [`Transport::is_alive`]'s
+            // question (the stream end), not this one.
             Self::Status { .. } | Self::Rpc { .. } => false,
             // Accepted but silent. The connection is open — a hung turn is a
             // fact about the turn, and dropping the connection would not have
@@ -341,6 +468,17 @@ pub struct Transport {
     dispatcher: Arc<Dispatcher>,
     next_id: Arc<AtomicI64>,
     readers: Mutex<Vec<JoinHandle<()>>>,
+    /// Set when the *connection-level* stream ends.
+    ///
+    /// That stream is the connection: `initialize` handed back a connection id,
+    /// the stream was opened with it, and when goose closes it — or the process
+    /// behind it goes away — the id is meaningless. Goose does not say so with an
+    /// error, and it does not have to: the next request carrying the stale id
+    /// comes back `404` over a perfectly healthy HTTP connection (measured after
+    /// a supervised `goose serve` restart, which is a routine event now). So the
+    /// end of this stream is the signal, and [`Transport::is_alive`] is what the
+    /// caller reads before reusing a connection.
+    dead: Arc<AtomicBool>,
 }
 
 impl Transport {
@@ -398,6 +536,7 @@ impl Transport {
             dispatcher: Arc::new(Dispatcher::new()),
             next_id: Arc::new(AtomicI64::new(1)),
             readers: Mutex::new(Vec::new()),
+            dead: Arc::new(AtomicBool::new(false)),
         };
         transport.open_stream(Scope::Connection).await?;
         Ok(transport)
@@ -427,9 +566,19 @@ impl Transport {
             });
         }
 
+        // Only the connection-level stream means the connection: a session
+        // stream ending says that session is over, which is not the same fact.
+        let on_close = match &scope {
+            Scope::Connection => Some(Arc::clone(&self.dead)),
+            Scope::Session(_) => None,
+        };
+
         let dispatcher = Arc::clone(&self.dispatcher);
         let handle = tokio::spawn(async move {
             pump(response.bytes_stream(), dispatcher).await;
+            if let Some(dead) = on_close {
+                dead.store(true, Ordering::Relaxed);
+            }
         });
         self.readers
             .lock()
@@ -511,6 +660,15 @@ impl Transport {
     /// How many requests are still waiting for a reply. `/status`'s leak check.
     pub fn in_flight(&self) -> usize {
         self.dispatcher.pending()
+    }
+
+    /// Whether goose still knows this connection.
+    ///
+    /// False once the connection-level stream has ended, which is the one signal
+    /// goose gives that the connection id has been forgotten. A caller that
+    /// reuses a connection without asking spends one failed request finding out.
+    pub fn is_alive(&self) -> bool {
+        !self.dead.load(Ordering::Relaxed)
     }
 
     /// Stops reading. The tasks own nothing the caller needs, so aborting is
@@ -822,5 +980,89 @@ mod tests {
         let result = waiting.await.expect("reassembled").expect("ok");
         assert_eq!(result["sessionId"], "sess_0001");
         assert_eq!(dispatcher.pending(), 0);
+    }
+
+    fn address(url: &str) -> AcpAddress {
+        acp_address(url).unwrap_or_else(|err| panic!("{url} should parse: {err}"))
+    }
+
+    #[test]
+    fn an_address_is_read_the_same_from_every_spelling_of_the_endpoint() {
+        // The same two spellings `acp_endpoint` normalises, plus the two things
+        // a URL may carry without meaning a different server.
+        for url in [
+            "http://127.0.0.1:3284/acp",
+            "http://127.0.0.1:3284",
+            "http://127.0.0.1:3284/",
+            "http://127.0.0.1:3284/acp/",
+            "http://nick:secret@127.0.0.1:3284/acp",
+            "http://127.0.0.1:3284/acp?x=1",
+        ] {
+            let parsed = address(url);
+            assert_eq!(parsed.host, "127.0.0.1", "{url}");
+            assert_eq!(parsed.port, 3284, "{url}");
+            assert_eq!(parsed.scheme, "http", "{url}");
+        }
+
+        // The scheme is read case-insensitively, because a URL's scheme is.
+        assert_eq!(address("HTTP://127.0.0.1:3284").scheme, "http");
+        // A name is a name: whether it is *usable* is the caller's call.
+        assert_eq!(
+            address("https://goose.example:443/acp").host,
+            "goose.example"
+        );
+        // Bracketed IPv6, which is the only way a URL may write one.
+        assert_eq!(address("http://[::1]:3284/acp").host, "::1");
+        assert_eq!(address("http://[::1]:3284/acp").port, 3284);
+    }
+
+    #[test]
+    fn an_address_that_cannot_be_bound_is_refused_by_reason() {
+        assert_eq!(
+            acp_address("127.0.0.1:3284/acp").unwrap_err(),
+            AcpAddressError::NoScheme {
+                url: "127.0.0.1:3284/acp".to_string()
+            }
+        );
+        assert_eq!(
+            acp_address("http:///acp").unwrap_err(),
+            AcpAddressError::NoHost {
+                url: "http:///acp".to_string()
+            }
+        );
+        // No port is not "port 80": goose does not serve there, and defaulting
+        // would start a child on a port nothing dials.
+        assert_eq!(
+            acp_address("http://127.0.0.1/acp").unwrap_err(),
+            AcpAddressError::NoPort {
+                url: "http://127.0.0.1/acp".to_string()
+            }
+        );
+        assert_eq!(
+            acp_address("http://127.0.0.1:port/acp").unwrap_err(),
+            AcpAddressError::BadPort {
+                url: "http://127.0.0.1:port/acp".to_string(),
+                port: "port".to_string()
+            }
+        );
+        assert_eq!(
+            acp_address("http://127.0.0.1:99999/acp").unwrap_err(),
+            AcpAddressError::BadPort {
+                url: "http://127.0.0.1:99999/acp".to_string(),
+                port: "99999".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn an_address_error_says_what_is_wrong_with_the_url() {
+        // These strings are read by whoever is looking at a host that will not
+        // start, so they name the URL and the missing piece.
+        let no_port = acp_address("http://127.0.0.1/acp").unwrap_err().to_string();
+        assert!(no_port.contains("http://127.0.0.1/acp"), "{no_port}");
+        assert!(no_port.contains("port"), "{no_port}");
+
+        let no_scheme = acp_address("127.0.0.1:3284").unwrap_err().to_string();
+        assert!(no_scheme.contains("scheme"), "{no_scheme}");
     }
 }

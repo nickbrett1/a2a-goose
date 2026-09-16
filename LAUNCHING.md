@@ -27,6 +27,13 @@ $DEPLOY_DIR/current -> releases/<version>
 
 `DEPLOY_DIR` defaults to `$HOME/.local/share/a2a-goose`.
 
+That `exec` is the whole of a host's startup. The payload it lands on is the
+**agent**, and the agent starts and supervises its own `goose serve`
+(`goose.acp.serve: own`) — so a host has one thing to start and one thing to
+supervise, and the agent refuses to start if something is already answering on
+the ACP address rather than adopting a goose it did not start. `deploy/` has the
+per-host units; [S14](spikes/S14.md) is the evidence.
+
 ## The manifest is the only stable URL
 
 `https://github.com/nickbrett1/a2a-goose/releases/latest/download/manifest.json`

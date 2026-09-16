@@ -17,9 +17,12 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::acp::{ACP_PATH, AcpAddressError, acp_address, acp_endpoint};
 
 /// Overrides the config file path. Set by the deploy units and by tests.
 pub const CONFIG_ENV: &str = "A2A_GOOSE_CONFIG";
@@ -202,9 +205,37 @@ pub struct Acp {
     pub url: String,
     /// The *name* of the variable holding goose's `X-Secret-Key`, never the key.
     ///
-    /// Read by [`crate::acp::secret_key`] and sent on every ACP request.
+    /// Read by [`crate::acp::secret_key`] and sent on every ACP request, and —
+    /// when this agent owns the server — handed to the child as goose's own
+    /// `GOOSE_SERVER__SECRET_KEY`. The name is ours; the value is the host's.
     #[serde(default = "default_goose_secret_env")]
     pub secret_env: String,
+    /// Who starts and keeps up `goose serve`.
+    ///
+    /// `own` means this agent spawns it, restarts it if it dies, and refuses to
+    /// start if something is *already* listening on the address above — so a
+    /// host with a hand-started goose is told so at boot rather than quietly
+    /// running against a server it does not control. `external` means the host
+    /// starts goose itself (init unit, systemd, by hand): nothing is spawned and
+    /// nothing is checked.
+    ///
+    /// `own` is the default because it is the one that cannot serve a card it
+    /// cannot fulfil: the agent waits for goose to answer `initialize` before it
+    /// binds a port, so "the agent is up, goose is not" is not a state a caller
+    /// can ever see.
+    #[serde(default = "default_serve_mode")]
+    pub serve: ServeMode,
+    /// Start an owned `goose serve` without authentication.
+    ///
+    /// The only way to run an owned goose with no key, because goose refuses to
+    /// start without one: `GOOSE_SERVER__SECRET_KEY must be set to start `goose
+    /// serve`; pass --dangerously-unauthenticated to run without ACP
+    /// authentication`. Setting this *passes that flag* to the child, so the ACP
+    /// endpoint accepts any caller that can reach it — the loopback bind
+    /// `own` requires is then the whole boundary. It is therefore a deliberate
+    /// act, not a fallback: with it unset and no key, startup refuses.
+    #[serde(default)]
+    pub unauthenticated: bool,
     #[serde(default)]
     pub timeouts: Timeouts,
 }
@@ -214,7 +245,27 @@ impl Default for Acp {
         Self {
             url: default_acp_url(),
             secret_env: default_goose_secret_env(),
+            serve: default_serve_mode(),
+            unauthenticated: false,
             timeouts: Timeouts::default(),
+        }
+    }
+}
+
+/// Who starts `goose serve` — see [`Acp::serve`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServeMode {
+    Own,
+    External,
+}
+
+impl ServeMode {
+    /// The word as it appears in config, logs and `/status`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Own => "own",
+            Self::External => "external",
         }
     }
 }
@@ -526,6 +577,10 @@ fn default_goose_secret_env() -> String {
     "GOOSE_SERVER__SECRET_KEY".to_string()
 }
 
+fn default_serve_mode() -> ServeMode {
+    ServeMode::Own
+}
+
 fn default_initialize_secs() -> u64 {
     10
 }
@@ -603,6 +658,34 @@ pub enum ConfigError {
         bind: String,
         source: std::net::AddrParseError,
     },
+    /// `goose.acp.url` cannot be taken apart, so an owned goose has no address.
+    OwnedAcpAddress {
+        url: String,
+        source: AcpAddressError,
+    },
+    /// Only `http` is owned: TLS would mean handing goose a certificate, which
+    /// is a decision nobody has made, and anything else is not a scheme goose
+    /// serves.
+    OwnedAcpNotHttp {
+        url: String,
+        scheme: String,
+    },
+    /// goose's `--host` is a socket address, not a name: it answers
+    /// `invalid socket address syntax` to `localhost` and to `::1`.
+    OwnedAcpHostIsNotAnAddress {
+        url: String,
+        host: String,
+    },
+    OwnedAcpNotLoopback {
+        url: String,
+    },
+    /// A path prefix or a query means a proxy in front of goose, and an owned
+    /// goose serves `/acp` and nothing else — so the address would not be the
+    /// endpoint.
+    OwnedAcpNotTheEndpoint {
+        url: String,
+        dialled: String,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -652,6 +735,39 @@ impl fmt::Display for ConfigError {
             Self::BindNotASocketAddress { bind, source } => {
                 write!(f, "server.bind={bind:?} is not a socket address: {source}")
             }
+            Self::OwnedAcpAddress { url, source } => write!(
+                f,
+                "goose.acp.serve is \"own\", so goose.acp.url has to name the address this agent \
+                 should start goose on, and {url:?} cannot be read as one: {source}"
+            ),
+            Self::OwnedAcpNotHttp { url, scheme } => write!(
+                f,
+                "goose.acp.serve is \"own\", which starts a plain-http goose: goose.acp.url is \
+                 {scheme:?} ({url:?}). Either write it as http://127.0.0.1:<port>/acp, or set \
+                 goose.acp.serve to \"external\" and start goose yourself"
+            ),
+            Self::OwnedAcpHostIsNotAnAddress { url, host } => write!(
+                f,
+                "goose.acp.serve is \"own\" and goose.acp.url names the host {host:?}, but goose's \
+                 --host takes an IPv4 address and not a name (it answers \"invalid socket address \
+                 syntax\" to `localhost` and to `::1`). Write {url:?} with 127.0.0.1 in place of \
+                 {host:?}"
+            ),
+            Self::OwnedAcpNotLoopback { url } => write!(
+                f,
+                "goose.acp.serve is \"own\", so the server would run on *this* machine, but \
+                 goose.acp.url ({url:?}) is not a loopback address. An agent cannot start a goose \
+                 on another host: point the URL at 127.0.0.1 (or whatever loopback this host \
+                 uses), or set goose.acp.serve to \"external\" and let that host own its goose"
+            ),
+            Self::OwnedAcpNotTheEndpoint { url, dialled } => write!(
+                f,
+                "goose.acp.serve is \"own\", which serves /acp and nothing else, but \
+                 goose.acp.url ({url:?}) resolves to {dialled} — a path prefix or a query means \
+                 something is in front of goose, and this agent would be starting a server at an \
+                 address no request goes to. Use the bare endpoint, or set goose.acp.serve to \
+                 \"external\""
+            ),
         }
     }
 }
@@ -773,6 +889,64 @@ impl Config {
                 bind: self.server.bind.clone(),
                 source,
             })?;
+        self.validate_owned_acp()?;
+        Ok(())
+    }
+
+    /// The refusals that only apply when this agent starts goose itself.
+    ///
+    /// All four are the same mistake wearing different clothes: `goose.acp.url`
+    /// is describing a server this process *cannot* start. Two addresses that
+    /// disagree, or a scheme or a host goose will not bind, produce a host whose
+    /// agent is healthy and whose turns all fail — which is the state owning the
+    /// process exists to make impossible. So they are refusals, at startup, with
+    /// the field named.
+    ///
+    /// Deliberately *not* here: whether a key is present. That is an environment
+    /// question, not a configuration one (the same reason `bearer_token` is read
+    /// where it is used), and it is asked when the child is started.
+    fn validate_owned_acp(&self) -> Result<(), ConfigError> {
+        if self.goose.acp.serve != ServeMode::Own {
+            return Ok(());
+        }
+        let url = &self.goose.acp.url;
+
+        let address = acp_address(url).map_err(|source| ConfigError::OwnedAcpAddress {
+            url: url.clone(),
+            source,
+        })?;
+
+        if address.scheme != "http" {
+            return Err(ConfigError::OwnedAcpNotHttp {
+                url: url.clone(),
+                scheme: address.scheme,
+            });
+        }
+
+        // goose's own `--host` argument is what decides this, and it takes an
+        // IPv4 address: `goose serve --host localhost` and `--host ::1` both
+        // answer `invalid socket address syntax`. Converting a name here would
+        // be guessing at which of a host's addresses goose should bind.
+        let Ok(loopback) = address.host.parse::<Ipv4Addr>() else {
+            return Err(ConfigError::OwnedAcpHostIsNotAnAddress {
+                url: url.clone(),
+                host: address.host.clone(),
+            });
+        };
+        if !loopback.is_loopback() {
+            return Err(ConfigError::OwnedAcpNotLoopback { url: url.clone() });
+        }
+
+        // The child would bind `http://<host>:<port>` and serve `/acp`; if the
+        // configured URL dials anything else, the two are different servers.
+        let dialled = acp_endpoint(url);
+        let served = format!("http://{}:{}{}", address.host, address.port, ACP_PATH);
+        if dialled != served {
+            return Err(ConfigError::OwnedAcpNotTheEndpoint {
+                url: url.clone(),
+                dialled,
+            });
+        }
         Ok(())
     }
 
@@ -936,6 +1110,165 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert!(matches!(err, ConfigError::MissingAllowedRoots), "{err}");
         assert!(err.to_string().contains("allowedRoots"), "{err}");
+    }
+
+    /// `goose.acp.serve: own` means this process starts goose, so the URL has to
+    /// describe a server it can actually start: plain http, an IPv4 loopback,
+    /// and exactly the endpoint goose serves.
+    #[test]
+    fn an_owned_goose_refuses_a_url_it_could_not_start_a_server_on() {
+        /// Does this refusal name the thing the case is about?
+        type Refusal = fn(&ConfigError) -> bool;
+
+        let cases: [(&str, Refusal, &str); 8] = [
+            (
+                "https://127.0.0.1:3284/acp",
+                |err| matches!(err, ConfigError::OwnedAcpNotHttp { .. }),
+                "tls needs a certificate nobody has chosen",
+            ),
+            (
+                "http://localhost:3284/acp",
+                |err| matches!(err, ConfigError::OwnedAcpHostIsNotAnAddress { .. }),
+                "goose --host rejects a name",
+            ),
+            (
+                "http://::1:3284/acp",
+                |err| matches!(err, ConfigError::OwnedAcpHostIsNotAnAddress { .. }),
+                "goose --host rejects a bare IPv6 literal",
+            ),
+            (
+                "http://192.168.1.5:3284/acp",
+                |err| matches!(err, ConfigError::OwnedAcpNotLoopback { .. }),
+                "an agent cannot start a goose on another host",
+            ),
+            (
+                "http://127.0.0.1:3284/goose/acp",
+                |err| matches!(err, ConfigError::OwnedAcpNotTheEndpoint { .. }),
+                "a path prefix means something is in front of goose",
+            ),
+            (
+                "http://127.0.0.1:3284/acp?x=1",
+                |err| matches!(err, ConfigError::OwnedAcpNotTheEndpoint { .. }),
+                "a query is not the endpoint goose serves",
+            ),
+            (
+                "http://127.0.0.1/acp",
+                |err| matches!(err, ConfigError::OwnedAcpAddress { .. }),
+                "a URL with no port is not an address to bind",
+            ),
+            (
+                "127.0.0.1:3284",
+                |err| matches!(err, ConfigError::OwnedAcpAddress { .. }),
+                "no scheme, nothing to read",
+            ),
+        ];
+
+        for (url, expect, why) in cases {
+            let mut config = valid();
+            config.goose.acp.url = url.to_string();
+            let err = config
+                .validate()
+                .expect_err(&format!("{url} should be refused: {why}"));
+            assert!(
+                expect(&err),
+                "{url}: expected a refusal about the URL, got {err}"
+            );
+            assert!(
+                err.to_string().contains(url),
+                "the refusal must name the URL it is about: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_spelling_of_one_owned_endpoint_is_accepted() {
+        // The same four spellings the transport test dials: one server, so one
+        // address, so no refusal.
+        for url in [
+            "http://127.0.0.1:3284",
+            "http://127.0.0.1:3284/",
+            "http://127.0.0.1:3284/acp",
+            "http://127.0.0.1:3284/acp/",
+        ] {
+            let mut config = valid();
+            config.goose.acp.url = url.to_string();
+            config
+                .validate()
+                .unwrap_or_else(|err| panic!("{url} names this host's own goose: {err}"));
+        }
+    }
+
+    #[test]
+    fn an_external_goose_may_be_anywhere_under_any_scheme() {
+        // `external` says "the host starts goose and this process only dials it",
+        // so none of the owned-address rules apply - there is no address to bind.
+        for url in [
+            "https://goose.example/goose/acp",
+            "http://192.168.1.5:3284",
+            "http://[::1]:3284/acp",
+        ] {
+            let mut config = valid();
+            config.goose.acp.serve = ServeMode::External;
+            config.goose.acp.url = url.to_string();
+            config
+                .validate()
+                .unwrap_or_else(|err| panic!("{url} is somebody else's server to start: {err}"));
+        }
+    }
+
+    #[test]
+    fn own_is_the_default_because_it_is_the_one_that_cannot_lie() {
+        assert_eq!(Config::default().goose.acp.serve, ServeMode::Own);
+        assert!(!Config::default().goose.acp.unauthenticated);
+    }
+
+    #[test]
+    fn the_serve_mode_is_written_lowercase_in_config() {
+        // The value an operator types, round-tripped through the parser that
+        // reads it - so `serve: Own` is a parse error rather than a silent
+        // mismatch between what was written and what runs.
+        let dir = std::env::temp_dir().join(format!("a2a-goose-serve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("config.yaml");
+
+        std::fs::write(
+            &path,
+            "server:\n  publicUrl: \"http://host:10001\"\n\
+             goose:\n  acp:\n    serve: \"external\"\n  defaults:\n    allowedRoots: [\"/tmp\"]\n    cwd: \"/tmp\"\n",
+        )
+        .expect("write");
+        let config = Config::load_from(&path, true).expect("external parses");
+        assert_eq!(config.goose.acp.serve, ServeMode::External);
+        assert_eq!(config.goose.acp.serve.as_str(), "external");
+
+        std::fs::write(
+            &path,
+            "server:\n  publicUrl: \"http://host:10001\"\n\
+             goose:\n  acp:\n    serve: \"Own\"\n  defaults:\n    allowedRoots: [\"/tmp\"]\n    cwd: \"/tmp\"\n",
+        )
+        .expect("write");
+        let err = Config::load_from(&path, true).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_misspelled_unauthenticated_is_a_parse_error_not_a_silent_false() {
+        // The field is the only way to own an unauthenticated goose, so a typo
+        // in it must not read as "false, carry on".
+        let dir = std::env::temp_dir().join(format!("a2a-goose-unauth-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("config.yaml");
+        std::fs::write(
+            &path,
+            "server:\n  publicUrl: \"http://host:10001\"\n\
+             goose:\n  acp:\n    dangerouslyUnauthenticated: true\n  defaults:\n    allowedRoots: [\"/tmp\"]\n    cwd: \"/tmp\"\n",
+        )
+        .expect("write");
+        let err = Config::load_from(&path, true).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

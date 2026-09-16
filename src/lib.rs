@@ -16,6 +16,7 @@ pub mod executor;
 pub mod goose;
 pub mod recipes;
 pub mod registry;
+pub mod serve;
 pub mod server;
 pub mod skills;
 pub mod turn;

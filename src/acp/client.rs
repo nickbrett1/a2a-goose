@@ -145,6 +145,15 @@ impl AcpClient {
         self.transport.in_flight()
     }
 
+    /// Whether goose still knows this connection.
+    ///
+    /// The caller that matters is [`crate::acp::turns`]: a supervised `goose
+    /// serve` restart ends the connection-level stream, and the next request on
+    /// the old connection would be answered `404` rather than reconnected.
+    pub fn is_alive(&self) -> bool {
+        self.transport.is_alive()
+    }
+
     /// Creates a session rooted at an already-validated directory, and hands
     /// back the update stream that belongs to it.
     ///

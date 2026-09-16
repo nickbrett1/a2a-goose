@@ -122,6 +122,31 @@ async fn fake_goose() -> (String, Arc<Seen>) {
     (format!("http://{addr}"), seen)
 }
 
+/// The connection-level stream is the connection: when it ends, the connection
+/// id goose handed back is meaningless, and it says so with a `404` on the next
+/// request rather than with an error. A supervised `goose serve` restart is the
+/// ordinary way that happens, so this is the signal the turns layer reconnects
+/// on instead of spending a caller's turn to find out.
+///
+/// The fake goose here hangs up its SSE stream as soon as it is opened, which is
+/// the simplest honest version of "the process behind it went away".
+#[tokio::test]
+async fn the_end_of_the_connection_stream_is_what_says_the_connection_is_gone() {
+    let (base, _seen) = fake_goose().await;
+    let transport = Transport::connect(&base, None, Duration::from_secs(5))
+        .await
+        .expect("initialize");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while transport.is_alive() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !transport.is_alive(),
+        "a connection whose stream has ended must not be handed to another turn"
+    );
+}
+
 #[tokio::test]
 async fn the_configured_url_is_dialled_as_the_endpoint_however_it_is_spelled() {
     let (base, seen) = fake_goose().await;

@@ -57,9 +57,14 @@ sha2 = "0.10"
 
 thiserror = "2"
 anyhow = "1"
-
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# `SIGTERM` for the `goose serve` child this binary starts (src/serve.rs).
+# tokio's `Child::kill` is `SIGKILL` and nothing else, and goose owns the
+# sessions it is holding, so it gets the signal it can act on first. Unix-only
+# in practice, which is both hosts - DSM and macOS.
+libc = "0.2"
 
 [dev-dependencies]
 # The A2A side of the integration tests talks to this project's own server, so

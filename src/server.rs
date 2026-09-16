@@ -45,6 +45,7 @@ use crate::config::Config;
 use crate::executor::{ADVERTISED_METHODS, GooseExecutor};
 use crate::goose::{Goose, MIN_GOOSE_VERSION};
 use crate::registry::Registry;
+use crate::serve::ServeStatus;
 use crate::skills::{Dispatch, SkillSet};
 use crate::turn::{TurnHealth, Turns};
 
@@ -62,6 +63,11 @@ pub struct Agent {
     /// and so an integration test can substitute a fake and pin the A2A wire
     /// without a `goose serve` running.
     pub turns: Arc<dyn Turns>,
+    /// The `goose serve` this process started and supervises, when
+    /// `goose.acp.serve` is `own`. `None` means the host starts goose itself,
+    /// which `/status` says out loud rather than leaving a reader to infer it
+    /// from a missing field.
+    pub serve: Option<Arc<ServeStatus>>,
     pub started: Instant,
 }
 
@@ -180,6 +186,27 @@ pub fn status_payload(agent: &Agent) -> Value {
             // it may not be reading; the header is only attached when this is
             // true.
             "secretSet": crate::acp::secret_key(&agent.config.goose.acp).is_some(),
+            // Who runs the ACP server, and — when that is this process — what it
+            // is doing. `mode` is the config value, so `external` here means
+            // exactly what it means in the file and nothing is inferred.
+            "serve": match &agent.serve {
+                Some(status) => {
+                    let health = status.health();
+                    json!({
+                        "mode": agent.config.goose.acp.serve.as_str(),
+                        "managed": true,
+                        "state": health.state,
+                        "pid": health.pid,
+                        // Spawns after the first: a goose that has been
+                        // restarted is visible here rather than only in the log.
+                        "restarts": health.restarts,
+                    })
+                }
+                None => json!({
+                    "mode": agent.config.goose.acp.serve.as_str(),
+                    "managed": false,
+                }),
+            },
         },
         "registry": agent.registry.state(),
         "sessions": {
@@ -246,6 +273,8 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    use crate::config::ServeMode;
+
     fn agent() -> Agent {
         let mut config = Config::default();
         config.server.public_url = "http://mac-studio.tail86fd19.ts.net:10001".to_string();
@@ -266,8 +295,32 @@ mod tests {
             // `/status` must not need a `goose serve` to answer, so a fake is
             // the right thing for a status test: it is the *unavailable* case.
             turns: Arc::new(crate::turn::NoTurns),
+            serve: None,
             started: Instant::now(),
         }
+    }
+
+    /// `/status` says who starts goose, and — when that is this process — what
+    /// the child it started is doing. The `external` branch reports `managed:
+    /// false` rather than omitting the field, because the two are different
+    /// states and a reader should not have to infer which one they are in.
+    #[test]
+    fn status_says_who_starts_goose_and_what_that_server_is_doing() {
+        let mut managed = agent();
+        managed.config.goose.acp.serve = ServeMode::Own;
+        managed.serve = Some(Arc::new(ServeStatus::new()));
+        let payload = status_payload(&managed);
+        assert_eq!(payload["acp"]["serve"]["mode"], "own");
+        assert_eq!(payload["acp"]["serve"]["managed"], true);
+        assert_eq!(payload["acp"]["serve"]["state"], "starting");
+        assert!(payload["acp"]["serve"]["pid"].is_null());
+        assert_eq!(payload["acp"]["serve"]["restarts"], 0);
+
+        let mut external = agent();
+        external.config.goose.acp.serve = ServeMode::External;
+        let payload = status_payload(&external);
+        assert_eq!(payload["acp"]["serve"]["mode"], "external");
+        assert_eq!(payload["acp"]["serve"]["managed"], false);
     }
 
     #[test]
