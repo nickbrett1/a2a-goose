@@ -106,7 +106,7 @@ steps:
         fi
       - |
         if ! command -v doppler >/dev/null 2>&1; then
-          apt-get update && apt-get install -y --no-install-recommends curl ca-certificates
+          apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gpgv
           curl -Ls --tlsv1.2 --proto "=https" --retry 3 https://cli.doppler.com/install.sh | sh
         fi
       - |
