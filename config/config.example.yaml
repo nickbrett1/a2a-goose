@@ -98,33 +98,33 @@ registry:
   # so this is how "edit a recipe, restart" converges the registry.
   reRegisterOnCardChange: true
 
-  # Cost control, settled by the S2 decision (see spikes/S2.md). Two halves, and
-  # the order matters:
+  # Cost control. There is no budget here, and that is the decision, not an
+  # omission - see the correction at the end of spikes/S2.md.
   #
-  # 1. The agent limits itself. Limits live here because the ACP stream gives us
-  #    `usage_update` (used/size per session) and every turn returns `stopReason`
-  #    - so we can stop a turn without asking LiteLLM or goose for anything.
-  #    This is the control that works even if the proxy is misconfigured.
+  # Measured on one trivial turn: goose's ACP stream and LiteLLM's logs agree
+  # EXACTLY on tokens (34001 = 34001), but price the same call 3.5x apart
+  # ($0.0001267 vs $0.0004389). Both are local price tables; neither is the
+  # provider's invoice. So a proxy-side budget is enforced against one system's
+  # guess at the price, and per-agent keys + budgets buy attribution we do not
+  # need. If a hard ceiling is ever wanted, it belongs on the provider account.
+  #
+  # What is left is exact, cheap and ours: bound the LOOP, not the wallet. These
+  # numbers are counts of things we can see in the ACP stream, deliberately not
+  # dollars. They use `usage_update` (used/size per session) and the
+  # `stopReason`/`usage` block on every prompt reply, so no LiteLLM cooperation
+  # is required and they hold even if the proxy is misconfigured.
+  #
+  # Note: one A2A turn fans out into MORE THAN ONE provider call (a trivial turn
+  # produced two), and the overhead call is invisible in the ACP usage block - so
+  # nothing here may be read as a cost.
   limits:
     maxIterationsPerTask: 12        # consecutive goose turns for one A2A task
     maxConcurrentSessions: 4        # across the whole host, not per context
     maxTokensPerContext: 400000     # from usage_update.used, summed over the task
     maxWallClockSecondsPerTask: 900
-
-  # 2. LiteLLM is the backstop, per node agent, via a Budget object attached to
-  #    a virtual key that only this agent uses. Not per-thread: goose 1.50.x
-  #    cannot forward a per-session trace header, and LiteLLM 1.103.0 drops
-  #    require_trace_id_on_calls_by_agent / max_budget_per_session on POST. A key
-  #    per agent also gives the attribution `x-litellm-trace-id` was meant to.
-  #    `budget_duration: "30d"` resets at the START OF THE NEXT CALENDAR MONTH,
-  #    not now+30d (verified against nas:4000 - see spikes/S2.md).
-  keyEnv: "LITELLM_AGENT_KEY"       # this agent's own virtual key
-  budget:
-    budgetDuration: "30d"
-    maxBudgetUsd: 20                # hard: requests fail once exceeded
-    softBudgetUsd: 15               # alert only, does not fail a call
   # Parked, deliberately, and not a TODO: the plan's section 6.7 per-thread
-  # fields. Revisit only if a goose release ships `session_id_header_override`.
+  # budget fields. Revisit only if a goose release ships
+  # `session_id_header_override` AND a ceiling is actually wanted.
   perThreadBudget: false
 
 executor:
