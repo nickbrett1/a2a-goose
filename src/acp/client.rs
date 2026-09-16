@@ -282,9 +282,16 @@ mod tests {
         // see, so it must not be possible to point it at the filesystem.
         let scratch = Scratch::new("outside");
         let err = resolve_cwd(&config(&scratch.0), Some("/etc")).expect_err("refused");
+        // The refusal names the directory that was *checked*, which is the
+        // resolved one: symlinks are followed before the prefix check, so on a
+        // host where /etc is a symlink (macOS: -> /private/etc) the caller is
+        // told where it actually landed rather than where it typed. Comparing
+        // against the literal "/etc" passed on Linux and failed on the macOS
+        // agent, which is a test bug, not a behaviour difference.
+        let outside = PathBuf::from("/etc").canonicalize().expect("/etc exists");
         match &err {
             CwdError::OutsideRoots { cwd, roots } => {
-                assert_eq!(cwd, &PathBuf::from("/etc"));
+                assert_eq!(cwd, &outside);
                 assert_eq!(roots.len(), 1, "the refusal should say what is allowed");
             }
             other => panic!("expected an outside-roots refusal, got {other:?}"),
