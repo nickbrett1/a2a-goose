@@ -71,11 +71,53 @@ steps:
           echo "target/x86_64-unknown-linux-musl/release/a2a-goose was not produced. Name the cargo package a2a-goose, or copy your binary into build/x86_64-unknown-linux-musl/bin/ here." >&2
         fi
 
+  - label: ":hammer: Build (rust, aarch64-unknown-linux-musl)"
+    key: build_aarch64_unknown_linux_musl
+    agents:
+      queue: mac-studio-linux
+    env:
+      RELEASE_TARGET: aarch64-unknown-linux-musl
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+    # Uploaded so the release step can attach what this build produced and
+    # tested instead of rebuilding it.
+    artifact_paths:
+      - "build/aarch64-unknown-linux-musl/**"
+    plugins:
+      - docker#v5.13.0:
+          image: "rust:1-slim"
+          # The fleet is Apple silicon. Without this, docker resolves a
+          # multi-arch tag to linux/amd64 and runs the whole step emulated (with
+          # a warning, and native modules built for the wrong architecture).
+          platform: linux/arm64
+          workdir: /workdir
+          environment:
+            - RELEASE_TARGET
+            - CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER
+    commands:
+      - |
+        mkdir -p "build/aarch64-unknown-linux-musl/bin"
+        rustup target add "aarch64-unknown-linux-musl"
+        # The musl C toolchain, for the TARGET's architecture. Debian's
+        # musl-tools is built for the host architecture only, so a plain
+        # install puts an arm64 `musl-gcc` on the fleet's arm64 containers -
+        # inert for an x86_64 target. Adding the target's architecture and
+        # installing it multiarch repoints /usr/bin/musl-gcc at that arch's
+        # wrapper, which is what the linker variable in this step's env names.
+        dpkg --add-architecture arm64
+        apt-get update && apt-get install -y --no-install-recommends musl-tools:arm64
+        cargo build --release --locked --target "aarch64-unknown-linux-musl"
+        if [ -f "target/aarch64-unknown-linux-musl/release/a2a-goose" ]; then
+          cp "target/aarch64-unknown-linux-musl/release/a2a-goose" "build/aarch64-unknown-linux-musl/bin/"
+        else
+          echo "target/aarch64-unknown-linux-musl/release/a2a-goose was not produced. Name the cargo package a2a-goose, or copy your binary into build/aarch64-unknown-linux-musl/bin/ here." >&2
+        fi
+
   - label: ":bookmark: Release"
     key: release
     depends_on:
       - build_aarch64_apple_darwin
       - build_x86_64_unknown_linux_musl
+      - build_aarch64_unknown_linux_musl
     if: build.branch == "main"
     agents:
       queue: mac-studio-linux
@@ -151,7 +193,7 @@ steps:
           apt-get update && apt-get install -y --no-install-recommends curl jq
         fi
         AGENT_API="https://agent-edge.buildkite.com/v3"
-        for pattern in "build/aarch64-apple-darwin/**" "build/x86_64-unknown-linux-musl/**"; do
+        for pattern in "build/aarch64-apple-darwin/**" "build/x86_64-unknown-linux-musl/**" "build/aarch64-unknown-linux-musl/**"; do
           if curl -fsS -G -H "Authorization: Token $$BUILDKITE_AGENT_ACCESS_TOKEN" \
             --data-urlencode "query=$$pattern" --data-urlencode "state=finished" \
             "$$AGENT_API/builds/$$BUILDKITE_BUILD_ID/artifacts/search" -o /tmp/buildkite-artifacts.json; then

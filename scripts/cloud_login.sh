@@ -23,12 +23,12 @@ if command -v doppler &> /dev/null; then
     echo "      your browser to complete the login, then return here."
     if doppler login --no-check-version --yes; then
       echo "✅ Doppler login successful."
-      if doppler setup --no-interactive --project common --config dev; then
-        echo "✅ Doppler project common/dev configured."
+      if doppler setup --no-interactive --project a2a-goose --config dev; then
+        echo "✅ Doppler project a2a-goose/dev configured."
       else
-        echo "WARN: doppler setup failed for common/dev - the project may not"
+        echo "WARN: doppler setup failed for a2a-goose/dev - the project may not"
         echo "      exist yet. Create it at https://dashboard.doppler.com, then run:"
-        echo "      doppler setup --no-interactive --project common --config dev"
+        echo "      doppler setup --no-interactive --project a2a-goose --config dev"
       fi
     else
       echo "❌ Doppler login did not complete. Re-run this script (or 'doppler login'),"
