@@ -20,16 +20,11 @@ This project includes the following capabilities:
 ## Setup
 
 1. Clone the repository
-2. Install dependencies:
+2. Build and run the checks:
 
    ```bash
-   npm install
-   ```
-
-3. Run the dev server:
-
-   ```bash
-   npm run dev
+   cargo build
+   cargo test
    ```
 
 ## Doppler
