@@ -152,10 +152,10 @@ agy-dev() {
     fi
   fi
 
-  echo "Starting Antigravity with Doppler (common + a2a-goose)..."
+  echo "Starting Antigravity with Doppler (common + common)..."
   # Load common secrets first, then layer project-specific secrets on top.
   # --forward-signals ensures SIGINT/SIGTERM are correctly passed through to agy.
-  doppler run --project common --config dev -- doppler run --forward-signals --project a2a-goose --config dev -- agy "$@"
+  doppler run --project common --config dev -- doppler run --forward-signals --project common --config dev -- agy "$@"
 }
 # A robust function to run goose with Doppler, ensuring all secrets are available.
 # Secrets are loaded from the 'common' project first, then the 'goose' project's secrets layer on

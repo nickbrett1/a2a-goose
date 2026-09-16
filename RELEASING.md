@@ -37,17 +37,24 @@ cannot exist for code that did not pass.
 Each Buildkite step runs in its own container, so the release step never sees
 the build step's working tree. It does not rebuild it either: the build step
 uploads its output (`artifact_paths:` in `.buildkite/pipeline.yml`) and the
-release step downloads those exact bytes back with
-`buildkite-agent artifact download`. One compile per commit, and the release
+release step fetches those exact bytes back from the Buildkite artifacts API:
+it lists this build's artifacts, keeps the ones under the build step's own path
+prefix, and downloads each with `curl`. One compile per commit, and the release
 attaches what the tests actually ran against.
+
+The fetch deliberately does not use `buildkite-agent artifact download`. That
+call reaches the agent binary mounted from the host, and this fleet runs macOS,
+so the mounted binary is unlaunchable inside the step's Linux container. The API
+needs no agent binary — only this job's own access token, which the docker plugin
+forwards into the container.
 
 ## Changing what is shipped
 
 Two places, depending on what you are changing.
 
 **Which files are carried between the steps** lives in `.buildkite/pipeline.yml`:
-the `artifact_paths:` list on the build step and the matching
-`artifact download` in the release step. That file is genproj's and is rewritten
+the `artifact_paths:` list on the build step and the matching fetch in the
+release step. That file is genproj's and is rewritten
 on every regeneration, so treat it as generated — change the project's saved
 configuration instead, or expect to re-apply the edit. `artifact_paths:`
 does not fail when a pattern matches nothing, so a build that outputs somewhere

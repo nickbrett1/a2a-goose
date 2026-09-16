@@ -77,40 +77,40 @@ DOPPLER_RC_MARKER='# genproj-doppler-context-pin'
 if ! grep -qF "$DOPPLER_RC_MARKER" "$HOME/.bashrc" 2>/dev/null; then
     cat >> "$HOME/.bashrc" <<'EOF'
 # genproj-doppler-context-pin: this repo's doppler.yaml context wins over ambient env
-export DOPPLER_PROJECT=a2a-goose
+export DOPPLER_PROJECT=common
 export DOPPLER_CONFIG=dev
 unset DOPPLER_ENVIRONMENT 2>/dev/null || true
 
 EOF
-    echo "INFO: Pinned doppler context (a2a-goose/dev) in ~/.bashrc"
+    echo "INFO: Pinned doppler context (common/dev) in ~/.bashrc"
 fi
 if ! grep -qF "$DOPPLER_RC_MARKER" "$HOME/.zshrc" 2>/dev/null; then
     cat >> "$HOME/.zshrc" <<'EOF'
 # genproj-doppler-context-pin: this repo's doppler.yaml context wins over ambient env
-export DOPPLER_PROJECT=a2a-goose
+export DOPPLER_PROJECT=common
 export DOPPLER_CONFIG=dev
 unset DOPPLER_ENVIRONMENT 2>/dev/null || true
 
 EOF
-    echo "INFO: Pinned doppler context (a2a-goose/dev) in ~/.zshrc"
+    echo "INFO: Pinned doppler context (common/dev) in ~/.zshrc"
 fi
 # Apply to this shell too, then verify resolution is never silently wrong.
-export DOPPLER_PROJECT=a2a-goose
+export DOPPLER_PROJECT=common
 export DOPPLER_CONFIG=dev
 unset DOPPLER_ENVIRONMENT 2>/dev/null || true
 if command -v doppler &> /dev/null && doppler whoami &> /dev/null 2>&1; then
     RESOLVED_PROJECT="$(doppler run -- printenv DOPPLER_PROJECT 2>/dev/null | tail -n 1)"
-    if [ -n "$RESOLVED_PROJECT" ] && [ "$RESOLVED_PROJECT" != "a2a-goose" ]; then
+    if [ -n "$RESOLVED_PROJECT" ] && [ "$RESOLVED_PROJECT" != "common" ]; then
         echo "WARNING: 'doppler run' resolves project '$RESOLVED_PROJECT', but doppler.yaml"
-        echo "         declares 'a2a-goose'. An ambient DOPPLER_* export is overriding"
+        echo "         declares 'common'. An ambient DOPPLER_* export is overriding"
         echo "         the repo context. Run: unset DOPPLER_PROJECT DOPPLER_CONFIG DOPPLER_ENVIRONMENT"
-        echo "         then 'doppler setup --no-interactive --project a2a-goose --config dev'."
+        echo "         then 'doppler setup --no-interactive --project common --config dev'."
     elif [ -z "$RESOLVED_PROJECT" ]; then
         echo "WARNING: could not resolve the doppler project via 'doppler run'. If"
-        echo "         'doppler projects get a2a-goose' 404s, create it and run"
-        echo "         'doppler setup --no-interactive --project a2a-goose --config dev'."
+        echo "         'doppler projects get common' 404s, create it and run"
+        echo "         'doppler setup --no-interactive --project common --config dev'."
     else
-        echo "INFO: doppler context verified: a2a-goose/dev"
+        echo "INFO: doppler context verified: common/dev"
     fi
 fi
 

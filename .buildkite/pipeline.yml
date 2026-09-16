@@ -87,12 +87,12 @@ steps:
           # a warning, and native modules built for the wrong architecture).
           platform: linux/arm64
           workdir: /workdir
-          # buildkite-agent is a host binary and artifact download is a
-          # buildkite-agent call: without this mount it is not in the container
-          # and the step has no way to read what the build step uploaded.
-          mount-buildkite-agent: true
           environment:
             - DOPPLER_TOKEN
+            - BUILDKITE_AGENT_ACCESS_TOKEN
+            - BUILDKITE_ORGANIZATION_SLUG
+            - BUILDKITE_PIPELINE_SLUG
+            - BUILDKITE_BUILD_NUMBER
     commands:
       - |
         if ! command -v gh >/dev/null 2>&1; then
@@ -149,8 +149,34 @@ steps:
       - |
         # The build step uploaded what it compiled and the tests ran against;
         # this fetches those exact bytes back rather than rebuilding the tree.
-        buildkite-agent artifact download "build/aarch64-apple-darwin/**" . || echo "No build/aarch64-apple-darwin/** artifacts to attach - the release will carry notes only."
-        buildkite-agent artifact download "build/x86_64-unknown-linux-musl/**" . || echo "No build/x86_64-unknown-linux-musl/** artifacts to attach - the release will carry notes only."
+        if ! command -v jq >/dev/null 2>&1; then
+          apt-get update && apt-get install -y --no-install-recommends curl jq
+        fi
+        ARTIFACTS_URL="https://api.buildkite.com/v2/organizations/$$BUILDKITE_ORGANIZATION_SLUG/pipelines/$$BUILDKITE_PIPELINE_SLUG/builds/$$BUILDKITE_BUILD_NUMBER/artifacts?per_page=100"
+        if curl -fsS -H "Authorization: Bearer $$BUILDKITE_AGENT_ACCESS_TOKEN" "$$ARTIFACTS_URL" -o /tmp/buildkite-artifacts.json; then
+          if [ "$$(jq --arg prefix "build/aarch64-apple-darwin/" '[.[] | select(.path | startswith($$prefix))] | length' /tmp/buildkite-artifacts.json)" -eq 0 ]; then
+            echo "No build/aarch64-apple-darwin/** artifacts to attach - the release will carry notes only."
+          else
+            jq -r --arg prefix "build/aarch64-apple-darwin/" '.[] | select(.path | startswith($$prefix)) | [.path, .download_url] | @tsv' /tmp/buildkite-artifacts.json |
+              while IFS="$$(printf '\t')" read -r artifact_path artifact_url; do
+                mkdir -p "$$(dirname "$$artifact_path")"
+                curl -fsSL -o "$$artifact_path" "$$artifact_url" ||
+                  echo "Failed to fetch $$artifact_path - the release may not carry it." >&2
+              done
+          fi
+          if [ "$$(jq --arg prefix "build/x86_64-unknown-linux-musl/" '[.[] | select(.path | startswith($$prefix))] | length' /tmp/buildkite-artifacts.json)" -eq 0 ]; then
+            echo "No build/x86_64-unknown-linux-musl/** artifacts to attach - the release will carry notes only."
+          else
+            jq -r --arg prefix "build/x86_64-unknown-linux-musl/" '.[] | select(.path | startswith($$prefix)) | [.path, .download_url] | @tsv' /tmp/buildkite-artifacts.json |
+              while IFS="$$(printf '\t')" read -r artifact_path artifact_url; do
+                mkdir -p "$$(dirname "$$artifact_path")"
+                curl -fsSL -o "$$artifact_path" "$$artifact_url" ||
+                  echo "Failed to fetch $$artifact_path - the release may not carry it." >&2
+              done
+          fi
+        else
+          echo "Could not list this build's artifacts - the release will carry notes only." >&2
+        fi
       - |
         VERSION="$$(cat .release-version)"
         TAG="$$(cat .release-tag)"
