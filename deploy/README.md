@@ -60,3 +60,25 @@ has its own `$HOME` and therefore its own, empty, recipe directory), script =
   on DSM, the ad-hoc signature on a downloaded Darwin binary)?
 - `scripts/check-goose.sh` must pass on the host first: an agent that cannot find
   goose refuses to start, by design.
+
+## Host identity and per-agent attribution
+
+`deploy/env/` holds the per-host `ENV_FILE` templates, with the reasoning in
+`deploy/env/README.md`. The load-bearing line in each is the host naming itself:
+
+```sh
+LITELLM_CUSTOM_HEADERS='{"User-Agent":"a2a-goose/mac-studio"}'
+```
+
+LiteLLM records that as `metadata.user_agent` on every spend-log row, which is
+what makes "which agent did this" answerable — with one shared master key, every
+row is otherwise filed under `litellm_proxy_master_key`. **Attribution only: no
+budget is attached anywhere, deliberately** (the decision is in `spikes/S2.md`).
+
+The env file is also where a host's identity belongs rather than the code,
+because the agent is one-per-host and `cwd` is the namespace: the host is the
+unit, so it sets its own name once at deploy.
+
+Both halves of that mechanism are proven but not yet proven *together*
+(LiteLLM records the header; goose forwards `LITELLM_CUSTOM_HEADERS`) — the
+end-to-end check needs a host, so it rides with **S8/S12**.
