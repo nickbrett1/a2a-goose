@@ -109,6 +109,34 @@ impl std::fmt::Display for AcpError {
     }
 }
 
+impl AcpError {
+    /// Whether this error means the *connection* is gone, as opposed to one
+    /// request having gone wrong on a connection that is still there.
+    ///
+    /// The distinction decides whether the agent forgets the connection and
+    /// every session on it (see [`crate::acp::pool`]). Both ways of getting it
+    /// wrong have a cost, and they are not symmetric: calling a live connection
+    /// dead costs a reconnect and one fresh session per context, which is always
+    /// correct and merely wasteful; calling a dead one live hands a half-open
+    /// connection to every later turn, and every one of them fails against a
+    /// server that will never answer.
+    pub fn is_connection_loss(&self) -> bool {
+        match self {
+            // No HTTP at all: could not reach goose, or the stream under us was
+            // shut down.
+            Self::Request(_) | Self::Closed | Self::NoConnectionId => true,
+            // goose answered and refused, so the connection carried a reply and
+            // is therefore alive.
+            Self::Status { .. } | Self::Rpc { .. } => false,
+            // Accepted but silent. The connection is open — a hung turn is a
+            // fact about the turn, and dropping the connection would not have
+            // made this one succeed while discarding every other context's
+            // session on it.
+            Self::Timeout { .. } => false,
+        }
+    }
+}
+
 impl std::error::Error for AcpError {}
 
 impl From<reqwest::Error> for AcpError {
@@ -598,6 +626,37 @@ mod tests {
             received[3]["params"]["update"]["content"]["text"], "ok",
             "agent_message_chunk carries the turn's output"
         );
+    }
+
+    #[test]
+    fn only_an_error_that_means_no_http_counts_as_losing_the_connection() {
+        // An answer of any kind proves the connection is alive, however
+        // unwelcome the answer is. Anything else means the agent is holding a
+        // connection that will not carry another turn, and it must forget it.
+        assert!(
+            !AcpError::Status {
+                status: 500,
+                body: "boom".to_string()
+            }
+            .is_connection_loss()
+        );
+        assert!(
+            !AcpError::Rpc {
+                code: -32602,
+                message: "Invalid params".to_string(),
+                data: None
+            }
+            .is_connection_loss()
+        );
+        assert!(
+            !AcpError::Timeout {
+                method: "session/prompt".to_string(),
+                secs: 900
+            }
+            .is_connection_loss()
+        );
+        assert!(AcpError::Closed.is_connection_loss());
+        assert!(AcpError::NoConnectionId.is_connection_loss());
     }
 
     #[test]

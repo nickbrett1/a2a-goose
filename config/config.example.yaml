@@ -71,11 +71,20 @@ goose:
   sessions:
     # The contextId -> sessionId map. NOT the conversation history: that is
     # goose's own sessions.db, which is the system of record (hard constraint #1).
+    # The map is held in memory: resuming a session across a restart of this
+    # process needs `session/load`, which this build does not drive yet. This
+    # path is where a durable map would live when it does.
     dbPath: "~/.local/share/a2a-goose/sessions.db"
+    # Whether an A2A contextId keeps its goose session between turns. Off means
+    # every turn opens a session and closes it, which is what a caller that sends
+    # no contextId gets anyway.
     reuseByContext: true
     # Idle sessions are evicted from the map (never deleted from goose) after
-    # this long.
+    # this long, and reaping is lazy: it happens on the next turn that needs the
+    # pool, not on a timer.
     idleTtlSecs: 3600
+    # The most sessions held at once. A new one beyond this evicts the least
+    # recently used. Zero means hold none.
     maxSessions: 16
   defaults:
     # Handed to `session/new`. Caller-supplied `metadata.cwd` overrides it, and

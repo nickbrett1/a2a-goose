@@ -124,6 +124,13 @@ pub enum TurnEvent {
 /// never sees a directory the host would refuse.
 #[derive(Debug, Clone)]
 pub struct TurnRequest {
+    /// The A2A `contextId` this turn belongs to, when the caller sent one.
+    ///
+    /// Carried rather than interpreted: the A2A layer knows nothing about
+    /// sessions, and the ACP layer is the only thing that can decide whether a
+    /// given context may reuse one. Today every turn still gets a fresh
+    /// session; this is what a reuse policy would key on.
+    pub context: Option<String>,
     pub cwd: PathBuf,
     pub prompt: String,
     /// The ceiling for the whole turn. Enforced where the waiting actually
@@ -159,6 +166,16 @@ pub trait Turns: Send + Sync + 'static {
 
     /// How many turns are running right now.
     fn in_flight(&self) -> usize {
+        0
+    }
+
+    /// How many sessions are being held for reuse.
+    ///
+    /// Only meaningful next to [`Self::in_flight`]: the two numbers together say
+    /// whether a context's session is being kept (the reuse policy working) or
+    /// whether every turn is starting over (an operator's "why does my agent
+    /// have no memory" question).
+    fn retained(&self) -> usize {
         0
     }
 }

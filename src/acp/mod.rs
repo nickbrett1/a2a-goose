@@ -13,6 +13,9 @@
 //!   replaying the frames [S3](../../spikes/S3.md) recorded.
 //! - [`client`] is the lifecycle: `session/new`, `session/prompt`,
 //!   `session/close`, and the `cwd` check that is this host's security boundary.
+//! - [`pool`] is the reuse policy: which `contextId` keeps which session, when
+//!   that session is handed back, and what evicts it. It holds no I/O, so the
+//!   rules are testable on their own.
 //! - [`turns`] is the implementation of [`crate::turn::Turns`]: it is what the
 //!   A2A executor calls, so the executor never names an ACP method.
 //!
@@ -22,10 +25,12 @@
 //! in this binary.
 
 pub mod client;
+pub mod pool;
 pub mod transport;
 pub mod turns;
 
 pub use client::{AcpClient, CwdError, Session, resolve_cwd};
+pub use pool::{Acquired, Claim, Idle, Pool};
 pub use transport::{
     ACP_PATH, AcpError, CONNECTION_ID_HEADER, SESSION_ID_HEADER, Scope, Transport,
 };
