@@ -293,9 +293,14 @@ pub struct Registry {
     pub master_key_env: String,
     #[serde(default = "default_card_name")]
     pub agent_name: String,
-    /// Hash the assembled card at boot and compare with the last registered
-    /// hash; on change, `DELETE` then `POST`. Skills do not auto-propagate
-    /// through LiteLLM, so this is how "edit a recipe, restart" converges.
+    /// Whether this process may **rewrite** a registry entry that already exists
+    /// under this host's name. On (the default) a restart converges the entry
+    /// onto the card this process is serving — `PUT /v1/agents/{id}`, in place,
+    /// because a second `POST` is a 400 on a duplicate name and a
+    /// `DELETE`-then-`POST` would leave a window with no entry. Off, the entry
+    /// is adopted as-is, for a host whose registry entry is managed elsewhere.
+    /// (M4 narrows this further, to "only when the card hash actually changed",
+    /// which it can compare in memory without persisting anything.)
     #[serde(default = "default_true")]
     pub re_register_on_card_change: bool,
     /// Loop bounds, not budgets. Deliberately counts of things that are visible

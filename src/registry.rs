@@ -1,13 +1,28 @@
 //! Registration with LiteLLM: the agent's own entry in the agent directory.
 //!
-//! Two calls, both against the **API** and never `config.yaml` (constraint #2:
+//! Three calls, all against the **API** and never `config.yaml` (constraint #2:
 //! config agents are un-evictable, so a dynamic agent that lands there is
 //! permanently un-sweepable):
 //!
 //! ```text
-//! POST   /v1/agents          {"agent_name": ..., "agent_card_params": {name, url, protocolVersion}}
+//! GET    /v1/agents                      is this host already listed?
+//! POST   /v1/agents                      no  -> create
+//! PUT    /v1/agents/{id}                 yes -> update in place
 //! DELETE /v1/agents/{id}
 //! ```
+//!
+//! **Why a lookup first, and a PUT rather than a second POST.** `POST
+//! /v1/agents` with a name that is already taken is a hard `400 {"detail":
+//! "Agent with name ... already exists"}` (measured, [S13](../../spikes/S13.md)),
+//! so a host that crashes without deregistering — OOM, a host sleep, a wedged
+//! process; exactly the cases `deregister` cannot cover — would fail to
+//! re-register and only *look* registered while serving a stale card. The
+//! lookup also makes the collision mean the right thing: the name is this host's
+//! identity, so a colliding entry is a previous instance of *us*, and adopting
+//! its id is how the stale entry gets reclaimed. `PUT /v1/agents/{id}` updates
+//! the stored card in place, which is strictly better than the `DELETE` then
+//! `POST` this was originally specified as: no window with no entry, and no id
+//! churn.
 //!
 //! **What is deliberately not sent.** LiteLLM 1.103.0 accepts and then silently
 //! discards `max_iterations`, `max_budget_per_session` and
@@ -121,6 +136,10 @@ struct Client {
     base_url: String,
     master_key: String,
     agent_name: String,
+    /// Whether an entry that already exists may be **rewritten**. `false` adopts
+    /// the existing entry and leaves its card alone, for a host whose registry
+    /// entry is managed from elsewhere.
+    re_register_on_card_change: bool,
     http: reqwest::Client,
 }
 
@@ -146,6 +165,7 @@ impl Registry {
                     .to_string(),
                 master_key,
                 agent_name: config.registry.agent_name.clone(),
+                re_register_on_card_change: config.registry.re_register_on_card_change,
                 http: reqwest::Client::new(),
             })
         });
@@ -257,6 +277,39 @@ impl Registry {
     }
 }
 
+/// Finds this host's entry in a `GET /v1/agents` listing.
+///
+/// Returns `None` for "not listed" — including for a listing that is not an
+/// array at all, because the caller's next move (create) is the same either way
+/// and a shape disagreement here must not be able to stop a host registering.
+fn find_by_name(text: &str, name: &str) -> Result<Option<String>, RegistryError> {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return Ok(None);
+    };
+    let Some(agents) = value.as_array() else {
+        return Ok(None);
+    };
+
+    let mut found = agents.iter().filter_map(|agent| {
+        let listed = agent.get("agent_name").and_then(Value::as_str)?;
+        let id = agent.get("agent_id").and_then(Value::as_str)?;
+        (listed == name).then(|| id.to_string())
+    });
+
+    let first = found.next();
+    if let (Some(id), Some(duplicate)) = (&first, found.next()) {
+        // Should not happen: one host, one identity. If it does, the entry we
+        // rewrite must be predictable, so say which one was chosen.
+        tracing::warn!(
+            name,
+            chosen = %id,
+            ignored = %duplicate,
+            "more than one registry entry carries this host's name"
+        );
+    }
+    Ok(first)
+}
+
 /// Reads a `POST /v1/agents` response.
 ///
 /// Split out from the request so the shape is testable against the *real*
@@ -264,12 +317,26 @@ impl Registry {
 /// — LiteLLM's answer is a contract we depend on and cannot type, so it is
 /// pinned rather than assumed.
 fn parse_registration(text: &str) -> Result<Registration, RegistryError> {
+    parse_registration_with(text, None)
+}
+
+/// As [`parse_registration`], but able to supply the id when the body does not.
+///
+/// Belt and braces: LiteLLM's `GET /v1/agents/{id}` *does* echo `agent_id`
+/// (measured), but the call is addressed by id already, so a body without one is
+/// still an answer — and failing there would turn a successful adoption into a
+/// boot failure over a field we already know.
+fn parse_registration_with(
+    text: &str,
+    known_id: Option<&str>,
+) -> Result<Registration, RegistryError> {
     let value: Value = serde_json::from_str(text).map_err(|_| RegistryError::NoAgentId {
         body: text.to_string(),
     })?;
     let agent_id = value
         .get("agent_id")
         .and_then(Value::as_str)
+        .or(known_id)
         .map(str::to_string)
         .ok_or_else(|| RegistryError::NoAgentId {
             body: text.to_string(),
@@ -289,7 +356,55 @@ fn parse_registration(text: &str) -> Result<Registration, RegistryError> {
     })
 }
 
+/// What to do about the registry entry, given what is already there.
+///
+/// A pure decision, split out so the two branches are tested without a proxy —
+/// the HTTP around it is three one-line calls to LiteLLM, and the part worth
+/// getting right is *which* one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Plan {
+    /// Nothing is listed under this host's name: create it.
+    Create,
+    /// Our own stale entry: take its id and rewrite the card.
+    Update(String),
+    /// Our own stale entry, but this host may not rewrite cards: take the id and
+    /// leave the stored card as it is.
+    Adopt(String),
+}
+
+fn plan(existing: Option<String>, may_rewrite: bool) -> Plan {
+    match existing {
+        None => Plan::Create,
+        Some(id) if may_rewrite => Plan::Update(id),
+        Some(id) => Plan::Adopt(id),
+    }
+}
+
 impl Client {
+    /// The agent id already listed under this host's name, if any.
+    ///
+    /// A list scan rather than a query, because LiteLLM's `GET /v1/agents` takes
+    /// no name filter. One host has one entry, so the scan is over a handful.
+    async fn find_agent_id(&self) -> Result<Option<String>, RegistryError> {
+        let response = self
+            .http
+            .get(format!("{}/v1/agents", self.base_url))
+            .bearer_auth(&self.master_key)
+            .send()
+            .await?;
+
+        let status = response.status();
+        let text = response.text().await?;
+        if !status.is_success() {
+            return Err(RegistryError::Status {
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+
+        find_by_name(&text, &self.agent_name)
+    }
+
     async fn register(
         &self,
         public_url: &str,
@@ -306,11 +421,54 @@ impl Client {
             },
         });
 
+        let existing = self.find_agent_id().await?;
+        match plan(existing, self.re_register_on_card_change) {
+            Plan::Create => {
+                let text = self
+                    .send(reqwest::Method::POST, "/v1/agents", &body)
+                    .await?;
+                parse_registration(&text)
+            }
+            Plan::Update(agent_id) => {
+                tracing::info!(
+                    %agent_id,
+                    "already listed under this name; updating the entry in place"
+                );
+                let text = self
+                    .send(
+                        reqwest::Method::PUT,
+                        &format!("/v1/agents/{agent_id}"),
+                        &body,
+                    )
+                    .await?;
+                parse_registration(&text)
+            }
+            Plan::Adopt(agent_id) => {
+                tracing::info!(
+                    %agent_id,
+                    "already listed under this name; adopting it without rewriting the card \
+                     (reRegisterOnCardChange is off)"
+                );
+                // Nothing came back to parse, so read the card we left alone:
+                // `/status` should report what the directory actually holds.
+                let text = self.get_agent(&agent_id).await?;
+                parse_registration_with(&text, Some(&agent_id))
+            }
+        }
+    }
+
+    /// One authenticated request, returning the body or a status error.
+    async fn send(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &Value,
+    ) -> Result<String, RegistryError> {
         let response = self
             .http
-            .post(format!("{}/v1/agents", self.base_url))
+            .request(method, format!("{}{path}", self.base_url))
             .bearer_auth(&self.master_key)
-            .json(&body)
+            .json(body)
             .send()
             .await?;
 
@@ -322,8 +480,26 @@ impl Client {
                 body: text,
             });
         }
+        Ok(text)
+    }
 
-        parse_registration(&text)
+    async fn get_agent(&self, agent_id: &str) -> Result<String, RegistryError> {
+        let response = self
+            .http
+            .get(format!("{}/v1/agents/{agent_id}", self.base_url))
+            .bearer_auth(&self.master_key)
+            .send()
+            .await?;
+
+        let status = response.status();
+        let text = response.text().await?;
+        if !status.is_success() {
+            return Err(RegistryError::Status {
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        Ok(text)
     }
 
     async fn deregister(&self, agent_id: &str) -> Result<(), RegistryError> {
@@ -462,5 +638,210 @@ mod tests {
             serde_json::to_value(RegistryState::Unconfigured).expect("serialise")["state"],
             "unconfigured"
         );
+    }
+
+    #[test]
+    fn nothing_listed_under_our_name_means_create() {
+        assert_eq!(plan(None, true), Plan::Create);
+        assert_eq!(plan(None, false), Plan::Create);
+    }
+
+    #[test]
+    fn our_own_stale_entry_is_rewritten_in_place_rather_than_reposted() {
+        // The whole point of the lookup: a host that crashed without
+        // deregistering must converge, and `POST` again is a 400 (S13).
+        assert_eq!(
+            plan(Some("id-1".to_string()), true),
+            Plan::Update("id-1".to_string())
+        );
+    }
+
+    #[test]
+    fn a_host_that_may_not_rewrite_reclaims_the_entry_without_touching_its_card() {
+        assert_eq!(
+            plan(Some("id-1".to_string()), false),
+            Plan::Adopt("id-1".to_string())
+        );
+    }
+
+    /// LiteLLM's `GET /v1/agents` element shape, trimmed to the two fields this
+    /// reads: a list of `{agent_id, agent_name}`.
+    const LISTING: &str = r#"[
+        {"agent_id":"other","agent_name":"someone-else"},
+        {"agent_id":"id-1","agent_name":"mac-studio-goose"}
+    ]"#;
+
+    #[test]
+    fn the_listing_is_searched_by_name_not_assumed_to_be_ours() {
+        assert_eq!(
+            find_by_name(LISTING, "mac-studio-goose").expect("scan"),
+            Some("id-1".to_string())
+        );
+        assert_eq!(
+            find_by_name(LISTING, "a-host-we-are-not").expect("scan"),
+            None,
+            "another host's entry must never be adopted as ours"
+        );
+    }
+
+    #[test]
+    fn a_listing_that_is_not_a_list_reads_as_not_listed() {
+        // A proxy answering `{}` or an HTML error page must not stop a host
+        // registering - the next move (create) is the same either way.
+        assert_eq!(find_by_name("{}", "mac-studio-goose").expect("scan"), None);
+        assert_eq!(find_by_name("<html>", "x").expect("scan"), None);
+        assert_eq!(
+            find_by_name(r#"[{"agent_name":"mac-studio-goose"}]"#, "mac-studio-goose")
+                .expect("scan"),
+            None,
+            "an entry with no id cannot be adopted"
+        );
+    }
+
+    /// A stand-in for LiteLLM's registry endpoints, recording what was called.
+    ///
+    /// Enough of the real surface to be worth testing against: the listing shape,
+    /// the `PUT` that updates in place, and — the reason this exists — the hard
+    /// `400` a second `POST` gets on a duplicate name. The behaviour under test
+    /// is *which* call the client makes, and that is invisible in a unit test of
+    /// a pure function.
+    #[derive(Clone)]
+    struct Stub {
+        exists: bool,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn stub_registry(
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+        axum::extract::State(stub): axum::extract::State<Stub>,
+    ) -> (axum::http::StatusCode, axum::Json<Value>) {
+        use axum::http::StatusCode;
+
+        let path = uri.path().to_string();
+        stub.calls
+            .lock()
+            .expect("call log")
+            .push(format!("{method} {path}"));
+
+        let registration = serde_json::json!({
+            "agent_id": "id-1",
+            "agent_name": "mac-studio-goose",
+            "agent_card_params": {
+                "name": "mac-studio-goose",
+                "url": "http://mac-studio.tail86fd19.ts.net:10099",
+                "protocolVersion": "1.0",
+                "skills": [{"id": "chat", "name": "Chat", "tags": ["chat"],
+                            "description": "Conversational interaction with the agent."}],
+            },
+        });
+
+        match (method.as_str(), path.as_str()) {
+            ("GET", "/v1/agents") => (
+                StatusCode::OK,
+                axum::Json(if stub.exists {
+                    serde_json::json!([{"agent_id": "id-1",
+                                        "agent_name": "mac-studio-goose"}])
+                } else {
+                    serde_json::json!([])
+                }),
+            ),
+            ("POST", "/v1/agents") if stub.exists => (
+                // Verbatim from the live proxy, and the reason for the lookup.
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "detail": "Agent with name mac-studio-goose already exists"
+                })),
+            ),
+            ("POST", "/v1/agents") => (StatusCode::OK, axum::Json(registration)),
+            ("PUT", "/v1/agents/id-1") | ("GET", "/v1/agents/id-1") => {
+                (StatusCode::OK, axum::Json(registration))
+            }
+            _ => (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({}))),
+        }
+    }
+
+    async fn stub_litellm(exists: bool) -> (String, Arc<Mutex<Vec<String>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .fallback(stub_registry)
+            .with_state(Stub {
+                exists,
+                calls: calls.clone(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        (format!("http://{addr}"), calls)
+    }
+
+    fn client_against(base_url: String, may_rewrite: bool) -> Client {
+        Client {
+            base_url,
+            master_key: "sk-test".to_string(),
+            agent_name: "mac-studio-goose".to_string(),
+            re_register_on_card_change: may_rewrite,
+            http: reqwest::Client::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_first_boot_creates_the_entry() {
+        let (base, calls) = stub_litellm(false).await;
+        let registration = client_against(base, true)
+            .register("http://mac-studio.tail86fd19.ts.net:10099", "1.0")
+            .await
+            .expect("register");
+
+        assert_eq!(registration.agent_id, "id-1");
+        assert_eq!(
+            *calls.lock().expect("call log"),
+            vec!["GET /v1/agents", "POST /v1/agents"],
+            "nothing listed, so create - and the lookup happens first"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restart_after_an_unclean_shutdown_updates_and_never_reposts() {
+        // The failure this prevents: `POST` returns the 400 the stub would give
+        // on a second create, the host logs "registration failed", and it serves
+        // a card nobody can discover while looking registered.
+        let (base, calls) = stub_litellm(true).await;
+        let registration = client_against(base, true)
+            .register("http://mac-studio.tail86fd19.ts.net:10099", "1.0")
+            .await
+            .expect("register");
+
+        assert_eq!(
+            registration.agent_id, "id-1",
+            "our own stale entry, reclaimed"
+        );
+        assert_eq!(
+            *calls.lock().expect("call log"),
+            vec!["GET /v1/agents", "PUT /v1/agents/id-1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_that_may_not_rewrite_cards_adopts_the_entry() {
+        let (base, calls) = stub_litellm(true).await;
+        let registration = client_against(base, false)
+            .register("http://mac-studio.tail86fd19.ts.net:10099", "1.0")
+            .await
+            .expect("register");
+
+        assert_eq!(registration.agent_id, "id-1");
+        assert_eq!(
+            *calls.lock().expect("call log"),
+            vec!["GET /v1/agents", "GET /v1/agents/id-1"],
+            "adopted, not rewritten and not reposted"
+        );
+        // And `/status` reports what the directory actually holds, which is
+        // LiteLLM's synthesised card rather than ours.
+        assert_eq!(registration.skills, vec!["chat".to_string()]);
     }
 }
