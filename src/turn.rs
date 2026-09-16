@@ -168,6 +168,16 @@ pub trait Turns: Send + Sync + 'static {
     fn in_flight(&self) -> usize {
         0
     }
+
+    /// How many sessions are being held for reuse.
+    ///
+    /// Only meaningful next to [`Self::in_flight`]: the two numbers together say
+    /// whether a context's session is being kept (the reuse policy working) or
+    /// whether every turn is starting over (an operator's "why does my agent
+    /// have no memory" question).
+    fn retained(&self) -> usize {
+        0
+    }
 }
 
 /// How long a turn may take, from `registry.limits.maxWallClockSecondsPerTask`.

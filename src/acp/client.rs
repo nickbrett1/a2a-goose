@@ -123,8 +123,22 @@ impl AcpClient {
         self.transport.in_flight()
     }
 
-    /// Creates a session rooted at an already-validated directory.
-    pub async fn new_session(&self, cwd: &Path) -> Result<Session, AcpError> {
+    /// Creates a session rooted at an already-validated directory, and hands
+    /// back the update stream that belongs to it.
+    ///
+    /// The stream is *returned* rather than kept inside the [`Session`] because
+    /// a streamed turn reads updates while awaiting the prompt's reply, and a
+    /// session that owned its receiver could not be borrowed for the one and
+    /// mutably borrowed for the other. Handing it over also gives the two
+    /// callers one shape instead of two: a fresh session and a retained session
+    /// both need "a session, and the stream to read it on", and neither has to
+    /// ask the session for it. A retained session's stream is the one it was
+    /// created with — subscribing again would open a *second* SSE stream for the
+    /// same session and deliver every frame twice.
+    pub async fn new_session(
+        &self,
+        cwd: &Path,
+    ) -> Result<(Session, mpsc::Receiver<Value>), AcpError> {
         let result = self
             .transport
             .request(
@@ -152,13 +166,15 @@ impl AcpClient {
         // ordering S3 warns about.
         let updates = self.transport.subscribe(&session_id).await?;
 
-        Ok(Session {
-            scope: Scope::Session(session_id.clone()),
-            id: session_id,
+        Ok((
+            Session {
+                scope: Scope::Session(session_id.clone()),
+                id: session_id,
+                timeout: Duration::from_secs(self.timeouts.prompt_secs),
+                transport: Arc::clone(&self.transport),
+            },
             updates,
-            timeout: Duration::from_secs(self.timeouts.prompt_secs),
-            transport: Arc::clone(&self.transport),
-        })
+        ))
     }
 
     pub fn shutdown(&self) {
@@ -166,10 +182,13 @@ impl AcpClient {
     }
 }
 
-/// One ACP session: its id, its update stream, and its turn timeout.
+/// One ACP session: its id, and the transport it lives on.
+///
+/// Its update stream is not here — see [`AcpClient::new_session`] for why — and
+/// neither is a lifecycle beyond `close`, because a session is opened, prompted
+/// and closed, and the transport is what knows how to do all three.
 pub struct Session {
     id: String,
-    updates: mpsc::Receiver<Value>,
     scope: Scope,
     timeout: Duration,
     transport: Arc<Transport>,
@@ -178,20 +197,6 @@ pub struct Session {
 impl Session {
     pub fn id(&self) -> &str {
         &self.id
-    }
-
-    /// Hands the update stream to the caller.
-    ///
-    /// Taken rather than borrowed because a streamed turn needs to read updates
-    /// *while* awaiting the prompt reply, and a `&mut self` receiver plus a
-    /// `&self` prompt cannot both be held. Owning the receiver also makes the
-    /// stream's end (and therefore the session's) visible to its consumer.
-    pub fn take_updates(&mut self) -> Option<mpsc::Receiver<Value>> {
-        // `mpsc::Receiver` is not `Default`, so a taken receiver is replaced by
-        // a closed channel of the same shape: a later `recv` returns `None`
-        // rather than panicking on a `None` field.
-        let (_, closed) = mpsc::channel(1);
-        Some(std::mem::replace(&mut self.updates, closed))
     }
 
     pub async fn prompt(&self, text: &str) -> Result<Value, AcpError> {

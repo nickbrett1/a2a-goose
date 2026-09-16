@@ -176,7 +176,16 @@ pub fn status_payload(agent: &Agent) -> Value {
             "url": agent.config.goose.acp.url,
         },
         "registry": agent.registry.state(),
-        "sessions": { "count": agent.turns.in_flight() },
+        "sessions": {
+            "count": agent.turns.in_flight(),
+            // Sessions held for a context, so that reuse is visible rather than
+            // inferred: a host serving a multi-turn conversation reports a
+            // steady 1 while `count` returns to 0 between turns, and a host
+            // whose sessions are all being closed at the end of every turn
+            // reports 0 here and 0 there — which is the difference an operator
+            // needs to see when the symptom is "my agent forgets".
+            "retained": agent.turns.retained(),
+        },
     })
 }
 
@@ -294,6 +303,16 @@ mod tests {
                 "the status payload must not imply a dollar control: {rendered}"
             );
         }
+    }
+
+    #[test]
+    fn status_says_how_many_sessions_are_being_held() {
+        // `NoTurns` holds none, which is the honest answer for a process with no
+        // ACP runner: not "unknown", and not a number that implies reuse is
+        // happening.
+        let payload = status_payload(&agent());
+        assert_eq!(payload["sessions"]["count"], 0);
+        assert_eq!(payload["sessions"]["retained"], 0);
     }
 
     #[test]

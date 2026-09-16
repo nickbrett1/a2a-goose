@@ -1,36 +1,47 @@
-//! [`Turns`] over ACP: one `goose serve` connection, one session per turn.
+//! [`Turns`] over ACP: one `goose serve` connection, one session per context.
 //!
 //! This is the only place that turns [`crate::turn`]'s vocabulary into ACP
-//! method calls. Three decisions are worth reading before the code:
+//! method calls. Decisions worth reading before the code:
 //!
-//! - **The connection is shared and long-lived; the session is not.** [S4]
-//!   proved goose multiplexes concurrent sessions on one connection, so
-//!   connecting is amortised and the demultiplexer in [`crate::acp::transport`]
-//!   does the routing. A *session* is opened per A2A task in M1: `contextId` →
-//!   `sessionId` reuse is a separate feature (`goose.sessions.reuseByContext`)
-//!   and doing it here would mean owning an eviction policy, which is not this
-//!   module's business. The cost of not doing it is compute, not correctness —
-//!   every task still gets a real goose session with a real `cwd`.
-//! - **A dead connection is dropped, not repaired in place.** If a request on a
-//!   cached connection fails at the transport layer, the cache is cleared, so
-//!   the next turn opens a fresh connection with its own `initialize`. A
-//!   half-open connection that answers nothing would otherwise poison every
-//!   subsequent turn — and `goose serve` restarting under a supervised process
-//!   is a normal event, not an exceptional one.
+//! - **The connection is shared and long-lived.** [S4] proved goose multiplexes
+//!   concurrent sessions on one connection, so connecting is amortised and the
+//!   demultiplexer in [`crate::acp::transport`] does the routing.
+//! - **A session belongs to a `contextId`, and its reuse policy lives in
+//!   [`crate::acp::pool`].** A turn with a context and no session of its own
+//!   running gets the context's session; the turn after it gets the same one,
+//!   which is what gives a conversation its memory. Which session that is, when
+//!   it is given up and what evicts it are [`crate::acp::pool`]'s business; what
+//!   this module adds is the wiring — a session only exists on the connection
+//!   that opened it, so the pool lives *inside* [`Connection`] and cannot be
+//!   forgotten separately from it.
+//! - **A dead connection is dropped, not repaired in place.** If the connection
+//!   fails at the transport layer, the cache *and the pool* are cleared, so the
+//!   next turn opens a fresh connection with its own `initialize` and every
+//!   context starts a new session. A half-open connection that answers nothing
+//!   would otherwise poison every subsequent turn — and `goose serve` restarting
+//!   under a supervised process is a normal event, not an exceptional one. The
+//!   cost is real and is worth naming: a reconnect loses every context's session,
+//!   so the conversations lose their label (goose's own `sessions.db` keeps the
+//!   history). It is still the right trade, because the alternative is handing
+//!   out sessions that cannot answer.
 //! - **The wall-clock bound lives here, not at the A2A edge.** A bound checked
 //!   between events cannot fire on the turn that has gone quiet, which is the
 //!   only kind of turn that needs one.
 //!
 //! [S4]: ../../spikes/S4.md
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use futures::stream::BoxStream;
 use serde_json::Value;
 use tokio::sync::{Mutex, Semaphore, mpsc};
 
 use crate::acp::client::{AcpClient, Session};
+use crate::acp::pool::{Acquired, Claim, Idle, Pool};
+use crate::acp::transport::AcpError;
 use crate::config::Config;
 use crate::turn::{
     ContextUsage, Limit, TurnError, TurnEvent, TurnHealth, TurnRequest, Turns, Usage,
@@ -45,6 +56,11 @@ const EVENT_BUFFER: usize = 256;
 /// The `stopReason` goose sends when a turn ran to completion.
 pub const STOP_END_TURN: &str = "end_turn";
 
+/// A message for a poisoned pool lock. Poisoning means a panic while a turn held
+/// the pool, which is a bug rather than a condition to recover from — but a turn
+/// that has already failed should not fail *again* on the way out.
+const POOL_POISONED: &str = "the session pool lock is poisoned";
+
 /// Turns over ACP.
 pub struct AcpTurns {
     config: Arc<Config>,
@@ -53,11 +69,44 @@ pub struct AcpTurns {
     capacity: usize,
 }
 
-/// The connection shared by every turn, and the flag that lets `/status` report
-/// on it without taking a lock (`/status` must never be the thing that blocks).
+/// A session kept for a context, and the stream its updates arrive on.
+///
+/// The receiver is stored *with* the session rather than inside
+/// [`crate::acp::client::Session`] so that both can be borrowed at once: the
+/// prompt needs `&Session` and the update loop needs `&mut Receiver`, and
+/// keeping them in one struct would make that a borrow error.
+struct Retained {
+    session: Session,
+    updates: mpsc::Receiver<Value>,
+}
+
+impl Retained {
+    /// Lets the pool's eviction paths close what they dropped without knowing
+    /// what a session is made of.
+    async fn close(&self) {
+        self.session.close().await;
+    }
+}
+
+/// The connection shared by every turn, and the state that only makes sense
+/// alongside it.
+///
+/// The pool is a field here rather than a sibling because a session is
+/// meaningless on any connection but the one that opened it: there is no way to
+/// lose one without losing the other, which is what rule 3 of
+/// [`crate::acp::pool`] asks for and what this shape makes unfalsifiable.
 #[derive(Default)]
 struct Connection {
     client: Mutex<Option<Arc<AcpClient>>>,
+    /// A `std` mutex, unlike the client's, and deliberately: nothing here is
+    /// ever held across an `await` — the lock is taken, a decision is made, and
+    /// it is dropped — so there is no reason to pay for an async one, and a
+    /// synchronous lock is what [`Claim`]'s `Drop` can use. Lock order, when
+    /// both are needed, is client before pool; no path takes them the other way
+    /// round.
+    pool: std::sync::Mutex<Pool<Retained>>,
+    /// Read by `/status` without taking a lock: `/status` must never be the
+    /// thing that blocks.
     live: AtomicBool,
 }
 
@@ -118,6 +167,78 @@ impl Turns for AcpTurns {
     fn in_flight(&self) -> usize {
         self.capacity - self.permits.available_permits()
     }
+
+    fn retained(&self) -> usize {
+        // A poisoned lock reads as zero rather than panicking: `/status` is what
+        // an operator asks when something is already wrong.
+        self.connection.pool.lock().map_or(0, |pool| pool.len())
+    }
+}
+
+/// Claims a context for this turn and hands over its idle session, if it has one
+/// that may be reused.
+///
+/// The returned guard must live as long as the turn: it is what makes the
+/// context look busy to a second turn that arrives meanwhile, and its `Drop` is
+/// what releases it — on the happy path, on an error, and on a timeout alike.
+fn take_session<'a>(
+    config: &Config,
+    connection: &'a Connection,
+    context: &str,
+    cwd: &Path,
+) -> (Acquired<Retained>, Claim<'a, Retained>, Vec<Idle<Retained>>) {
+    let sessions = &config.goose.sessions;
+    let mut pool = connection.pool.lock().expect(POOL_POISONED);
+    let (acquired, dropped) = pool.acquire(
+        context,
+        cwd,
+        Instant::now(),
+        Duration::from_secs(sessions.idle_ttl_secs),
+    );
+    (
+        acquired,
+        Claim::new(&connection.pool, context.to_string()),
+        dropped,
+    )
+}
+
+/// Puts a finished session back as its context's own. Returns whatever the pool
+/// evicted to make room, for the caller to close.
+fn retain_session(
+    config: &Config,
+    connection: &Connection,
+    context: String,
+    retained: Retained,
+    cwd: PathBuf,
+) -> Vec<Idle<Retained>> {
+    let idle = Idle {
+        session: retained,
+        cwd,
+        last_used: Instant::now(),
+    };
+    connection.pool.lock().expect(POOL_POISONED).retain(
+        &context,
+        idle,
+        config.goose.sessions.max_sessions,
+    )
+}
+
+/// Forgets the connection and everything that lived on it.
+///
+/// The sessions are dropped rather than closed: `session/close` is a request,
+/// and the connection that would answer it is the one that has gone. Dropping
+/// them closes their streams, and goose reaps the sessions from its own side.
+async fn die(connection: &Connection) {
+    let mut slot = connection.client.lock().await;
+    *slot = None;
+    connection.live.store(false, Ordering::Relaxed);
+    let discarded = connection.pool.lock().expect(POOL_POISONED).clear();
+    if discarded > 0 {
+        tracing::info!(
+            sessions = discarded,
+            "discarded the session pool along with its connection"
+        );
+    }
 }
 
 async fn run_turn(
@@ -144,47 +265,142 @@ async fn run_turn(
         })?;
 
     let client = connect_or_reuse(config, connection).await?;
-    let mut session = match client.new_session(&request.cwd).await {
-        Ok(session) => session,
-        Err(err) => {
-            // Do not hand the next turn the connection that just failed.
-            let mut slot = connection.client.lock().await;
-            *slot = None;
-            connection.live.store(false, Ordering::Relaxed);
-            return Err(TurnError::Transport(err.to_string()));
-        }
+
+    // A turn belongs to a context only if the caller named one and this host
+    // keeps sessions at all. Otherwise it is exactly the turn M1 ran: a fresh
+    // session, closed when it is done, with nothing remembered between turns.
+    let context = match config.goose.sessions.reuse_by_context {
+        true => request.context.clone(),
+        false => None,
     };
 
-    let outcome =
-        tokio::time::timeout(request.wall_clock, pump(&mut session, &request, events)).await;
+    // `owns` is the pool's answer to "may this turn become the context's
+    // session": true if it took the context's own session, or if it is the first
+    // turn for that context. A turn that arrives while another is running gets a
+    // throwaway instead — see rule 1 of `crate::acp::pool`.
+    let mut owns = true;
+    let mut acquired = None;
+    let mut claim = None;
+    if let Some(context) = context.as_deref() {
+        let (take, guard, evicted) = take_session(config, connection, context, &request.cwd);
+        owns = match take {
+            Acquired::Reuse(idle) => {
+                acquired = Some(idle);
+                true
+            }
+            Acquired::Fresh { vacant } => vacant,
+        };
+        claim = Some(guard);
+        for idle in evicted {
+            // Evicted by the pool's own rules, on a connection that is alive:
+            // closed rather than dropped, because an abandoned session is one
+            // nothing will ever close.
+            idle.session.close().await;
+        }
+    }
 
-    // Best effort, and after the outcome is decided, so a session that cannot be
-    // closed does not turn a completed turn into a failed one.
-    session.close().await;
+    // This turn's session: the context's, or a fresh one. A retained session
+    // arrives with its update stream, so nothing is re-subscribed.
+    let (session, mut updates) = match acquired {
+        Some(idle) => {
+            let Retained { session, updates } = idle.session;
+            (session, updates)
+        }
+        None => match client.new_session(&request.cwd).await {
+            Ok(pair) => pair,
+            Err(err) => {
+                // Everything on this connection is now suspect, and the next
+                // turn must not be handed any of it.
+                if err.is_connection_loss() {
+                    die(connection).await;
+                }
+                return Err(TurnError::Transport(err.to_string()));
+            }
+        },
+    };
 
-    match outcome {
-        Ok(outcome) => outcome,
+    let outcome = match tokio::time::timeout(
+        request.wall_clock,
+        pump(&session, &mut updates, &request, events),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(PumpError::Acp(err))) => {
+            if err.is_connection_loss() {
+                die(connection).await;
+            }
+            Err(TurnError::Transport(err.to_string()))
+        }
+        Ok(Err(PumpError::CallerGone)) => Err(TurnError::Transport(
+            "the caller disconnected while the turn was running".to_string(),
+        )),
         Err(_) => Err(TurnError::Limit {
             limit: Limit::WallClock,
             allowed: request.wall_clock.as_secs(),
             observed: request.wall_clock.as_secs(),
         }),
+    };
+
+    // A session is kept only if the turn finished cleanly *and* this turn is the
+    // one that owns the context's memory. A failure does not keep it: after a
+    // wall-clock timeout the prompt may still be running inside goose, and
+    // handing the next turn a session with a prompt in flight would be worse
+    // than making it start over. The context loses its session either way only
+    // when a turn fails — and it loses the *label*, not the conversation, which
+    // is goose's own `sessions.db` (hard constraint #1).
+    match (context, outcome.is_ok() && owns) {
+        (Some(context), true) => {
+            let retained = Retained { session, updates };
+            for idle in retain_session(config, connection, context, retained, request.cwd.clone()) {
+                idle.session.close().await;
+            }
+        }
+        // Best effort, and after the outcome is decided, so a session that
+        // cannot be closed does not turn a completed turn into a failed one.
+        _ => session.close().await,
+    }
+    // Released last: the context stays busy until its session is back in the
+    // pool, so a turn arriving in between runs a throwaway rather than racing
+    // this one for the same session.
+    drop(claim);
+
+    outcome
+}
+
+/// Why a pump stopped before it saw the turn end.
+enum PumpError {
+    /// The ACP hop itself failed.
+    Acp(AcpError),
+    /// The caller stopped reading. The turn is abandoned, not broken.
+    CallerGone,
+}
+
+impl From<AcpError> for PumpError {
+    fn from(err: AcpError) -> Self {
+        Self::Acp(err)
     }
 }
 
 /// Reads a live session's updates while awaiting the prompt's reply.
 async fn pump(
-    session: &mut Session,
+    session: &Session,
+    updates: &mut mpsc::Receiver<Value>,
     request: &TurnRequest,
     events: &mpsc::Sender<Result<TurnEvent, TurnError>>,
-) -> Result<(), TurnError> {
-    let mut updates = session.take_updates().ok_or_else(|| {
-        TurnError::Transport("this session's update stream was already taken".to_string())
-    })?;
+) -> Result<(), PumpError> {
+    // Whatever is already buffered belongs to the turn *before* this one, and
+    // must not be reported as this turn's news. This is not hypothetical: the
+    // turn S3 recorded ends with a `session_info_update` that arrives *after*
+    // the prompt's reply, so a reused session really does start with a previous
+    // turn's frame already waiting. Frames still in flight cannot be told apart
+    // from this turn's — they carry no turn id — but the ones that have landed
+    // can be, and are.
+    while updates.try_recv().is_ok() {}
 
-    // Started *after* the updates are in hand, and this ordering is the reason
-    // `Session::take_updates` exists: a reply that arrives on a stream that is
-    // not being read is a reply that never arrives.
+    // Started *after* the stream is draining, and the ordering is why the stream
+    // is handed to this function at all: a reply that arrives on a stream nobody
+    // is reading is a reply that never arrives.
     let prompt = session.prompt(&request.prompt);
     futures::pin_mut!(prompt);
 
@@ -195,7 +411,7 @@ async fn pump(
             // a burst of notifications.
             biased;
             reply = &mut prompt => {
-                let reply = reply.map_err(|err| TurnError::Transport(err.to_string()))?;
+                let reply = reply?;
                 for event in finish_events(&reply) {
                     emit(events, event).await?;
                 }
@@ -219,10 +435,11 @@ async fn pump(
 async fn emit(
     events: &mpsc::Sender<Result<TurnEvent, TurnError>>,
     event: TurnEvent,
-) -> Result<(), TurnError> {
-    events.send(Ok(event)).await.map_err(|_| {
-        TurnError::Transport("the caller disconnected while the turn was running".to_string())
-    })
+) -> Result<(), PumpError> {
+    events
+        .send(Ok(event))
+        .await
+        .map_err(|_| PumpError::CallerGone)
 }
 
 async fn connect_or_reuse(
@@ -234,7 +451,9 @@ async fn connect_or_reuse(
         return Ok(Arc::clone(client));
     }
     // Held across the connect on purpose: two turns arriving on a cold cache
-    // should produce one connection, not two racing `initialize`s.
+    // should produce one connection, not two racing `initialize`s. Nothing needs
+    // clearing on failure: a connection slot that is empty already means an empty
+    // pool, because `die` is the only thing that empties one.
     let client = Arc::new(
         AcpClient::connect(&config.goose.acp)
             .await
