@@ -49,6 +49,9 @@ steps:
           # a warning, and native modules built for the wrong architecture).
           platform: linux/arm64
           workdir: /workdir
+          environment:
+            - RELEASE_TARGET
+            - CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER
     commands:
       - |
         mkdir -p "build/x86_64-unknown-linux-musl/bin"
