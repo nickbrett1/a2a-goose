@@ -25,6 +25,14 @@ a2a-server = { package = "a2a-server-lf", version = "0.4.4" }
 axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 
+# `AgentExecutor` hands back a `BoxStream`, so implementing it means naming
+# `futures` types. Same version the SDK already builds against.
+futures = "0.3"
+
+# `TaskStatus.timestamp` is a `chrono::DateTime<Utc>`, and the SDK does not
+# re-export chrono. Already in the tree via `a2a-lf`.
+chrono = { version = "0.4", features = ["serde"] }
+
 # Config and card serialisation. `serde_yaml` is what parses recipe YAML for
 # skill mining (recipes.rs) - a deprecated crate, but the only stable YAML
 # parser here and the shapes are small.
