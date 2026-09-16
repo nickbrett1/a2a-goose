@@ -193,8 +193,16 @@ pub struct Goose {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Acp {
+    /// Where the ACP endpoint lives on the host's `goose serve`.
+    ///
+    /// Written either as the endpoint (`http://127.0.0.1:3284/acp`) or as the
+    /// origin (`http://127.0.0.1:3284`); [`crate::acp::acp_endpoint`] normalises
+    /// both to the same URL, so neither spelling is a trap.
     #[serde(default = "default_acp_url")]
     pub url: String,
+    /// The *name* of the variable holding goose's `X-Secret-Key`, never the key.
+    ///
+    /// Read by [`crate::acp::secret_key`] and sent on every ACP request.
     #[serde(default = "default_goose_secret_env")]
     pub secret_env: String,
     #[serde(default)]

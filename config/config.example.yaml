@@ -59,8 +59,15 @@ skills:
 
 goose:
   acp:
+    # The ACP endpoint on the host's `goose serve`. Either spelling works and
+    # both are dialled the same: with the path (as here) or as the bare origin
+    # `http://127.0.0.1:3284`. A path prefix survives, so a proxy in front of
+    # goose is spelled and dialled as written.
     url: "http://127.0.0.1:3284/acp"
     # Name of the variable holding goose's X-Secret-Key (GOOSE_SERVER__SECRET_KEY).
+    # This is read, and sent as `X-Secret-Key` on every ACP request. Unset or
+    # empty means no header, which is right for a goose started with
+    # `--dangerously-unauthenticated`; goose answers 401 if it wanted one.
     secretEnv: "GOOSE_SERVER__SECRET_KEY"
     timeouts:
       initializeSecs: 10

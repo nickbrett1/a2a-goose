@@ -87,6 +87,12 @@ async fn run() -> anyhow::Result<()> {
     let turns: Arc<dyn Turns> = Arc::new(AcpTurns::new(Arc::clone(&config)));
     tracing::info!(
         acp = %config.goose.acp.url,
+        // Whether goose will want a key is only knowable by asking it, but
+        // whether this process *has* one is knowable now — and a host that is
+        // about to run every turn into a 401 should hear about it at boot
+        // rather than from the first caller.
+        acp_secret_set = a2a_goose::acp::client::secret_key(&config.goose.acp).is_some(),
+        acp_secret_env = %config.goose.acp.secret_env,
         max_concurrent_sessions = config.registry.limits.max_concurrent_sessions,
         "turns will run over ACP"
     );

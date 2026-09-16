@@ -35,6 +35,34 @@ use tokio::task::JoinHandle;
 /// Where goose serves the ACP transport on a `goose serve` process.
 pub const ACP_PATH: &str = "/acp";
 
+/// goose's ACP credential, sent on every request when this process holds one.
+///
+/// The value never comes from config — `goose.acp.secretEnv` names the variable
+/// that holds it, and [`crate::acp::client::secret_key`] is the only thing that
+/// reads it.
+pub const SECRET_HEADER: &str = "X-Secret-Key";
+
+/// Turns a configured `goose.acp.url` into the one endpoint every request dials.
+///
+/// The field is written both ways in the wild: as the endpoint
+/// (`http://127.0.0.1:3284/acp` — what the example config and [S1] show) and as
+/// the origin (`http://127.0.0.1:3284`). Appending the path blindly turned the
+/// first spelling into `/acp/acp`, so every turn was answered `404` and the only
+/// thing that worked was the spelling the shipped config did *not* use
+/// (mac-studio, 2026-09-16). Normalising here means both dial the same endpoint:
+/// a trailing slash is not a different server, and a URL that already carries
+/// the path is not asking for it twice.
+///
+/// A path *prefix* survives, so a reverse proxy in front of goose
+/// (`https://host/goose/acp`) is spelled and dialled the same way.
+///
+/// [S1]: ../../spikes/S1.md
+pub fn acp_endpoint(url: &str) -> String {
+    let base = url.trim_end_matches('/');
+    let base = base.strip_suffix(ACP_PATH).unwrap_or(base);
+    format!("{base}{ACP_PATH}")
+}
+
 /// Carries the connection id: a response header on `initialize`, a request header
 /// on everything afterwards.
 pub const CONNECTION_ID_HEADER: &str = "Acp-Connection-Id";
@@ -291,10 +319,23 @@ pub fn take_events(buffer: &mut String) -> Vec<String> {
     events
 }
 
+/// Attaches goose's credential when this process holds one.
+///
+/// One place rather than three, because every request on the connection needs it
+/// — `initialize` included — and a missing header on exactly one of them is a
+/// 401 that only shows up on the path that forgot.
+fn with_secret(request: reqwest::RequestBuilder, secret: Option<&str>) -> reqwest::RequestBuilder {
+    match secret {
+        Some(secret) => request.header(SECRET_HEADER, secret),
+        None => request,
+    }
+}
+
 /// The ACP connection: one POST endpoint, one connection-level stream, and a
 /// per-session stream opened on demand.
 pub struct Transport {
-    base_url: String,
+    endpoint: String,
+    secret: Option<Arc<str>>,
     connection_id: Arc<str>,
     http: reqwest::Client,
     dispatcher: Arc<Dispatcher>,
@@ -308,12 +349,20 @@ impl Transport {
     /// The stream is opened *here* rather than lazily because `session/new`'s
     /// reply comes back on it, so a session can never be created on a connection
     /// whose stream is not already being read.
-    pub async fn connect(base_url: &str, initialize_timeout: Duration) -> Result<Self, AcpError> {
+    ///
+    /// `url` is `goose.acp.url` and is normalised by [`acp_endpoint`]. `secret`
+    /// is the value named by `goose.acp.secretEnv`, or `None` when this process
+    /// does not have it — which is not an error here, because whether goose
+    /// wants a key is goose's business, and the 401 it answers says so plainly.
+    pub async fn connect(
+        url: &str,
+        secret: Option<&str>,
+        initialize_timeout: Duration,
+    ) -> Result<Self, AcpError> {
         let http = reqwest::Client::new();
-        let base_url = base_url.trim_end_matches('/').to_string();
+        let endpoint = acp_endpoint(url);
 
-        let response = http
-            .post(format!("{base_url}{ACP_PATH}"))
+        let response = with_secret(http.post(&endpoint), secret)
             .json(&serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 0,
@@ -342,7 +391,8 @@ impl Transport {
         let connection_id = connection_id.ok_or(AcpError::NoConnectionId)?;
 
         let transport = Self {
-            base_url,
+            endpoint,
+            secret: secret.map(Arc::from),
             connection_id: Arc::from(connection_id.as_str()),
             http,
             dispatcher: Arc::new(Dispatcher::new()),
@@ -360,9 +410,7 @@ impl Transport {
     /// Starts reading a stream. Safe to call twice for the same scope; the
     /// caller owns avoiding that.
     async fn open_stream(&self, scope: Scope) -> Result<(), AcpError> {
-        let mut request = self
-            .http
-            .get(format!("{}{ACP_PATH}", self.base_url))
+        let mut request = with_secret(self.http.get(&self.endpoint), self.secret.as_deref())
             .header(CONNECTION_ID_HEADER, self.connection_id.as_ref())
             .header(reqwest::header::ACCEPT, "text/event-stream");
         if let Scope::Session(session_id) = &scope {
@@ -401,9 +449,7 @@ impl Transport {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let reply = self.dispatcher.expect(id);
 
-        let mut request = self
-            .http
-            .post(format!("{}{ACP_PATH}", self.base_url))
+        let mut request = with_secret(self.http.post(&self.endpoint), self.secret.as_deref())
             .header(CONNECTION_ID_HEADER, self.connection_id.as_ref())
             .json(&serde_json::json!({
                 "jsonrpc": "2.0",
@@ -625,6 +671,41 @@ mod tests {
         assert_eq!(
             received[3]["params"]["update"]["content"]["text"], "ok",
             "agent_message_chunk carries the turn's output"
+        );
+    }
+
+    #[test]
+    fn a_configured_url_is_dialled_the_same_however_it_is_spelled() {
+        // The two spellings that actually exist: the example config and the
+        // spike notes write the endpoint, the mac-studio host wrote the origin.
+        // Blindly appending the path turned the first into `/acp/acp` and 404ed
+        // every turn, so this is the bug in one assertion.
+        assert_eq!(
+            acp_endpoint("http://127.0.0.1:3284/acp"),
+            "http://127.0.0.1:3284/acp"
+        );
+        assert_eq!(
+            acp_endpoint("http://127.0.0.1:3284"),
+            "http://127.0.0.1:3284/acp"
+        );
+        // A trailing slash is not a different server.
+        assert_eq!(
+            acp_endpoint("http://127.0.0.1:3284/"),
+            "http://127.0.0.1:3284/acp"
+        );
+        assert_eq!(
+            acp_endpoint("http://127.0.0.1:3284/acp/"),
+            "http://127.0.0.1:3284/acp"
+        );
+        // A path prefix survives, so a reverse proxy in front of goose is
+        // spelled once and dialled as written.
+        assert_eq!(
+            acp_endpoint("https://host.example/goose/acp"),
+            "https://host.example/goose/acp"
+        );
+        assert_eq!(
+            acp_endpoint("https://host.example/goose"),
+            "https://host.example/goose/acp"
         );
     }
 
