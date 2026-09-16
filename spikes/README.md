@@ -13,7 +13,7 @@ is quoted in each file; the sanitised S3 frames are committed as
 | # | Question | Verdict |
 | --- | -------- | ------- |
 | [S1](S1.md) | Which `goose serve` invocation? | **PASS** — identical surface; pin the bare one |
-| [S2](S2.md) | Does goose forward `X-LiteLLM-Trace-Id` to its provider calls? | **FAIL as specified** — 🚩 escalation, needs a decision |
+| [S2](S2.md) | Does goose forward `X-LiteLLM-Trace-Id` to its provider calls? | **FAIL as specified** — 🚩 escalated, then **decided**: local limits + per-agent key budget |
 | [S3](S3.md) | Exact shapes of the ACP methods | **PASS** — fixtures committed; the transport is POST **+ SSE** |
 | [S4](S4.md) | Does one `goose serve` handle concurrent sessions? | **PASS** — concurrent, isolated, 2.0s for two turns |
 | [S5](S5.md) | Does `DELETE /v1/agents/{id}` 404 on an already-deleted id? | **PASS** — 404; the sweeper's guard #3 holds |
@@ -30,9 +30,15 @@ is quoted in each file; the sanitised S3 frames are committed as
 
 Four spikes changed the plan or this repo. They are the ones worth reading:
 
-- **S2** — cost control changes shape. goose 1.50.x cannot carry a per-session
-  trace id upstream, so §6.7's per-thread budgets are not implementable on the
-  deployed goose. This is an explicit **§12.6 escalation trigger**: stop and ask.
+- **S2** — cost control changes shape, twice over. goose 1.50.x cannot carry a
+  per-session trace id upstream, **and** LiteLLM 1.103.0 silently drops
+  `max_iterations` / `max_budget_per_session` /
+  `require_trace_id_on_calls_by_agent` on `POST /v1/agents` — so §6.7 as written
+  is not implementable on either side. Escalated (§12.6), then **decided**:
+  the agent limits itself using the `usage_update` stream (S4/S6), and LiteLLM
+  is the backstop via one virtual key + Budget object per node agent. Per-thread
+  budgets are dropped from Phase 1. Full reasoning in the decision section at
+  the end of [S2](S2.md).
 - **S3** — the ACP transport is **HTTP POST for requests *plus* SSE for replies
   and notifications**, not "POST for requests, WebSocket for notifications" as
   §6.4 assumed. `session/new` and `session/prompt` return 202 with an empty body.

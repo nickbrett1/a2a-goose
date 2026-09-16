@@ -97,12 +97,35 @@ registry:
   # on change, DELETE then POST. Skills do not auto-propagate through LiteLLM,
   # so this is how "edit a recipe, restart" converges the registry.
   reRegisterOnCardChange: true
-  # Parked pending the S2 decision (spikes/S2.md, plan 12.6): the plan's
-  # per-thread budgets needed goose to forward a per-session `x-litellm-trace-id`
-  # upstream, and goose 1.50.x cannot. No `require_trace_id_on_calls_by_agent`
-  # or `max_budget_per_session` field appears here until that is settled; the
-  # working fallback is one LiteLLM key per node agent, capped per key.
-  perAgentKeyEnv: "LITELLM_AGENT_KEY"
+
+  # Cost control, settled by the S2 decision (see spikes/S2.md). Two halves, and
+  # the order matters:
+  #
+  # 1. The agent limits itself. Limits live here because the ACP stream gives us
+  #    `usage_update` (used/size per session) and every turn returns `stopReason`
+  #    - so we can stop a turn without asking LiteLLM or goose for anything.
+  #    This is the control that works even if the proxy is misconfigured.
+  limits:
+    maxIterationsPerTask: 12        # consecutive goose turns for one A2A task
+    maxConcurrentSessions: 4        # across the whole host, not per context
+    maxTokensPerContext: 400000     # from usage_update.used, summed over the task
+    maxWallClockSecondsPerTask: 900
+
+  # 2. LiteLLM is the backstop, per node agent, via a Budget object attached to
+  #    a virtual key that only this agent uses. Not per-thread: goose 1.50.x
+  #    cannot forward a per-session trace header, and LiteLLM 1.103.0 drops
+  #    require_trace_id_on_calls_by_agent / max_budget_per_session on POST. A key
+  #    per agent also gives the attribution `x-litellm-trace-id` was meant to.
+  #    `budget_duration: "30d"` resets at the START OF THE NEXT CALENDAR MONTH,
+  #    not now+30d (verified against nas:4000 - see spikes/S2.md).
+  keyEnv: "LITELLM_AGENT_KEY"       # this agent's own virtual key
+  budget:
+    budgetDuration: "30d"
+    maxBudgetUsd: 20                # hard: requests fail once exceeded
+    softBudgetUsd: 15               # alert only, does not fail a call
+  # Parked, deliberately, and not a TODO: the plan's section 6.7 per-thread
+  # fields. Revisit only if a goose release ships `session_id_header_override`.
+  perThreadBudget: false
 
 executor:
   # On a client disconnect mid-turn: `cancel` or `orphan`. `cancel` is the
