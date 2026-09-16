@@ -1,0 +1,46 @@
+{
+  "url": "http://nas:4000/a2a/00000000-0000-0000-0000-000000000000",
+  "name": "s13-probe-agent",
+  "skills": [
+    {
+      "id": "chat",
+      "name": "Chat",
+      "tags": [
+        "chat"
+      ],
+      "description": "Conversational interaction with the agent."
+    }
+  ],
+  "version": "1.0.0",
+  "provider": {
+    "url": "http://nas:4000",
+    "organization": "LiteLLM Proxy"
+  },
+  "security": [
+    {
+      "LiteLLMKey": []
+    }
+  ],
+  "capabilities": {},
+  "protocolVersion": "1.0",
+  "securitySchemes": {
+    "LiteLLMKey": {
+      "type": "http",
+      "scheme": "bearer",
+      "description": "LiteLLM virtual key"
+    }
+  },
+  "defaultInputModes": [
+    "text"
+  ],
+  "defaultOutputModes": [
+    "text"
+  ],
+  "supportedInterfaces": [
+    {
+      "url": "http://nas:4000/a2a/00000000-0000-0000-0000-000000000000",
+      "protocolBinding": "JSONRPC",
+      "protocolVersion": "1.0"
+    }
+  ]
+}

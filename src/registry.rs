@@ -257,6 +257,38 @@ impl Registry {
     }
 }
 
+/// Reads a `POST /v1/agents` response.
+///
+/// Split out from the request so the shape is testable against the *real*
+/// response, which is committed as `tests/fixtures/litellm-agent-registration.json`
+/// — LiteLLM's answer is a contract we depend on and cannot type, so it is
+/// pinned rather than assumed.
+fn parse_registration(text: &str) -> Result<Registration, RegistryError> {
+    let value: Value = serde_json::from_str(text).map_err(|_| RegistryError::NoAgentId {
+        body: text.to_string(),
+    })?;
+    let agent_id = value
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| RegistryError::NoAgentId {
+            body: text.to_string(),
+        })?;
+
+    // The skills live *inside* `agent_card_params`, not at the top level, and
+    // S5's finding is why reading them matters at all: a registration whose
+    // upstream card has not been fetched answers with LiteLLM's own synthesised
+    // card, so `["chat"]` means "not read ours yet" rather than "registered and
+    // matching". Reported rather than acted on, because the remedy is a
+    // re-registration, not a retry.
+    let card = value.get("agent_card_params").unwrap_or(&value);
+
+    Ok(Registration {
+        agent_id,
+        skills: crate::card::skill_ids(card),
+    })
+}
+
 impl Client {
     async fn register(
         &self,
@@ -291,18 +323,7 @@ impl Client {
             });
         }
 
-        let value: Value = serde_json::from_str(&text)
-            .map_err(|_| RegistryError::NoAgentId { body: text.clone() })?;
-        let agent_id = value
-            .get("agent_id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or(RegistryError::NoAgentId { body: text.clone() })?;
-
-        Ok(Registration {
-            agent_id,
-            skills: crate::card::skill_ids(&value),
-        })
+        parse_registration(&text)
     }
 
     async fn deregister(&self, agent_id: &str) -> Result<(), RegistryError> {
@@ -378,6 +399,51 @@ mod tests {
         runtime.block_on(registry.deregister());
         unsafe { std::env::remove_var("A2A_GOOSE_TEST_MASTER_KEY_9f3b") };
         assert_eq!(registry.state(), RegistryState::Unregistered);
+    }
+
+    /// LiteLLM 1.103.0's actual `POST /v1/agents` response, with the id and name
+    /// replaced. The shape is the point: `agent_card_params` is LiteLLM's
+    /// *synthesised* card, not the three fields we sent, and its skills are
+    /// LiteLLM's defaults rather than ours.
+    const REGISTRATION_RESPONSE: &str =
+        include_str!("../tests/fixtures/litellm-agent-registration.json");
+
+    #[test]
+    fn a_real_registration_response_parses_into_an_id_and_litellms_own_skills() {
+        let registration = parse_registration(REGISTRATION_RESPONSE).expect("parse");
+        assert_eq!(
+            registration.agent_id,
+            "00000000-0000-0000-0000-000000000000"
+        );
+        assert_eq!(
+            registration.skills,
+            vec!["chat".to_string()],
+            "the response card is LiteLLM's synthesised default, so this is what \
+             `unregistered-pending-fetch` looks like - and why /status reports it"
+        );
+    }
+
+    #[test]
+    fn a_response_without_an_agent_id_is_refused_because_it_could_never_be_deleted() {
+        let err = parse_registration(r#"{"agent_name":"x","agent_card_params":{}}"#).unwrap_err();
+        assert!(matches!(err, RegistryError::NoAgentId { .. }), "{err}");
+        assert!(err.to_string().contains("agent_id"), "{err}");
+    }
+
+    #[test]
+    fn a_response_that_is_not_json_is_refused() {
+        let err = parse_registration("<html>502 Bad Gateway</html>").unwrap_err();
+        assert!(matches!(err, RegistryError::NoAgentId { .. }), "{err}");
+    }
+
+    #[test]
+    fn top_level_skills_are_read_when_there_is_no_card_envelope() {
+        // Belt and braces: the SDK's own docs disagree with themselves about
+        // which shape is returned, so both are accepted rather than one being
+        // silently read as "no skills".
+        let registration =
+            parse_registration(r#"{"agent_id":"a","skills":[{"id":"ask"}]}"#).expect("parse");
+        assert_eq!(registration.skills, vec!["ask".to_string()]);
     }
 
     #[test]

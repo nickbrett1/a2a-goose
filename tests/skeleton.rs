@@ -135,6 +135,76 @@ fn rpc_body(text: &str) -> Value {
     })
 }
 
+#[tokio::test]
+async fn the_jsonrpc_wire_is_pinned_independently_of_the_sdk() {
+    // Every other test in this file reads the wire through `a2a-client-lf`, which
+    // is the same SDK that wrote it — so a serialisation change would move both
+    // sides together and pass. This one reads it raw, and pins the three things a
+    // caller outside this repo would notice: the method names, the state
+    // vocabulary, and the fact that a response is the POST body.
+    let fixture = boot().await;
+    let response: Value = reqwest::Client::new()
+        .post(format!("{}/", fixture.base))
+        .bearer_auth(TOKEN)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "SendMessage",
+            "params": {
+                "message": {
+                    "messageId": "m1",
+                    "role": "ROLE_USER",
+                    "parts": [{ "text": "hello" }],
+                }
+            }
+        }))
+        .send()
+        .await
+        .expect("POST")
+        .json()
+        .await
+        .expect("a unary call answers in the POST body");
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 7);
+    let task = &response["result"]["task"];
+    assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED");
+    assert_eq!(task["status"]["message"]["role"], "ROLE_AGENT");
+    assert!(task["id"].is_string());
+    assert!(task["contextId"].is_string());
+
+    // And the streaming method is the SDK's own name for it, not `message/stream`.
+    let stream = reqwest::Client::new()
+        .post(format!("{}/", fixture.base))
+        .bearer_auth(TOKEN)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "SendStreamingMessage",
+            "params": {
+                "message": {
+                    "messageId": "m2",
+                    "role": "ROLE_USER",
+                    "parts": [{ "text": "hello again" }],
+                }
+            }
+        }))
+        .send()
+        .await
+        .expect("POST stream")
+        .text()
+        .await
+        .expect("SSE body");
+    assert!(
+        stream.contains("data: "),
+        "SSE frames are `data:` lines: {stream}"
+    );
+    assert!(
+        stream.contains("\"TASK_STATE_COMPLETED\""),
+        "the streamed task is the same shape: {stream}"
+    );
+}
+
 /// The served card, as the SDK parses it, with the interface address rewritten to
 /// the port this test is actually listening on.
 ///

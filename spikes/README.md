@@ -18,17 +18,17 @@ is quoted in each file; the sanitised S3 frames are committed as
 | [S4](S4.md) | Does one `goose serve` handle concurrent sessions? | **PASS** — concurrent, isolated, 2.0s for two turns |
 | [S5](S5.md) | Does `DELETE /v1/agents/{id}` 404 on an already-deleted id? | **PASS** — 404; the sweeper's guard #3 holds |
 | [S6](S6.md) | Does the deployed goose advertise `sessionCapabilities.close`? | **PASS** — `close`, `list` and `delete` are all advertised |
-| [S7](S7.md) | Does `protocolVersion: "1.0"` survive a caller with no `a2a-version` header? | **NOT RUN** — needs a2a-rs's server (M1) |
+| [S7](S7.md) | Does `protocolVersion: "1.0"` survive a caller with no `a2a-version` header? | **PASS** — the server never reads the header |
 | [S8](S8.md) | Can the agent run as a host process on DSM 7? | **NOT RUN** — needs the NAS shell |
 | [S9](S9.md) | Can the LiteLLM container reach the agent at its `card.url`? | **NOT RUN** — needs the NAS shell |
 | [S10](S10.md) | Recipe mining: where do recipes live, and is the shape stable? | **PASS, with one correction to §6.1** |
 | [S11](S11.md) | Does the emitted launcher resolve the right triple and fail open? | **NOT RUN** — needs a host and a real release |
 | [S12](S12.md) | Does the published binary run on the target host? | **NOT RUN** — needs both hosts and a release |
-| [S13](S13.md) | Is `a2a-rs` wire-compatible with LiteLLM's A2A routes? | **NOT RUN** — gates M1's exit |
+| [S13](S13.md) | Is `a2a-rs` wire-compatible with LiteLLM's A2A routes? | **PASS** — the framing agrees; the *card* needs work on our side |
 
 ## What the spikes changed
 
-Four spikes changed the plan or this repo. They are the ones worth reading:
+Six spikes changed the plan or this repo. They are the ones worth reading:
 
 - **S2** — cost control changes shape, twice over. goose 1.50.x cannot carry a
   per-session trace id upstream, **and** LiteLLM 1.103.0 silently drops
@@ -52,11 +52,21 @@ Four spikes changed the plan or this repo. They are the ones worth reading:
   demultiplexer. Also: goose enforces `cwd` (`-32602 invalid directory path`).
 - **S10** — recipes have **no `name` field**. The skill `id` must come from the
   filename, not a recipe field.
+- **S13** — the wire is compatible, but the **card** is not: LiteLLM synthesises
+  its own card for a registered agent (its `skills: [{id: "chat"}]`, its address,
+  its security scheme), so our skills are invisible to a proxy-side caller. Its
+  proxy also fetches the **legacy** `/.well-known/agent.json` on every call, which
+  our server does not serve — so M1 must serve both paths, and
+  `re_register_on_card_change` must PUT (a second `POST /v1/agents` is a 400 on a
+  duplicate name). Not a §12.6 escalation; all three are ours to absorb.
+- **S7** — `A2A-Version` is **decorative**: the pinned server never reads it, so
+  a caller without the header is indistinguishable from one with it. That voids
+  the risk it was gating — and also voids the plan's implied "a wrong version
+  fails cleanly". A version refusal, if we ever want one, is ours to write.
 
 ## Not run, and what unblocks each
 
 | Spike | Blocked on |
 | ----- | ---------- |
-| S7, S13 | M1's server existing (deliberately deferred — M1 answers them for free) |
-| S8, S9 | a shell on the NAS |
+| S8, S9 | a shell on the NAS (S9 is now *narrowed*: the container cannot resolve the tailnet name, and cannot reach the sandbox bridge — which DSM address it can route to is the remaining question) |
 | S11, S12 | both hosts **and** a real GitHub Release (merge M0 to `main` first) |
