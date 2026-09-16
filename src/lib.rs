@@ -9,4 +9,13 @@
 //! `sessionId` map, which is recoverable via ACP `session/list` if it is lost.
 //! You lose the label, not the conversation.
 
+pub mod acp;
+pub mod card;
+pub mod config;
+pub mod executor;
 pub mod goose;
+pub mod recipes;
+pub mod registry;
+pub mod server;
+pub mod skills;
+pub mod turn;

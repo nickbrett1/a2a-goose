@@ -35,6 +35,8 @@ dependencies = [
  "a2a-server-lf",
  "anyhow",
  "axum",
+ "chrono",
+ "futures",
  "reqwest",
  "rusqlite",
  "serde",

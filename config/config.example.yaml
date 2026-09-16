@@ -22,7 +22,7 @@ server:
   publicUrl: "http://mac-studio.tail86fd19.ts.net:10001"
   # A2A has no authentication of its own, so the endpoint carries a bearer token
   # even though the tailnet ACL is the real boundary (hard constraint #3).
-  bearerTokenEnv: "A2A_GOOSE_TOKEN"
+  bearerTokenEnv: "A2A_GOOSE_BEARER_TOKEN"
 
 card:
   name: "mac-studio-goose"
@@ -49,13 +49,13 @@ skills:
     # deliberate configuration: the card then carries `ask` plus whatever
     # `skills.d/` declares. A recipe that is not listed here is not advertised.
     enabled: []
-    # Where a hand-written skill file lives, for anything with no recipe behind
-    # it. Ids must be unique across every source; a collision is a startup
-    # failure, not a silent override.
-    d: "~/.config/a2a-goose/skills.d"
-    # Per-id overrides of the projected display fields. Ids are the stable
-    # contract; `name` and `description` may change freely.
-    overrides: {}
+  # Where a hand-written skill file lives, for anything with no recipe behind
+  # it. Ids must be unique across every source; a collision is a startup
+  # failure, not a silent override.
+  d: "~/.config/a2a-goose/skills.d"
+  # Per-id overrides of the projected display fields. Ids are the stable
+  # contract; `name` and `description` may change freely.
+  overrides: {}
 
 goose:
   acp:
