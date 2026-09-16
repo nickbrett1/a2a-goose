@@ -54,11 +54,12 @@ Six spikes changed the plan or this repo. They are the ones worth reading:
   filename, not a recipe field.
 - **S13** — the wire is compatible, but the **card** is not: LiteLLM synthesises
   its own card for a registered agent (its `skills: [{id: "chat"}]`, its address,
-  its security scheme), so our skills are invisible to a proxy-side caller. Its
-  proxy also fetches the **legacy** `/.well-known/agent.json` on every call, which
-  our server does not serve — so M1 must serve both paths, and
-  `re_register_on_card_change` must PUT (a second `POST /v1/agents` is a 400 on a
-  duplicate name). Not a §12.6 escalation; all three are ours to absorb.
+  its security scheme), so our skills are invisible to a proxy-side caller. And a
+  second `POST /v1/agents` is a **400** on a duplicate name, so
+  `re_register_on_card_change` must PUT. Its card-fetch path (the errors name the
+  legacy `/.well-known/agent.json`) could not be confirmed — the container has no
+  route to the agent, which is [S9](S9.md)'s question. Not a §12.6 escalation;
+  the card work is ours.
 - **S7** — `A2A-Version` is **decorative**: the pinned server never reads it, so
   a caller without the header is indistinguishable from one with it. That voids
   the risk it was gating — and also voids the plan's implied "a wrong version
@@ -68,5 +69,5 @@ Six spikes changed the plan or this repo. They are the ones worth reading:
 
 | Spike | Blocked on |
 | ----- | ---------- |
-| S8, S9 | a shell on the NAS (S9 is now *narrowed*: the container cannot resolve the tailnet name, and cannot reach the sandbox bridge — which DSM address it can route to is the remaining question) |
+| S8, S9 | a shell on the NAS. S9 is now *narrowed*: the LiteLLM container cannot resolve the tailnet name, cannot reach the sandbox bridge, and **hangs** on the agent's tailnet IP — so the obstacle is routing, and a wrong card `url` fails as a hang. It also blocks two S13 follow-ups (which card path the proxy fetches, and whether it forwards `metadata`/SSE). |
 | S11, S12 | both hosts **and** a real GitHub Release (merge M0 to `main` first) |
