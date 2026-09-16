@@ -56,7 +56,12 @@ fi
 # nothing — the same fail-open reasoning as the artifact download above. The
 # list is empty for a project that declares no targets, which makes the whole
 # loop a no-op.
-for target in aarch64-apple-darwin x86_64-unknown-linux-musl; do
+#
+# This list must stay in step with github-release.targets. The pipeline's half
+# is regenerated; this half is not, because scripts/ is app-owned - so a target
+# added in the generator has to be added here by hand, or its payload is built,
+# uploaded and fetched and then quietly never packed.
+for target in aarch64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
   if [ -d "build/$target" ]; then
     tar -czf "$OUT_DIR/a2a-goose-$target.tar.gz" -C "build/$target" .
     echo "packaged build/$target/ as a2a-goose-$target.tar.gz"
