@@ -122,6 +122,8 @@ impl GooseExecutor {
         let cwd = resolve_cwd(&self.config, requested_cwd)?;
         let prompt = prompt_for(&resolved.skill_id, &resolved.dispatch, text)?;
         Ok(TurnRequest {
+            // Filled in by `execute`, which is where the A2A context is known.
+            context: None,
             cwd,
             prompt,
             wall_clock: wall_clock(&self.config),
@@ -149,13 +151,18 @@ impl AgentExecutor for GooseExecutor {
                 .map_err(refusal_to_a2a)
         });
 
-        let request = match request {
+        let mut request = match request {
             Ok(request) => request,
             // Nothing has been claimed to the caller yet, so a refusal is the
             // JSON-RPC error the SDK turns into a non-2xx-coded reply rather
             // than a task that starts and then fails.
             Err(err) => return Box::pin(futures::stream::once(async move { Err(err) })),
         };
+
+        // An empty context id is the SDK's "no context", and treating it as a
+        // key would pool every contextless turn together — the opposite of what
+        // it means.
+        request.context = Some(context_id.clone()).filter(|id| !id.is_empty());
 
         let events = self.turns.run(request);
         let state = TurnState::new(

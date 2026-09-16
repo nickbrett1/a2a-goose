@@ -124,6 +124,13 @@ pub enum TurnEvent {
 /// never sees a directory the host would refuse.
 #[derive(Debug, Clone)]
 pub struct TurnRequest {
+    /// The A2A `contextId` this turn belongs to, when the caller sent one.
+    ///
+    /// Carried rather than interpreted: the A2A layer knows nothing about
+    /// sessions, and the ACP layer is the only thing that can decide whether a
+    /// given context may reuse one. Today every turn still gets a fresh
+    /// session; this is what a reuse policy would key on.
+    pub context: Option<String>,
     pub cwd: PathBuf,
     pub prompt: String,
     /// The ceiling for the whole turn. Enforced where the waiting actually
