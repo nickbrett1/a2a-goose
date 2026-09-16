@@ -24,15 +24,60 @@ use a2a_goose::goose::{Goose, Version};
 use a2a_goose::registry::Registry;
 use a2a_goose::server::{self, Agent};
 use a2a_goose::skills::SkillSet;
+use a2a_goose::turn::{TurnError, TurnEvent, TurnRequest, Turns, Usage};
 use serde_json::Value;
 
 const TOKEN: &str = "skeleton-test-token";
+
+/// What the fake turn says.
+const ANSWER: &str = "hello from the fake turn";
+
+/// A [`Turns`] with no ACP behind it.
+///
+/// This file pins the *A2A wire* — the card, the auth layer, the JSON-RPC method
+/// names, the shape of a completed task — and none of that should need a
+/// `goose serve` running in CI. The ACP hop has its own tests, against a
+/// recording and against a real goose.
+#[derive(Default)]
+struct FakeTurns {
+    /// What each turn was asked to do, so a test can assert the *prompt* the
+    /// executor built and not just the answer it produced.
+    requests: std::sync::Mutex<Vec<TurnRequest>>,
+}
+
+impl Turns for FakeTurns {
+    fn run(
+        &self,
+        request: TurnRequest,
+    ) -> futures::stream::BoxStream<'static, Result<TurnEvent, TurnError>> {
+        self.requests.lock().expect("lock").push(request);
+        Box::pin(futures::stream::iter(vec![
+            Ok(TurnEvent::Text(ANSWER.to_string())),
+            Ok(TurnEvent::Finished {
+                stop_reason: "end_turn".to_string(),
+                usage: Usage {
+                    total: 7,
+                    input: 5,
+                    output: 2,
+                },
+            }),
+        ]))
+    }
+}
 
 /// A booted server on an ephemeral port, plus the directories behind its card.
 struct Fixture {
     base: String,
     recipes: PathBuf,
     skills_d: PathBuf,
+    turns: Arc<FakeTurns>,
+}
+
+impl Fixture {
+    /// The turns this server has been asked to run.
+    fn ran(&self) -> Vec<TurnRequest> {
+        self.turns.requests.lock().expect("lock").clone()
+    }
 }
 
 impl Drop for Fixture {
@@ -77,6 +122,7 @@ async fn boot() -> Fixture {
     // carries, and the test dials the real listener address separately.
     config.server.public_url = "http://mac-studio.tail86fd19.ts.net:10001".to_string();
     config.goose.defaults.allowed_roots = vec![PathBuf::from("/tmp")];
+    config.goose.defaults.cwd = PathBuf::from("/tmp");
     config.skills.recipes.search_paths = vec![recipes.clone()];
     config.skills.recipes.enabled = vec!["scaffold-project".to_string()];
     config.skills.d = skills_d.clone();
@@ -90,6 +136,7 @@ async fn boot() -> Fixture {
     let skills = SkillSet::load(&config.skills).expect("skills");
     let card = card::assemble(&config, &skills);
     let card_hash = card::hash(&card);
+    let turns = Arc::new(FakeTurns::default());
 
     let agent = Arc::new(Agent {
         config,
@@ -101,6 +148,7 @@ async fn boot() -> Fixture {
             version: Version::new(1, 50, 0),
         },
         registry: Registry::new(&Config::default()),
+        turns: turns.clone(),
         started: Instant::now(),
     });
 
@@ -117,6 +165,7 @@ async fn boot() -> Fixture {
         base: format!("http://{addr}"),
         recipes,
         skills_d,
+        turns,
     }
 }
 
@@ -169,7 +218,10 @@ async fn the_jsonrpc_wire_is_pinned_independently_of_the_sdk() {
     assert_eq!(response["id"], 7);
     let task = &response["result"]["task"];
     assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED");
-    assert_eq!(task["status"]["message"]["role"], "ROLE_AGENT");
+    // The answer is an artifact, not a status message: it is what a caller
+    // reads, and it is the same thing a streaming caller watches arrive.
+    assert_eq!(task["artifacts"][0]["artifactId"], "answer");
+    assert_eq!(task["artifacts"][0]["parts"][0]["text"], ANSWER);
     assert!(task["id"].is_string());
     assert!(task["contextId"].is_string());
 
@@ -321,7 +373,7 @@ async fn posting_without_a_token_is_a_401_and_healthz_is_not_affected() {
 }
 
 #[tokio::test]
-async fn an_authenticated_send_round_trips_through_the_stub_executor() {
+async fn an_authenticated_send_round_trips_through_the_executor() {
     let fixture = boot().await;
     let card = dial_card(&fixture.base).await;
 
@@ -333,18 +385,26 @@ async fn an_authenticated_send_round_trips_through_the_stub_executor() {
     let response = client.send_text("hello there").await.expect("send");
 
     let SendMessageResponse::Task(task) = response else {
-        panic!("the stub executor answers with a task, got {response:?}");
+        panic!("the executor answers with a task, got {response:?}");
     };
     assert_eq!(task.status.state, TaskState::Completed);
-    let answer = task
-        .status
-        .message
-        .as_ref()
-        .and_then(Message::text)
-        .expect("a status message");
-    assert!(answer.contains("skill=ask"), "{answer}");
-    assert!(answer.contains("hello there"), "{answer}");
-    assert!(answer.contains("cwd=<goose default>"), "{answer}");
+    // The SDK's task snapshot pushes one artifact per artifact *update*, so the
+    // answer is the chunks in order rather than one merged part. A unary caller
+    // concatenates; a streaming caller gets `append: true` frames instead.
+    let answer: String = task
+        .artifacts
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|artifact| artifact.parts.iter())
+        .filter_map(|part| part.as_text().map(str::to_string))
+        .collect();
+    assert_eq!(answer, ANSWER);
+
+    // And the turn was asked to run the caller's own text, in the default
+    // directory, under the default skill.
+    let ran = fixture.ran();
+    assert_eq!(ran.len(), 1);
+    assert_eq!(ran[0].prompt, "hello there");
 }
 
 #[tokio::test]
@@ -374,10 +434,14 @@ async fn an_unknown_skill_id_is_refused_rather_than_falling_back_to_ask() {
         .expect_err("an unknown skillId must not resolve");
     assert_eq!(err.code, a2a::error_code::INVALID_PARAMS);
     assert!(err.message.contains("no-such-skill"), "{}", err.message);
+    assert!(
+        fixture.ran().is_empty(),
+        "a refused skill must not cost a goose session"
+    );
 }
 
 #[tokio::test]
-async fn a_named_skill_is_reported_back_by_the_stub() {
+async fn a_named_skill_sends_its_instruction_and_a_cwd_inside_the_roots() {
     let fixture = boot().await;
     let card = dial_card(&fixture.base).await;
 
@@ -403,15 +467,21 @@ async fn a_named_skill_is_reported_back_by_the_stub() {
     let SendMessageResponse::Task(task) = client.send_message(&request).await.expect("send") else {
         panic!("expected a task");
     };
-    let answer = task
-        .status
-        .message
-        .as_ref()
-        .and_then(Message::text)
-        .expect("a status message");
-    assert!(answer.contains("skill=code-review"), "{answer}");
-    assert!(answer.contains("dispatch=instruction"), "{answer}");
-    assert!(answer.contains("cwd=/tmp"), "{answer}");
+    assert_eq!(task.status.state, TaskState::Completed);
+
+    let ran = fixture.ran();
+    assert_eq!(ran.len(), 1);
+    assert_eq!(
+        ran[0].prompt, "Review the current diff.\n\nreview this",
+        "the declared skill's instruction is the preamble to the caller's text"
+    );
+    assert_eq!(
+        ran[0].cwd,
+        PathBuf::from("/tmp")
+            .canonicalize()
+            .expect("canonical /tmp"),
+        "the caller's cwd is used, canonicalised before the prefix check"
+    );
 }
 
 #[tokio::test]

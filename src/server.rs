@@ -42,13 +42,14 @@ use axum::{
 use serde_json::{Value, json};
 
 use crate::config::Config;
-use crate::executor::{ADVERTISED_METHODS, StubExecutor};
+use crate::executor::{ADVERTISED_METHODS, GooseExecutor};
 use crate::goose::{Goose, MIN_GOOSE_VERSION};
 use crate::registry::Registry;
 use crate::skills::{Dispatch, SkillSet};
+use crate::turn::{TurnHealth, Turns};
 
 /// Everything a handler needs. Shared, and never mutated: the mutable state is
-/// inside `registry` and inside the SDK's task store.
+/// inside `registry`, inside the SDK's task store, and behind `turns`.
 pub struct Agent {
     pub config: Config,
     pub skills: Arc<SkillSet>,
@@ -56,6 +57,11 @@ pub struct Agent {
     pub card_hash: String,
     pub goose: Goose,
     pub registry: Registry,
+    /// How a turn is actually run. Held here rather than built inside
+    /// [`router`] so that `/status` can report on the connection the turns use,
+    /// and so an integration test can substitute a fake and pin the A2A wire
+    /// without a `goose serve` running.
+    pub turns: Arc<dyn Turns>,
     pub started: Instant,
 }
 
@@ -68,7 +74,11 @@ pub fn router(agent: Arc<Agent>, bearer_token: Arc<str>) -> Router {
     let card = agent_card_router(Arc::new(StaticAgentCard::new(agent.card.clone())));
 
     let handler = Arc::new(DefaultRequestHandler::new(
-        StubExecutor::new(agent.skills.clone()),
+        GooseExecutor::new(
+            agent.skills.clone(),
+            Arc::new(agent.config.clone()),
+            agent.turns.clone(),
+        ),
         InMemoryTaskStore::new(),
     ));
     let a2a =
@@ -151,11 +161,22 @@ pub fn status_payload(agent: &Agent) -> Value {
         "methods": ADVERTISED_METHODS,
         "limits": agent.config.registry.limits,
         "attribution": agent.config.registry.attribution,
-        // Not built yet, and reported as such rather than omitted, so a reader
-        // can tell "not built" from "built and unhealthy".
-        "acp": { "state": "unconfigured" },
+        "acp": {
+            // `connected` and `idle` are both healthy: the connection is made on
+            // the first turn, so a host that has served nothing yet is not a
+            // host with a problem. `unconfigured` is the one that is a problem,
+            // and it is reported rather than omitted so a reader can tell it
+            // from a healthy-but-quiet host.
+            "state": match agent.turns.health() {
+                TurnHealth::Connected => "connected",
+                TurnHealth::Idle => "idle",
+                TurnHealth::Unavailable => "unconfigured",
+            },
+            "inFlight": agent.turns.in_flight(),
+            "url": agent.config.goose.acp.url,
+        },
         "registry": agent.registry.state(),
-        "sessions": { "count": 0 },
+        "sessions": { "count": agent.turns.in_flight() },
     })
 }
 
@@ -227,6 +248,9 @@ mod tests {
                 version: crate::goose::Version::new(1, 50, 0),
             },
             registry: Registry::new(&Config::default()),
+            // `/status` must not need a `goose serve` to answer, so a fake is
+            // the right thing for a status test: it is the *unavailable* case.
+            turns: Arc::new(crate::turn::NoTurns),
             started: Instant::now(),
         }
     }

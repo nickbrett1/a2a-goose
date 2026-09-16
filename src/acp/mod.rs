@@ -13,6 +13,8 @@
 //!   replaying the frames [S3](../../spikes/S3.md) recorded.
 //! - [`client`] is the lifecycle: `session/new`, `session/prompt`,
 //!   `session/close`, and the `cwd` check that is this host's security boundary.
+//! - [`turns`] is the implementation of [`crate::turn::Turns`]: it is what the
+//!   A2A executor calls, so the executor never names an ACP method.
 //!
 //! The shapes here are not guesses. `goose serve`'s transport is HTTP POST for
 //! requests **plus SSE for replies and notifications** — S3 corrects the plan on
@@ -21,8 +23,10 @@
 
 pub mod client;
 pub mod transport;
+pub mod turns;
 
 pub use client::{AcpClient, CwdError, Session, resolve_cwd};
 pub use transport::{
     ACP_PATH, AcpError, CONNECTION_ID_HEADER, SESSION_ID_HEADER, Scope, Transport,
 };
+pub use turns::AcpTurns;

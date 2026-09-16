@@ -15,11 +15,13 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use a2a_goose::acp::AcpTurns;
 use a2a_goose::config::Config;
 use a2a_goose::goose::{Goose, MIN_GOOSE_VERSION};
 use a2a_goose::registry::Registry;
 use a2a_goose::server::Agent;
 use a2a_goose::skills::SkillSet;
+use a2a_goose::turn::Turns;
 use a2a_goose::{card, server};
 use tracing_subscriber::EnvFilter;
 
@@ -74,18 +76,33 @@ async fn run() -> anyhow::Result<()> {
     // the proxy being up (§9). The handle is kept so a clean shutdown can
     // deregister — and so `/status` can say what happened.
     let registry = Registry::new(&config);
+
+    // The ACP connection is deliberately *not* made here. `goose serve` may not
+    // be up yet (the supervisor starts both), and a node agent that refuses to
+    // boot because the thing next to it is still starting is a node agent that
+    // never converges. The first turn connects; `/status` reports which state
+    // that is in. The url is logged so a misconfigured one is visible at boot
+    // rather than at the first caller's expense.
+    let config = Arc::new(config);
+    let turns: Arc<dyn Turns> = Arc::new(AcpTurns::new(Arc::clone(&config)));
+    tracing::info!(
+        acp = %config.goose.acp.url,
+        max_concurrent_sessions = config.registry.limits.max_concurrent_sessions,
+        "turns will run over ACP"
+    );
     registry.spawn_registration(
         config.server.public_url.clone(),
         config.card.protocol_version.clone(),
     );
 
     let agent = Arc::new(Agent {
-        config,
+        config: (*config).clone(),
         skills: Arc::new(skills),
         card,
         card_hash,
         goose,
         registry: registry.clone(),
+        turns,
         started: Instant::now(),
     });
 
