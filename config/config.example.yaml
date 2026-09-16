@@ -122,6 +122,23 @@ registry:
     maxConcurrentSessions: 4        # across the whole host, not per context
     maxTokensPerContext: 400000     # from usage_update.used, summed over the task
     maxWallClockSecondsPerTask: 900
+
+  # Visibility, which is a different thing from a budget and IS wanted. LiteLLM
+  # will not account per agent on its own: every row today is filed under
+  # `litellm_proxy_master_key`. Two hooks, verified against nas:4000 (see the
+  # addendum in spikes/S2.md):
+  #
+  # 1. `userAgent` rides LITELLM_CUSTOM_HEADERS to LiteLLM, which records it as
+  #    metadata.user_agent on every spend-log row (and auto-tags the request).
+  #    Per-request detail, needs no proxy change - just a distinct name per host.
+  # 2. A per-agent virtual key puts this host's traffic under its own api_key,
+  #    which is what makes LiteLLM's own aggregate endpoints split per agent
+  #    instead of lumping everything under the master key. Attribution ONLY:
+  #    attach no budget to it (see the decision above).
+  attribution:
+    userAgent: "a2a-goose/mac-studio"   # -> metadata.user_agent on every row
+    keyEnv: "LITELLM_AGENT_KEY"         # optional; makes /spend/logs split by agent
+
   # Parked, deliberately, and not a TODO: the plan's section 6.7 per-thread
   # budget fields. Revisit only if a goose release ships
   # `session_id_header_override` AND a ceiling is actually wanted.
