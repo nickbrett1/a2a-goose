@@ -541,8 +541,13 @@ mod tests {
     #[test]
     fn no_master_key_is_unconfigured_not_a_failure() {
         let mut config = config();
-        // A name nothing in the environment can be using.
-        config.registry.master_key_env = "A2A_GOOSE_SURELY_NOT_SET_9f3a".to_string();
+        // A name nothing in the environment can be using. Spelled out rather
+        // than given a random-looking suffix: the suffix made the literal read
+        // as a credential to a secret scanner (`master_key_env = "…9f3a"`), and
+        // it bought nothing — if anything ever did set this variable the test
+        // fails loudly rather than passing quietly, which is the same guarantee
+        // a random suffix would have given.
+        config.registry.master_key_env = "A2A_GOOSE_NO_SUCH_ENV_VAR".to_string();
         let registry = Registry::new(&config);
         assert_eq!(registry.state(), RegistryState::Unconfigured);
         // And spawning is a no-op rather than a panic.
