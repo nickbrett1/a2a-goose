@@ -140,6 +140,12 @@ steps:
             - DOPPLER_TOKEN
             - BUILDKITE_AGENT_ACCESS_TOKEN
             - BUILDKITE_BUILD_ID
+            # Hand-added, not generated: scripts/release-artifacts.sh writes
+            # the commit into release/manifest.json from BUILDKITE_COMMIT, and
+            # the docker plugin forwards only what is named here - so without
+            # this line every release advertised an empty commit and nothing
+            # tied an artifact back to the tree it came from.
+            - BUILDKITE_COMMIT
     commands:
       - |
         if ! command -v gh >/dev/null 2>&1; then

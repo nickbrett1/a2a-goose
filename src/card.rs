@@ -85,11 +85,27 @@ fn project(skill: &crate::skills::Skill) -> AgentSkill {
 }
 
 /// A stable fingerprint of the card, for §6.2's change detection.
+///
+/// The digest is hexed byte by byte rather than with `format!("{:x}", ..)`.
+/// `LowerHex` on the digest output is not part of sha2's stable surface — it
+/// went away in 0.11, which turned an unrelated dependency bump into a compile
+/// error here (E0277: `Array<u8, ..>: LowerHex` is not satisfied). Bytes are
+/// the interface that has not moved, so hexing them keeps this correct across
+/// the bump instead of pinning a version to keep one format string working.
 pub fn hash(card: &AgentCard) -> String {
+    use std::fmt::Write as _;
+
     let value = serde_json::to_value(card).expect("an AgentCard always serialises");
     let mut hasher = Sha256::new();
     hasher.update(canonical_json(&value).as_bytes());
-    format!("{:x}", hasher.finalize())
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest.iter() {
+        // Writing to a String cannot fail; the result is ignored rather than
+        // unwrapped so there is no panic path in a function that fingerprints.
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// JSON with object keys sorted, recursively.
