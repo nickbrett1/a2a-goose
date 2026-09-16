@@ -37,16 +37,18 @@ cannot exist for code that did not pass.
 Each Buildkite step runs in its own container, so the release step never sees
 the build step's working tree. It does not rebuild it either: the build step
 uploads its output (`artifact_paths:` in `.buildkite/pipeline.yml`) and the
-release step fetches those exact bytes back from the Buildkite artifacts API:
-it lists this build's artifacts, keeps the ones under the build step's own path
-prefix, and downloads each with `curl`. One compile per commit, and the release
-attaches what the tests actually ran against.
+release step fetches those exact bytes back from the Buildkite agent API: it
+searches this build's artifacts for the build step's own path, and downloads
+each match with `curl` from the URL the search returns. One compile per commit,
+and the release attaches what the tests actually ran against.
 
 The fetch deliberately does not use `buildkite-agent artifact download`. That
 call reaches the agent binary mounted from the host, and this fleet runs macOS,
-so the mounted binary is unlaunchable inside the step's Linux container. The API
-needs no agent binary — only this job's own access token, which the docker plugin
-forwards into the container.
+so the mounted binary is unlaunchable inside the step's Linux container. The
+agent API needs no agent binary — only this job's own token, which the docker
+plugin forwards into the container. That token is why the agent API is called
+rather than the public REST API: a job token is minted per job, expires with it,
+and the public API rejects it.
 
 ## Changing what is shipped
 
