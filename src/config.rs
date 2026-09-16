@@ -583,6 +583,7 @@ pub enum ConfigError {
         found: String,
     },
     MissingAllowedRoots,
+    MissingDefaultCwd,
     UnknownDefaultSkill {
         default: String,
         known: Vec<String>,
@@ -618,6 +619,12 @@ impl fmt::Display for ConfigError {
                 f,
                 "card.protocolVersion is {found:?}; LiteLLM accepts only {} at registration",
                 ACCEPTED_PROTOCOL_VERSIONS.join(" and ")
+            ),
+            Self::MissingDefaultCwd => write!(
+                f,
+                "goose.defaults.cwd is not set. It is the directory a turn runs in when the \
+                 caller names none, and without it every such turn is refused - a host that \
+                 boots into that state looks healthy and answers every call with an error"
             ),
             Self::MissingAllowedRoots => write!(
                 f,
@@ -740,6 +747,14 @@ impl Config {
         if self.goose.defaults.allowed_roots.is_empty() {
             return Err(ConfigError::MissingAllowedRoots);
         }
+        // Not a filesystem check - a fresh host may not have the directory yet.
+        // An *empty* default, though, is a configuration mistake with a
+        // predictable outcome: every turn that does not name a `cwd` is
+        // refused, so the agent answers every call with an error while looking
+        // perfectly healthy.
+        if self.goose.defaults.cwd.as_os_str().is_empty() {
+            return Err(ConfigError::MissingDefaultCwd);
+        }
         // Parsed here rather than at bind time so a typo is a startup failure
         // with the field named, not a bare `AddrParseError` from inside the
         // runtime.
@@ -836,7 +851,17 @@ mod tests {
         let mut config = Config::default();
         config.server.public_url = "http://mac-studio.tail86fd19.ts.net:10001".to_string();
         config.goose.defaults.allowed_roots = vec![PathBuf::from("/tmp")];
+        config.goose.defaults.cwd = PathBuf::from("/tmp");
         config
+    }
+
+    #[test]
+    fn a_host_with_no_default_cwd_is_refused_rather_than_answering_every_call_with_an_error() {
+        let mut config = valid();
+        config.goose.defaults.cwd = PathBuf::new();
+        let err = config.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::MissingDefaultCwd), "{err}");
+        assert!(err.to_string().contains("goose.defaults.cwd"), "{err}");
     }
 
     #[test]
@@ -928,7 +953,7 @@ mod tests {
         std::fs::write(
             &path,
             "server:\n  publicUrl: \"http://from-file:10001\"\n  bind: \"127.0.0.1:1\"\n\
-             goose:\n  defaults:\n    allowedRoots: [\"/tmp\"]\n",
+             goose:\n  defaults:\n    allowedRoots: [\"/tmp\"]\n    cwd: \"/tmp\"\n",
         )
         .expect("write config");
 

@@ -238,6 +238,12 @@ mod tests {
         assert!(matches!(err, GooseError::NotFound { .. }), "{err:?}");
     }
 
+    /// `ETXTBSY`, the errno behind the retry in [`verify_fake`].
+    const ETXTBSY: i32 = 26;
+
+    /// How many times [`verify_fake`] will retry a busy executable.
+    const RETRIES: u32 = 50;
+
     /// Writes a stand-in `goose` that prints `output`, so the failure paths are
     /// tested against a real spawn rather than a real goose's real version.
     fn fake_goose(name: &str, output: &str) -> PathBuf {
@@ -256,10 +262,38 @@ mod tests {
         path
     }
 
+    /// [`Goose::verify_bin`], retrying the one failure that is not the behaviour
+    /// under test.
+    ///
+    /// `ETXTBSY` ("Text file busy") here is a race with the *other* tests in this
+    /// binary, not with anything this crate does. Rust opens the script
+    /// `O_CLOEXEC`, but that flag only takes effect at `execve`: while some other
+    /// test's `Command` is between `fork` and `exec`, its child holds a writable
+    /// descriptor to this freshly written script, and the kernel refuses to exec
+    /// it. The window is microseconds and it is why this looked like a 1-in-20
+    /// flake. Production cannot hit it — `goose` is a binary that has existed on
+    /// disk for a long time — so the fix belongs in the test.
+    fn verify_fake(path: &std::path::Path) -> Result<Goose, GooseError> {
+        let bin = path.to_str().expect("a UTF-8 path");
+        for attempt in 0..RETRIES {
+            match Goose::verify_bin(bin) {
+                Err(GooseError::VersionFailed { source, .. })
+                    if source.raw_os_error() == Some(ETXTBSY) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        5 * u64::from(attempt + 1),
+                    ));
+                }
+                outcome => return outcome,
+            }
+        }
+        Goose::verify_bin(bin)
+    }
+
     #[test]
     fn an_unparsable_binary_names_its_output() {
         let path = fake_goose("unparsable", "goose: something went wrong");
-        let err = Goose::verify_bin(path.to_str().unwrap()).unwrap_err();
+        let err = verify_fake(&path).unwrap_err();
         assert!(
             matches!(err, GooseError::UnparsableVersion { .. }),
             "{err:?}"
@@ -271,7 +305,7 @@ mod tests {
     #[test]
     fn an_older_goose_is_refused_with_both_versions() {
         let path = fake_goose("old", "goose 1.49.9");
-        let err = Goose::verify_bin(path.to_str().unwrap()).unwrap_err();
+        let err = verify_fake(&path).unwrap_err();
         let GooseError::TooOld {
             found, required, ..
         } = err
@@ -286,7 +320,7 @@ mod tests {
     #[test]
     fn a_recent_enough_goose_is_accepted() {
         let path = fake_goose("current", "1.50.0");
-        let goose = Goose::verify_bin(path.to_str().unwrap()).expect("verify fake goose");
+        let goose = verify_fake(&path).expect("verify fake goose");
         assert_eq!(goose.version, MIN_GOOSE_VERSION);
         let _ = std::fs::remove_file(path);
     }
