@@ -1,4 +1,60 @@
 [package]
 name = "a2a-goose"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.85"
+description = "A thin A2A facade over a host's `goose serve` ACP server"
+license = "MIT"
+repository = "https://github.com/nickbrett1/a2a-goose"
+
+# The binary is named after the package on purpose: the generated per-target
+# build steps look for `target/<triple>/release/a2a-goose` and the launcher
+# execs `current/bin/a2a-goose` (see LAUNCHING.md).
+
+[dependencies]
+# The A2A wire, the JSON-RPC/REST/SSE bindings and the card model come from the
+# first-party SDK - see hard constraint #17: do not hand-roll protocol types.
+# `a2a-server` (crate `a2a-server-lf`) mounts the axum router; its default
+# `rustls-tls` feature is what keeps this binary free of an OpenSSL dependency,
+# which matters on the musl target and on DSM.
+a2a = { package = "a2a-lf", version = "0.3.1" }
+a2a-server = { package = "a2a-server-lf", version = "0.4.4" }
+
+# HTTP server for the control surface (`/healthz`, `/status`, ...) and the A2A
+# router itself. Kept in step with the axum the SDK builds on.
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+
+# Config and card serialisation. `serde_yaml` is what parses recipe YAML for
+# skill mining (recipes.rs) - a deprecated crate, but the only stable YAML
+# parser here and the shapes are small.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# The contextId -> sessionId map. `bundled` compiles SQLite in, so a host needs
+# no system SQLite: that is what makes one static binary per triple work on both
+# macOS and DSM (see the phase-1 plan, section 3.4).
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+# ACP transport: HTTP POST for requests, plus the WebSocket read loop for
+# `session/update` notifications. rustls, and no native-tls, so the musl build
+# stays self-contained.
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
+
+# Card hashing, for the card-change re-registration in registry.rs.
+sha2 = "0.10"
+
+thiserror = "2"
+anyhow = "1"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+# The A2A side of the integration tests talks to this project's own server, so
+# the tests drive it with the SDK's client rather than a hand-written HTTP
+# client (hard constraint #17 again). Same SDK release as the server half.
+a2a-client = { package = "a2a-client-lf", version = "0.2.5" }
+tokio = { version = "1", features = ["test-util"] }
