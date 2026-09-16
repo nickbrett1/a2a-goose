@@ -37,11 +37,12 @@ serde_yaml = "0.9"
 # macOS and DSM (see the phase-1 plan, section 3.4).
 rusqlite = { version = "0.40", features = ["bundled"] }
 
-# ACP transport: HTTP POST for requests, plus the WebSocket read loop for
-# `session/update` notifications. rustls, and no native-tls, so the musl build
-# stays self-contained.
+# ACP transport. Spike S3 corrected the plan here: the ACP HTTP transport is
+# POST for requests *plus SSE for replies and notifications* - not a WebSocket
+# read loop. So the ACP hop needs an HTTP client that can hold an event stream
+# open (`stream` gives us `bytes_stream()`), and no WebSocket client at all.
+# rustls, and no native-tls, so the musl build stays self-contained.
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
 
 # Card hashing, for the card-change re-registration in registry.rs.
 sha2 = "0.10"

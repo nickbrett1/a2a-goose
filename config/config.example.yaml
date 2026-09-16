@@ -97,6 +97,12 @@ registry:
   # on change, DELETE then POST. Skills do not auto-propagate through LiteLLM,
   # so this is how "edit a recipe, restart" converges the registry.
   reRegisterOnCardChange: true
+  # Parked pending the S2 decision (spikes/S2.md, plan 12.6): the plan's
+  # per-thread budgets needed goose to forward a per-session `x-litellm-trace-id`
+  # upstream, and goose 1.50.x cannot. No `require_trace_id_on_calls_by_agent`
+  # or `max_budget_per_session` field appears here until that is settled; the
+  # working fallback is one LiteLLM key per node agent, capped per key.
+  perAgentKeyEnv: "LITELLM_AGENT_KEY"
 
 executor:
   # On a client disconnect mid-turn: `cancel` or `orphan`. `cancel` is the
