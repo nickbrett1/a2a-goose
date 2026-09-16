@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The macOS half of the host-process deployment. genproj emits no deploy/, so
+  this file is authored here (phase-1 plan, section 2.2).
+
+  What is supervised is the LAUNCHER, not the agent (hard constraint #14): the
+  fetch has to happen before the agent starts, and the launcher ends in `exec`,
+  so from launchd's point of view launcher and payload are one process.
+
+  Install (per user, no sudo):
+
+      mkdir -p ~/Library/LaunchAgents ~/Library/Logs/a2a-goose
+      cp deploy/launchd/com.nick.a2a-goose.plist ~/Library/LaunchAgents/
+      launchctl bootstrap gui/"$(id -u)" ~/Library/LaunchAgents/com.nick.a2a-goose.plist
+      launchctl print gui/"$(id -u)"/com.nick.a2a-goose | head
+
+  Stop it:
+
+      launchctl bootout gui/"$(id -u)"/com.nick.a2a-goose
+
+  There is no ordering dependency on the network. launchd has no
+  network-online equivalent, and it does not need one: the launcher fails open
+  (hard constraint #13), so a boot with no network installs what is already
+  there and starts it. The fetch that matters happens on the next restart.
+
+  There is no shell wrapper and no environment file here on purpose. Everything
+  the payload needs - the bearer token, LITELLM_BASE_URL, the bind address -
+  comes from ENV_FILE ($HOME/.config/a2a-goose/env, mode 0600), which the
+  launcher sources on its way to the exec. Secrets stay on the host; the release
+  payload never carries them.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.nick.a2a-goose</string>
+
+  <!-- The one host-specific line: where this host keeps its checkout of the
+       repository. The launcher is a repository file, not a release asset, so
+       it is installed by hand and stays put while the payload it fetches
+       changes underneath it. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/nick/Projects/a2a-goose/scripts/fetch-launch.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/nick/Projects/a2a-goose</string>
+
+  <!-- goose has to be resolvable from this PATH: the agent's first act is to
+       verify it (src/goose.rs), and a launchd job does not inherit the shell's
+       PATH. Both install locations are listed because the goose installer and
+       Homebrew disagree about where goose goes. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/nick/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Restart on any exit, which is also what makes a crash-restart re-run the
+       fetch: the payload is `exec`ed, so its exit is this process's exit. -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- launchd's own floor between restarts. It is the backstop for a payload
+       that dies instantly on load, which is the failure S12 exists to catch
+       before a host ever sees a release. -->
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>StandardOutPath</key>
+  <string>/Users/nick/Library/Logs/a2a-goose/launcher.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/nick/Library/Logs/a2a-goose/launcher.log</string>
+</dict>
+</plist>
