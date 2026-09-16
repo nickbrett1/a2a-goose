@@ -1,0 +1,4 @@
+# Generated infra files (machine output) excluded from prettier --check.
+.agents/
+coverage/
+wrangler.template.jsonc

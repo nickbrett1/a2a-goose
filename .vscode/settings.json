@@ -1,0 +1,6 @@
+{
+  "terminal.integrated.defaultProfile.linux": "tmux-integrated",
+  "terminal.integrated.defaultProfile.osx": "tmux-integrated",
+  "terminal.integrated.defaultProfile.windows": "tmux-integrated",
+  "tmux-integrated.shell": "/bin/zsh"
+}

@@ -1,0 +1,3 @@
+setup:
+  project: a2a-goose
+  config: dev
