@@ -1,0 +1,29 @@
+# A hand-written skill, for anything with no recipe behind it.
+#
+# Copy into the directory named by `skills.d` in config.yaml (default:
+# ~/.config/a2a-goose/skills.d/), one skill per file. Skills are data, not code:
+# adding one is a config edit, not a release.
+#
+# `id` is the routing contract that callers put in `metadata.skillId` - treat it
+# as frozen once anything calls it. `name` and `description` are display only.
+# Ids must be unique across recipes, skills.d/ and overrides; a collision is a
+# startup failure, not a silent override.
+#
+# The card advertises; it does not instruct (hard constraint #12). Only the four
+# fields below reach the card, plus tags. Not here, and never on the card:
+# extensions, parameters, secrets, and anything else that only matters when
+# goose actually runs the turn.
+
+id: "code-review"
+name: "Code review"
+description: "Review a diff for correctness, style and missing tests"
+tags:
+  - review
+  - quality
+
+# What is said to goose when this skill is selected. This stays on disk. A
+# recipe-backed skill instead dispatches to its recipe, which is executed by
+# goose with the recipe's own instructions, extensions and parameters.
+instruction: |
+  Review the current diff in this working directory. Report findings grouped by
+  severity, each with the file and line it applies to. Do not edit files.

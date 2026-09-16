@@ -1,0 +1,16 @@
+# Pinned, not "stable": the compiler that produced the committed Cargo.lock is
+# the one every build uses. Every cargo invocation in CI is `--locked` (hard
+# constraint #18 in the phase-1 plan) - the lockfile is the wire-compat contract
+# with LiteLLM's A2A routes, so an unpinned compiler resolving a different
+# dependency set is exactly the failure the flag exists to prevent.
+#
+# The components are declared here rather than installed by hand because CI runs
+# `cargo fmt --check` and `cargo clippy -- -D warnings` inside a bare
+# `rust:1-slim` image: rustup installs what this file asks for.
+#
+# 1.85 is the floor this project targets (a2a-rs's MSRV); the pin is the newest
+# stable at the time Cargo.lock was generated.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -22,3 +22,13 @@ updates:
         update-types:
           - "minor"
           - "patch"
+    ignore:
+      # Pins, not drift. The a2a-* versions are the wire contract with LiteLLM's
+      # A2A routes - the serde shapes either match what the Python a2a-sdk on the
+      # LiteLLM side emits and expects, or they do not (S13). The lockfile is
+      # that contract, and .github/workflows/dependabot-auto-merge.yml would
+      # merge a bump unreviewed, so these are excluded here and bumped on
+      # purpose, with the wire checked again.
+      - dependency-name: "a2a-lf"
+      - dependency-name: "a2a-server-lf"
+      - dependency-name: "a2a-client-lf"

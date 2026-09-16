@@ -1,0 +1,165 @@
+# a2a-goose configuration. Copy to $A2A_GOOSE_CONFIG
+# (default: ~/.config/a2a-goose/config.yaml) and edit.
+#
+# Precedence: environment > this file > built-in defaults. Secrets are named,
+# never written here: every `*Env` field holds the NAME of an environment
+# variable, and the value is read from the process environment. On a host that
+# means ENV_FILE ($HOME/.config/a2a-goose/env, mode 0600), which
+# scripts/fetch-launch.sh sources before exec.
+#
+# Startup fails loudly - never partially - on: a loopback `server.publicUrl`, a
+# missing `goose.defaults.allowedRoots`, an unrecognised `card.protocolVersion`,
+# an empty resolvable skill set, duplicate skill ids, a `skills.default` naming
+# an unknown id, a malformed recipe, and `goose` not being found on PATH.
+
+server:
+  # Loopback by default. A Tailscale address is the usual override: the dialer is
+  # the LiteLLM container, so the card has to carry an address that container can
+  # resolve (S9).
+  bind: "127.0.0.1:10001"
+  # What goes on the card as `url`, and what LiteLLM fetches. MUST NOT be
+  # loopback - validated at startup, and startup fails if it is.
+  publicUrl: "http://mac-studio.tail86fd19.ts.net:10001"
+  # A2A has no authentication of its own, so the endpoint carries a bearer token
+  # even though the tailnet ACL is the real boundary (hard constraint #3).
+  bearerTokenEnv: "A2A_GOOSE_TOKEN"
+
+card:
+  name: "mac-studio-goose"
+  description: "goose on the Mac Studio, via A2A"
+  # Pinned. Unpinned agents serve 0.3-shaped responses to callers that send no
+  # `a2a-version` header; LiteLLM accepts only "0.3" and "1.0" (S7).
+  protocolVersion: "1.0"
+  version: "0.1.0"
+
+skills:
+  # The only built-in, always present, never removable and never redefinable
+  # (hard constraint #10). It makes an omitted `metadata.skillId` safe: it is a
+  # bare goose session with no instruction attached.
+  default: "ask"
+
+  recipes:
+    # Recipe mining (S10). Each path is searched for goose recipe YAML; only the
+    # safe projection reaches the card - id/name/description/tags. `instructions`,
+    # `extensions`, `parameters` and secrets stay on disk and are read by goose
+    # itself (hard constraint #12).
+    searchPaths:
+      - "~/.config/goose/recipes"
+    # An allowlist. Empty means "advertise nothing mined", which is a valid,
+    # deliberate configuration: the card then carries `ask` plus whatever
+    # `skills.d/` declares. A recipe that is not listed here is not advertised.
+    enabled: []
+    # Where a hand-written skill file lives, for anything with no recipe behind
+    # it. Ids must be unique across every source; a collision is a startup
+    # failure, not a silent override.
+    d: "~/.config/a2a-goose/skills.d"
+    # Per-id overrides of the projected display fields. Ids are the stable
+    # contract; `name` and `description` may change freely.
+    overrides: {}
+
+goose:
+  acp:
+    url: "http://127.0.0.1:3284/acp"
+    # Name of the variable holding goose's X-Secret-Key (GOOSE_SERVER__SECRET_KEY).
+    secretEnv: "GOOSE_SERVER__SECRET_KEY"
+    timeouts:
+      initializeSecs: 10
+      # A turn is an agent loop, not a request: this is the ceiling for a whole
+      # `session/prompt`, so it is minutes, not seconds.
+      promptSecs: 900
+      cancelSecs: 10
+  sessions:
+    # The contextId -> sessionId map. NOT the conversation history: that is
+    # goose's own sessions.db, which is the system of record (hard constraint #1).
+    dbPath: "~/.local/share/a2a-goose/sessions.db"
+    reuseByContext: true
+    # Idle sessions are evicted from the map (never deleted from goose) after
+    # this long.
+    idleTtlSecs: 3600
+    maxSessions: 16
+  defaults:
+    # Handed to `session/new`. Caller-supplied `metadata.cwd` overrides it, and
+    # is checked against allowedRoots first.
+    cwd: "/Users/nick/Projects"
+    # The security boundary (hard constraint #4): `cwd` is caller-supplied and
+    # reaches the filesystem as this process's user. A missing list is a startup
+    # failure. Because the agent runs as the host user, a traversal is bounded by
+    # that user's own permissions - a weaker boundary than a container, not a
+    # stronger one. Keep it tight.
+    allowedRoots:
+      - "/Users/nick/Projects"
+
+registry:
+  litellmBaseUrl: "http://nas:4000"
+  masterKeyEnv: "LITELLM_MASTER_KEY"
+  agentName: "mac-studio-goose"
+  # Hash the assembled card at boot and compare with the last registered hash;
+  # on change, DELETE then POST. Skills do not auto-propagate through LiteLLM,
+  # so this is how "edit a recipe, restart" converges the registry.
+  reRegisterOnCardChange: true
+
+  # Cost control. There is no budget here, and that is the decision, not an
+  # omission - see the correction at the end of spikes/S2.md.
+  #
+  # Measured on one trivial turn: goose's ACP stream and LiteLLM's logs agree
+  # EXACTLY on tokens (34001 = 34001), but price the same call 3.5x apart
+  # ($0.0001267 vs $0.0004389). Both are local price tables; neither is the
+  # provider's invoice. So a proxy-side budget is enforced against one system's
+  # guess at the price, and per-agent keys + budgets buy attribution we do not
+  # need. If a hard ceiling is ever wanted, it belongs on the provider account.
+  #
+  # What is left is exact, cheap and ours: bound the LOOP, not the wallet. These
+  # numbers are counts of things we can see in the ACP stream, deliberately not
+  # dollars. They use `usage_update` (used/size per session) and the
+  # `stopReason`/`usage` block on every prompt reply, so no LiteLLM cooperation
+  # is required and they hold even if the proxy is misconfigured.
+  #
+  # Note: one A2A turn fans out into MORE THAN ONE provider call (a trivial turn
+  # produced two), and the overhead call is invisible in the ACP usage block - so
+  # nothing here may be read as a cost.
+  limits:
+    maxIterationsPerTask: 12        # consecutive goose turns for one A2A task
+    maxConcurrentSessions: 4        # across the whole host, not per context
+    maxTokensPerContext: 400000     # from usage_update.used, summed over the task
+    maxWallClockSecondsPerTask: 900
+
+  # Visibility, which is a different thing from a budget and IS wanted. LiteLLM
+  # will not account per agent on its own: every row today is filed under
+  # `litellm_proxy_master_key`. Two hooks, verified against nas:4000 (see the
+  # addendum in spikes/S2.md):
+  #
+  # 1. `userAgent` rides LITELLM_CUSTOM_HEADERS to LiteLLM, which records it as
+  #    metadata.user_agent on every spend-log row (and auto-tags the request).
+  #    Per-request detail, needs no proxy change - just a distinct name per host.
+  # 2. A per-agent virtual key puts this host's traffic under its own api_key,
+  #    which is what makes LiteLLM's own aggregate endpoints split per agent
+  #    instead of lumping everything under the master key. Attribution ONLY:
+  #    attach no budget to it (see the decision above).
+  attribution:
+    userAgent: "a2a-goose/mac-studio"   # -> metadata.user_agent on every row
+    keyEnv: "LITELLM_AGENT_KEY"         # optional; makes /spend/logs split by agent
+
+  # Parked, deliberately, and not a TODO: the plan's section 6.7 per-thread
+  # budget fields. Revisit only if a goose release ships
+  # `session_id_header_override` AND a ceiling is actually wanted.
+  perThreadBudget: false
+
+executor:
+  # On a client disconnect mid-turn: `cancel` or `orphan`. `cancel` is the
+  # default - a disconnected caller must not leave a turn burning tokens, and a
+  # silent orphan is the one outcome nobody can see.
+  onClientDisconnect: "cancel"
+
+tracing:
+  traceIdHeader: "x-litellm-trace-id"
+  # What to send when the caller supplied no trace id. `contextId` makes
+  # LiteLLM's per-thread iteration and dollar caps line up with the A2A thread
+  # (S2 decides whether goose forwards it; if it cannot, the caps fall back to
+  # per-key).
+  traceIdSource: "contextId"
+  forwardToGoose: true
+
+observability:
+  phoenix:
+    enabled: false
+    endpoint: ""

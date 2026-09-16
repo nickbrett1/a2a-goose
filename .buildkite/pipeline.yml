@@ -19,6 +19,13 @@ steps:
     artifact_paths:
       - "build/aarch64-apple-darwin/**"
     commands:
+      # Hand-added, not generated: no genproj capability serves Rust linting
+      # (phase-1 plan, section 2.3), so fmt and clippy are wired in here, in the
+      # one step that runs natively on the macOS agent - no second container and
+      # no second checkout. A lint failure fails this step, which is what stops
+      # the release step (it depends on this one).
+      - cargo fmt --all --check
+      - cargo clippy --all-targets --locked -- -D warnings
       - |
         mkdir -p "build/aarch64-apple-darwin/bin"
         rustup target add "aarch64-apple-darwin"
