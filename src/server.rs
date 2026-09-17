@@ -208,6 +208,11 @@ pub fn status_payload(agent: &Agent) -> Value {
                 }),
             },
         },
+        // The launcher is the process that started this one, on a host that has
+        // one. It is a separate question from goose (`acp.serve`) and from this
+        // process's own version: it says whether the *supervisor* is the one the
+        // release shipped, which nothing else here can see.
+        "launcher": launcher(),
         "registry": agent.registry.state(),
         "sessions": {
             "count": agent.turns.in_flight(),
@@ -220,6 +225,54 @@ pub fn status_payload(agent: &Agent) -> Value {
             "retained": agent.turns.retained(),
         },
     })
+}
+
+/// The variable names the launcher exports on the way to its `exec`.
+///
+/// The launcher is generated (LAUNCHING.md, *What the launcher tells the
+/// payload*), and these three strings are the whole contract between it and this
+/// process. They are the launcher's own names, not ours: `FETCH_LAUNCH_*` says
+/// where the value came from, which matters because nothing else in this process
+/// knows anything about it.
+pub const LAUNCHER_PATH_ENV: &str = "FETCH_LAUNCH_PATH";
+pub const LAUNCHER_VERSION_ENV: &str = "FETCH_LAUNCH_VERSION";
+pub const LAUNCHER_SHA256_ENV: &str = "FETCH_LAUNCH_SHA256";
+
+/// The launcher that started this process, as it described itself on the way in.
+///
+/// `managed: false` means there was no launcher: a test, a developer's
+/// `cargo run`, or a payload started by hand. That is a fact worth reporting
+/// rather than a gap to fill with a guess — the same shape `acp.serve` uses to
+/// say that goose was not started by this process.
+///
+/// `version` is the release the launcher last verified itself against, which is
+/// the only version a launcher has: it is fetched fresh from whichever release
+/// is current rather than versioned on its own. `sha256` is the one to hold
+/// against a release manifest's `launcher.sha256` — they are equal exactly when
+/// the host's launcher is current, so this is what makes "we shipped a launcher"
+/// checkable from outside the box. Both can lag the payload by a single start,
+/// because a launcher self-update takes effect on the next one.
+///
+/// Read from the environment on every call rather than snapshotted: the values
+/// are what this process was started with, and they cannot change under it.
+fn launcher() -> Value {
+    launcher_from(|name| std::env::var(name).ok())
+}
+
+fn launcher_from(read: impl Fn(&str) -> Option<String>) -> Value {
+    // An empty export is the launcher saying "I could not work this out" (no
+    // `sha256` tool on the host, `$0` it could not resolve), which is not the
+    // same as a value, and must not read as one.
+    let field = |name: &str| read(name).filter(|value| !value.is_empty());
+    match field(LAUNCHER_PATH_ENV) {
+        Some(path) => json!({
+            "managed": true,
+            "path": path,
+            "version": field(LAUNCHER_VERSION_ENV).unwrap_or_default(),
+            "sha256": field(LAUNCHER_SHA256_ENV).unwrap_or_default(),
+        }),
+        None => json!({ "managed": false }),
+    }
 }
 
 /// Rejects anything without the bearer token.
@@ -372,6 +425,67 @@ mod tests {
         let payload = status_payload(&agent());
         assert_eq!(payload["sessions"]["count"], 0);
         assert_eq!(payload["sessions"]["retained"], 0);
+    }
+
+    #[test]
+    fn status_reports_the_launcher_that_started_this_process() {
+        // The pair an operator holds against a release manifest's
+        // `launcher.sha256`: equal exactly when the host's launcher is current.
+        let payload = launcher_from(|name| match name {
+            LAUNCHER_PATH_ENV => {
+                Some("/Users/nick/.local/share/a2a-goose/fetch-launch.sh".to_string())
+            }
+            LAUNCHER_VERSION_ENV => Some("0.1.18".to_string()),
+            LAUNCHER_SHA256_ENV => {
+                Some("9270793a4c4f6410b526872c57fd81759c2266562fa74ea8e26aed1690220da2".to_string())
+            }
+            _ => None,
+        });
+
+        assert_eq!(payload["managed"], true);
+        assert_eq!(
+            payload["path"],
+            "/Users/nick/.local/share/a2a-goose/fetch-launch.sh"
+        );
+        assert_eq!(payload["version"], "0.1.18");
+        assert_eq!(
+            payload["sha256"],
+            "9270793a4c4f6410b526872c57fd81759c2266562fa74ea8e26aed1690220da2"
+        );
+    }
+
+    #[test]
+    fn status_says_so_when_there_is_no_launcher() {
+        // A test, a developer's `cargo run`, a payload started by hand: there is
+        // no launcher to report, and inventing one would make the digest
+        // meaningless on the hosts where it matters.
+        assert_eq!(launcher_from(|_| None), json!({ "managed": false }));
+        // An empty export is the launcher saying it could not work the value
+        // out, which is not a value.
+        assert_eq!(
+            launcher_from(|name| match name {
+                LAUNCHER_PATH_ENV => Some(String::new()),
+                _ => Some("0.1.18".to_string()),
+            }),
+            json!({ "managed": false })
+        );
+    }
+
+    #[test]
+    fn status_keeps_a_launcher_that_could_not_describe_itself() {
+        // A host with no `sha256sum` still has a launcher, and the path is how
+        // an operator finds it; the empty fields are the honest answer.
+        let payload = launcher_from(|name| match name {
+            LAUNCHER_PATH_ENV => Some("/opt/goose/fetch-launch.sh".to_string()),
+            LAUNCHER_VERSION_ENV => Some(String::new()),
+            LAUNCHER_SHA256_ENV => Some(String::new()),
+            _ => None,
+        });
+
+        assert_eq!(payload["managed"], true);
+        assert_eq!(payload["path"], "/opt/goose/fetch-launch.sh");
+        assert_eq!(payload["version"], "");
+        assert_eq!(payload["sha256"], "");
     }
 
     #[test]

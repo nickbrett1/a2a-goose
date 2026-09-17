@@ -88,12 +88,47 @@ source_env_file() {
   set +a
 }
 
+# Tell the payload what started it, so an app's own status endpoint can report
+# the launcher this host is actually running. That question is the reason the
+# launcher is a release asset at all: it can be answered, so it must be.
+#
+# Three values, and each one fails open to empty: a payload started by hand (a
+# test, a developer's `cargo run`) has no launcher to describe, and a host with
+# no sha256 tool must still boot.
+#
+#   - The *version* is the release this launcher last verified itself against,
+#     which is the only version a launcher has. It is fetched fresh from
+#     whichever release is current rather than versioned on its own, so there is
+#     no separate launcher version to report.
+#   - The *digest* is taken after self_update because the file on disk is the
+#     one that supervises the *next* start (a swap takes effect then, not now).
+#     Held against a release manifest's `launcher.sha256` it answers "is this
+#     host's launcher current?" - a mismatch that the launcher could not see
+#     itself, because seeing it is what it just tried to do.
+#
+# Both can therefore lag the payload by one start, and neither is a promise: the
+# payload is being told what its launcher believes, which is all any process
+# knows about the process that started it.
+describe_self() {
+  FETCH_LAUNCH_PATH="${SELF:-}"
+  FETCH_LAUNCH_VERSION="${version:-}"
+  FETCH_LAUNCH_SHA256=""
+  if [ -n "${FETCH_LAUNCH_PATH}" ] && [ -f "${FETCH_LAUNCH_PATH}" ]; then
+    FETCH_LAUNCH_SHA256="$(sha256_of "${FETCH_LAUNCH_PATH}")"
+  fi
+  export FETCH_LAUNCH_PATH FETCH_LAUNCH_VERSION FETCH_LAUNCH_SHA256
+}
+
 exec_current() {
   # The env file belongs to the host, not to the release: it is where *this*
   # machine's database URL, token or port comes from, and it is read on the way
   # out so the payload inherits it. Every exit path is an exec, so this is the
   # one call site.
   source_env_file
+  # After the host's file, deliberately: these three are the launcher's own
+  # answer about itself, and host-local configuration must not be able to
+  # overwrite it into a claim about a launcher that is not running.
+  describe_self
   if [ -x "${CURRENT}/bin/${LAUNCHER_NAME}" ]; then
     exec "${CURRENT}/bin/${LAUNCHER_NAME}" "$@"
   fi
