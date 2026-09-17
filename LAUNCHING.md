@@ -145,6 +145,35 @@ an event, and neither is a bad one, because the launcher is fail-open here too: 
 file that does not parse is logged and skipped, and a host with no file starts
 with the environment it already had.
 
+## What the launcher tells the payload
+
+The launcher exports three variables on the way to the `exec`, so this agent can
+report which launcher a host is running — `/status` answers with a `launcher`
+object beside `acp`, `{"managed": false}` when it was started by hand:
+
+| Variable | Value |
+| -------- | ----- |
+| `FETCH_LAUNCH_PATH` | This launcher's own path (`$0`, resolved), or empty if it could not be resolved |
+| `FETCH_LAUNCH_VERSION` | The release version this launcher last verified itself against; empty when it verified nothing (`NO_FETCH`, or a manifest it could not read) |
+| `FETCH_LAUNCH_SHA256` | sha256 of the launcher file on disk; empty when the host has no `sha256sum`/`shasum` |
+
+They are set **after** `ENV_FILE` is sourced, so host-local configuration cannot
+overwrite the launcher's answer about itself.
+
+Two things to hold onto when reading them:
+
+- `FETCH_LAUNCH_VERSION` is the release the launcher was fetched from, because a
+  launcher has no version of its own: it comes from whichever release is current.
+- The digest is taken *after* the self-update, so it describes the file that will
+  supervise the **next** start. Compare it with a release manifest's
+  `launcher.sha256` to answer *"is this host's launcher current?"* — a mismatch
+  means a launcher one start behind, which is exactly the state the self-update
+  takes a boot to leave.
+
+This is why the launcher had to become a release asset at all: pinning could not
+answer that question, and an answer nobody can read is not an answer
+([S11](spikes/S11.md), *the new obligation*).
+
 ## The payload contract
 
 The tarball for a target unpacks to the payload root, and its entry point is
