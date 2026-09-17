@@ -203,10 +203,40 @@ fi
 rm -rf "${RELEASES_DIR:?}/${version}"
 mv "$staging" "${RELEASES_DIR}/${version}"
 
-# Atomic flip: build the new link beside the old one and rename over it, so a
-# reader never observes `current` missing or dangling.
-ln -sn "${RELEASES_DIR}/${version}" "${DEPLOY_DIR}/.current.$$"
-mv -f "${DEPLOY_DIR}/.current.$$" "$CURRENT"
+# Point `current` at the release just unpacked.
+#
+# The obvious spelling - link to a temporary name, then `mv -f` it over
+# `current` - does not work, and does not fail either. `current` is a symlink to
+# a directory, `mv` follows it, decides the destination is a directory and moves
+# the new link *inside* the old release: `current` is left untouched and a stray
+# `.current.<pid>` appears under the previous version. The launcher then logs
+# "installed <version>" on every boot while still executing the version it first
+# installed, which is the one failure a self-updating host must not have
+# (mac-studio, v0.1.14 -> v0.1.15). `mv -T` is the fix on GNU and does not exist
+# on macOS.
+#
+# So the old link is removed first, and the new link is renamed into the name
+# that frees. With no destination to inspect, every `mv` gets this right. The
+# gap between the two is one rename wide and nothing execs from `current` while
+# the launcher is flipping it. `previous` is kept so a failed rename can put the
+# old link back rather than leave the host with no `current` at all - fail open
+# applies here too - and the result is read back, because this bug's whole
+# character is that it reported success.
+previous="$(readlink "$CURRENT" 2>/dev/null || true)"
+flip="${DEPLOY_DIR}/.current.$$"
+if ln -sn "${RELEASES_DIR}/${version}" "$flip" && rm -f "$CURRENT" && mv "$flip" "$CURRENT"; then
+  if [ "$(readlink "$CURRENT" 2>/dev/null || true)" != "${RELEASES_DIR}/${version}" ]; then
+    log "installed ${version} but ${CURRENT} does not point at it - starting what is installed"
+    exec_current "$@"
+  fi
+else
+  log "could not point ${CURRENT} at ${version} - starting what is installed"
+  rm -f "$flip"
+  if [ -n "$previous" ]; then
+    ln -sn "$previous" "$CURRENT"
+  fi
+  exec_current "$@"
+fi
 
 log "installed ${version} (${label})"
 exec_current "$@"

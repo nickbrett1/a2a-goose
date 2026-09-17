@@ -22,14 +22,15 @@ is quoted in each file; the sanitised S3 frames are committed as
 | [S8](S8.md) | Can the agent run as a host process on DSM 7? | **NOT RUN** — needs the NAS shell |
 | [S9](S9.md) | Can the LiteLLM container reach the agent at its `card.url`? | **NOT RUN** — needs the NAS shell |
 | [S10](S10.md) | Recipe mining: where do recipes live, and is the shape stable? | **PASS, with one correction to §6.1** |
-| [S11](S11.md) | Does the emitted launcher resolve the right triple and fail open? | **NOT RUN** — needs a host and a real release |
+| [S11](S11.md) | Does the emitted launcher resolve the right triple, fail open, and *upgrade*? | **Item 5 failed, now fixed** — the flip was a no-op on every upgrade; the rest needs a host |
 | [S12](S12.md) | Does the published binary run on the target host? | **NOT RUN** — needs both hosts and a release |
 | [S13](S13.md) | Is `a2a-rs` wire-compatible with LiteLLM's A2A routes? | **PASS** — the framing agrees; the *card* needs work on our side |
 | [S14](S14.md) | Does the agent really own `goose serve`? | **PASS on this box** — starts, gates, restarts, refuses; a host is [S8](S8.md)/[S12](S12.md) |
 
 ## What the spikes changed
 
-Seven spikes changed the plan or this repo. They are the ones worth reading:
+Eight spikes changed the plan, this repo, or the launcher. They are the ones
+worth reading:
 
 - **S2** — cost control changes shape, twice over. goose 1.50.x cannot carry a
   per-session trace id upstream, **and** LiteLLM 1.103.0 silently drops
@@ -74,6 +75,14 @@ Seven spikes changed the plan or this repo. They are the ones worth reading:
   a caller without the header is indistinguishable from one with it. That voids
   the risk it was gating — and also voids the plan's implied "a wrong version
   fails cleanly". A version refusal, if we ever want one, is ours to write.
+- **S11 (item 5)** — the launcher's `current` flip was a **no-op on every
+  upgrade**: `mv -f tmp current` follows `current` to the release directory it
+  points at and moves the new link *inside* the old release. The host logged
+  `installed 0.1.14` and kept executing 0.1.12 — self-update was fake, and it
+  said so in the log. Fixed in the `fetch-launch` capability (genproj #28) and in
+  this repo's seeded copy, with tests that run the launcher for real from a host
+  that already has a release installed, because no static test could see it —
+  the buggy script passed all of them.
 
 ## Not run, and what unblocks each
 
