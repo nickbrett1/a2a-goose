@@ -72,6 +72,13 @@ impl Stub {
     fn marker(&self) -> PathBuf {
         self.dir.join("signalled")
     }
+
+    /// A sibling of [`Self::marker`], for a stub that has to record more than
+    /// "I was signalled" - and whose failure needs to say which of two things
+    /// went wrong.
+    fn beside(&self, name: &str) -> PathBuf {
+        self.dir.join(name)
+    }
 }
 
 impl Drop for Stub {
@@ -99,6 +106,18 @@ fn config(url: &str) -> Config {
     // nothing about the guarantee: the one test that needs this variable unset
     // fails loudly if anything ever sets it.
     config.goose.acp.secret_env = NO_SUCH_ENV.to_string();
+    config
+}
+
+/// The same config with a longer readiness deadline.
+///
+/// The subject of a test is sometimes what the *child* does rather than what the
+/// clock does, and then the deadline must not be able to end the wait first. It
+/// did on a loaded agent: a stub's `exit` lost a race with a one-second deadline
+/// and the test reported a mute goose instead (build 54).
+fn config_with_deadline(url: &str, secs: u64) -> Config {
+    let mut config = config(url);
+    config.goose.acp.timeouts.initialize_secs = secs;
     config
 }
 
@@ -263,14 +282,17 @@ async fn an_address_somebody_is_already_using_is_a_refusal_and_nothing_is_spawne
 
 #[tokio::test]
 async fn a_goose_that_dies_before_it_answers_is_refused_with_its_own_reason() {
+    // No `sleep` before the exit, and a deadline far longer than any scheduling
+    // delay. The exit is what ends the wait, so the clock cannot end it first,
+    // and the output below is carried by the drain rather than by the child
+    // staying alive long enough to be read. Both of those were races against a
+    // one-second deadline, and on a loaded agent they were lost (build 54).
     let stub = Stub::new("dies", |_marker| {
-        // The sleep is what makes the output assertion below deterministic: the
-        // reader task has to have taken the line before the child is reaped.
-        "echo boom: no provider configured >&2\nsleep 0.3\nexit 7".to_string()
+        "echo boom: no provider configured >&2\nexit 7".to_string()
     });
 
     let err = start(
-        &config(&url(free_port().await)),
+        &config_with_deadline(&url(free_port().await), 30),
         &stub.goose(),
         RestartPolicy::default(),
         Arc::new(NeverUp),
@@ -295,15 +317,21 @@ async fn a_goose_that_dies_before_it_answers_is_refused_with_its_own_reason() {
 
 #[tokio::test]
 async fn a_goose_that_comes_up_mute_is_stopped_rather_than_left_holding_the_port() {
+    // `started` is touched before the loop, so a failure below can say which
+    // race was lost: a child that never ran is a different bug from one that was
+    // signalled before it had installed its trap. The deadline here is the
+    // subject of the test - the SIGTERM comes from *it* - so it is longer than
+    // the child needs to install a trap rather than short enough to be quick.
     let stub = Stub::new("mute", |marker| {
         format!(
-            "trap 'touch {}; exit 0' TERM\nwhile :; do sleep 0.1; done",
+            "touch {}\ntrap 'touch {}; exit 0' TERM\nwhile :; do sleep 0.1; done",
+            marker.with_file_name("started").display(),
             marker.display()
         )
     });
 
     let err = start(
-        &config(&url(free_port().await)),
+        &config_with_deadline(&url(free_port().await), 5),
         &stub.goose(),
         RestartPolicy::default(),
         Arc::new(NeverUp),
@@ -314,11 +342,15 @@ async fn a_goose_that_comes_up_mute_is_stopped_rather_than_left_holding_the_port
     let ServeError::NotReady { waited_secs, .. } = &err else {
         panic!("expected a readiness failure, got {err}");
     };
-    assert!(*waited_secs >= 1, "it waited the configured second: {err}");
+    assert!(
+        *waited_secs >= 5,
+        "it waited the configured five seconds: {err}"
+    );
     assert!(
         stub.marker().exists(),
-        "the child was asked to stop (SIGTERM), not left to hold the port: {}",
-        err
+        "the child was asked to stop (SIGTERM), not left to hold the port: {} (it had started: {})",
+        err,
+        stub.beside("started").exists()
     );
 }
 
