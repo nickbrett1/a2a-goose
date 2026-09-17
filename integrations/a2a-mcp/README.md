@@ -210,7 +210,12 @@ sudo docker run --rm --network ai_proxy -e MCP_URL=http://mcphub:3000/mcp/core \
   are for **relatively short-lived work**. Each agent line in `list_agents` also
   carries the ceiling that agent's *own* card advertises
   ([`docs/turn-deadline.md`](../../docs/turn-deadline.md)), because a caller that
-  can only see one of the two numbers is guessing. The caller's ceiling is usually
+  can only see one of the two numbers is guessing. That number is fetched from the
+  agent itself — the row cannot supply it, because LiteLLM stores a *normalised*
+  card and drops `capabilities.extensions` (measured 2026-09-17: a registered
+  a2a-goose row reads back `capabilities: {"streaming": true}` while the agent's
+  own card carries the extension) — and the fetch fails open, so an agent that is
+  down costs the roster that line and nothing else. The caller's ceiling is usually
   lower still (Open WebUI's bridge valve defaults to 180 s; mcphub's own tool-call
   timeout is still unmeasured), so the number advertised is the one this process
   enforces, and the guidance is about *what to send*. A call that gives up does
