@@ -9,7 +9,8 @@ Every spike below was run against **goose 1.50.0** (the version the hosts run) o
 the LiteLLM leg ran against the live proxy on the NAS (`nas:4000`). Raw evidence
 is quoted in each file; the sanitised S3 frames are committed as
 `tests/fixtures/acp-turn.jsonl`. S11 and S14 were additionally run on the
-**mac-studio host** on 2026-09-17 against a published release (v0.1.16).
+**mac-studio host** on 2026-09-17 against a published release (v0.1.16); S9 was
+run on the **NAS** on 2026-09-17 against the live proxy (`litellm 1.103.0`).
 
 | # | Question | Verdict |
 | --- | -------- | ------- |
@@ -21,7 +22,7 @@ is quoted in each file; the sanitised S3 frames are committed as
 | [S6](S6.md) | Does the deployed goose advertise `sessionCapabilities.close`? | **PASS** — `close`, `list` and `delete` are all advertised |
 | [S7](S7.md) | Does `protocolVersion: "1.0"` survive a caller with no `a2a-version` header? | **PASS** — the server never reads the header |
 | [S8](S8.md) | Can the agent run as a host process on DSM 7? | **NOT RUN** — needs the NAS shell |
-| [S9](S9.md) | Can the LiteLLM container reach the agent at its `card.url`? | **NOT RUN** — needs the NAS shell |
+| [S9](S9.md) | Can the LiteLLM container reach the agent at its `card.url`? | **SPLIT** — addressing **PASS** (LAN literal; no tailnet); card fetch **FAIL** — LiteLLM 1.103.0 never fetches the card, 🚩 escalated |
 | [S10](S10.md) | Recipe mining: where do recipes live, and is the shape stable? | **PASS, with one correction to §6.1** |
 | [S11](S11.md) | Does the emitted launcher resolve the right triple, fail open, and *upgrade*? | **PASS on mac-studio** — the flip was a no-op on every upgrade, then fixed and proven by two real upgrades; item 4 and the DSM host pending |
 | [S12](S12.md) | Does the published binary run on the target host? | **NOT RUN** — needs both hosts and a release |
@@ -30,7 +31,7 @@ is quoted in each file; the sanitised S3 frames are committed as
 
 ## What the spikes changed
 
-Eight spikes changed the plan, this repo, or the launcher. They are the ones
+Nine spikes changed the plan, this repo, or the launcher. They are the ones
 worth reading:
 
 - **S2** — cost control changes shape, twice over. goose 1.50.x cannot carry a
@@ -63,6 +64,16 @@ worth reading:
   legacy `/.well-known/agent.json`) could not be confirmed — the container has no
   route to the agent, which is [S9](S9.md)'s question. Not a §12.6 escalation;
   the card work is ours.
+- **S9** — the LiteLLM container **cannot** reach the tailnet at all (no DNS, peer
+  timeouts), so `card.url` is a **LAN literal**; and LiteLLM 1.103.0 **never
+  fetches the card** on the registration path — `POST /v1/agents` merges the
+  posted `agent_card_params` and stamps its default `[chat]` skill into any card
+  that lacks one. Re-registration cannot help (there is nothing to re-fetch), and
+  the only fetcher, `POST /v1/a2a/discover`, is admin-only **and** SSRF-gated
+  (`HTTP 400: URL targets a blocked address (192.168.1.33)`) until the host is in
+  `user_url_allowed_hosts`. 🚩 §12.6: getting our skills into the registry is a
+  decision (send the assembled card, add a discover+PUT reconciler, or fork
+  LiteLLM), not a workaround.
 - **S14** — the deploy tree shipped one unit, the launcher's, and **nothing
   started `goose serve`**: on reboot the agent came back, served a card, accepted
   calls and failed every turn with `connection refused` on `:3284` — a
@@ -105,6 +116,6 @@ worth reading:
 
 | Spike | Blocked on |
 | ----- | ---------- |
-| S8, S9 | a shell on the NAS. S9 is now *narrowed*: the LiteLLM container cannot resolve the tailnet name, cannot reach the sandbox bridge, and **hangs** on the agent's tailnet IP — so the obstacle is routing, and a wrong card `url` fails as a hang. It also blocks two S13 follow-ups (which card path the proxy fetches, and whether it forwards `metadata`/SSE). |
+| S8 | a shell on the NAS. |
 | S11 | item 4 (a bad download on a host), the **DSM host** (items 1–5 never run there), and the launcher **self-update** (decided, not yet on a host). |
 | S12 | the **DSM** host. mac-studio now runs a published release (0.1.16), so the darwin half is seen. |
