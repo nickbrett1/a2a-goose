@@ -185,6 +185,10 @@ registry:
   # 1. `userAgent` rides LITELLM_CUSTOM_HEADERS to LiteLLM, which records it as
   #    metadata.user_agent on every spend-log row (and auto-tags the request).
   #    Per-request detail, needs no proxy change - just a distinct name per host.
+  #    The variable is `Name: value` *lines*, not JSON: `User-Agent: a2a-goose/x`.
+  #    A JSON value makes goose exit "Error invalid HTTP header name" and every
+  #    turn then fails as "Provider not set"; `name=value` silently drops it.
+  #    Measured on the NAS in spikes/S12.md; the table is in deploy/env/README.md.
   # 2. A per-agent virtual key puts this host's traffic under its own api_key,
   #    which is what makes LiteLLM's own aggregate endpoints split per agent
   #    instead of lumping everything under the master key. Attribution ONLY:

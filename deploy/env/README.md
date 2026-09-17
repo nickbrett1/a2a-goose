@@ -26,12 +26,36 @@ also auto-adds it to `request_tags`.
 So each host names itself:
 
 ```sh
-LITELLM_CUSTOM_HEADERS='{"User-Agent":"a2a-goose/mac-studio"}'
+LITELLM_CUSTOM_HEADERS='User-Agent: a2a-goose/mac-studio'
 ```
 
 goose forwards those headers on every provider call (spike S2 proved
 `LITELLM_CUSTOM_HEADERS` reaches LiteLLM), and the header is what lets a row be
 attributed afterwards by reading `metadata.user_agent` from `/spend/logs/v2`.
+
+**The syntax matters, and the obvious guess is the wrong one.** goose parses
+this variable as **`Name: value` lines** — newline-separated when there is more
+than one header. Measured on the NAS (v0.1.25, goose 1.50.0), by pointing
+`LITELLM_HOST` at a listener that logs every request:
+
+| Value | What happens |
+|---|---|
+| `User-Agent: a2a-goose/nas` | the header arrives upstream; LiteLLM records `metadata.user_agent = 'a2a-goose/nas'` |
+| `User-Agent:a2a-goose/nas` | same — the space after the colon is optional |
+| `x-a: 1` newline `x-b: 2` | two headers, both arrive. **A comma does not separate them**: `x-a: 1, x-b: 2` arrives as *one* header named `x-a` with the rest as its value |
+| `User-Agent=a2a-goose/nas` | accepted, silently **drops the header** — the turn succeeds and the row comes back with an empty `user_agent` |
+| `{"User-Agent":"a2a-goose/nas"}` | **breaks the provider**: goose exits `Error invalid HTTP header name`, and the ACP turn answers `-32603 Internal error ("Error getting agent reply: Provider not set")` |
+
+That last row is worth reading twice: a JSON value here is not a no-op, it is the
+difference between a host answering turns and a host that fails every one of them
+with a message about a *missing provider*. It cost a real debugging session on
+the NAS, where the header was the only variable in the file that was wrong.
+
+The agent now refuses both bad spellings at startup, before it binds a port
+(`serve::check_child_env`): a host deployed with either one does not come up at
+all, naming the variable and the shape to write instead. That is the same
+trade as the goose version gate — a host that advertises skills and fails every
+turn is worse than one that does not start.
 
 **Attribution only — no budget is attached to anything, deliberately.** See the
 decision in `spikes/S2.md`: goose's and LiteLLM's price tables differ by ~3.5x on
@@ -39,17 +63,41 @@ the same call and neither is the provider's invoice, so a proxy-side ceiling
 would enforce a guess. The agent bounds its own *loop* instead (`limits` in
 `config/config.example.yaml`).
 
-### Not verified end to end
+### Verified end to end
 
 The **LiteLLM side is proven** (a direct request with a `User-Agent` came back
-with that string in `metadata.user_agent`) and the **goose side is proven**
-(`LITELLM_CUSTOM_HEADERS` headers arrive at LiteLLM). What is *not* yet proven is
-the two together — goose overriding its own `User-Agent` on the provider call.
-That is a five-minute check on a host that already has a working goose, and it
-belongs with **S8/S12** which need the hosts anyway.
+with that string in `metadata.user_agent`), the **goose side is proven**
+(`LITELLM_CUSTOM_HEADERS` headers arrive at LiteLLM), and as of **2026-09-17 the
+two were seen together on the NAS** (v0.1.25, goose 1.50.0, DSM 7.4.1): a real
+`SendMessage` turn came back `TASK_STATE_COMPLETED` and the spend-log rows for it
+carried
 
-If it turns out goose will not override `User-Agent`, the fallback is route 2 in
-`spikes/S2.md`: a per-agent virtual key with **no budget attached**, which puts
-the host's traffic under its own `api_key` column and makes LiteLLM's own
-aggregate endpoints split per agent. The `LITELLM_AGENT_KEY` placeholder below is
-for exactly that, and is commented out until it is needed.
+```
+2026-09-17T15:01:23  model=deepseek/deepseek-v4-flash
+                     ua='a2a-goose/nas'  tags=['User-Agent: a2a-goose', 'User-Agent: a2a-goose/nas']
+```
+
+So goose *does* override its own `User-Agent` on the provider call, and the host's
+name reaches the row. Route 2 in `spikes/S2.md` (a per-agent virtual key) is not
+needed for attribution; the `LITELLM_AGENT_KEY` placeholder below stays commented
+out until per-agent *aggregation* from LiteLLM's own endpoints is wanted.
+
+### The other thing the turn taught us: the child goose needs a provider key
+
+`ENV_FILE` is not only the agent's own surface. The agent starts `goose serve`
+itself (`goose.acp.serve: own`) and that child **inherits this file's environment
+and nothing else** — so any credential goose's provider needs has to be here. On
+a host where the human's own goose gets its key from `doppler run` in an
+interactive shell, the agent-started goose gets nothing, and the turn fails
+*after* the version gate, the bearer and the ACP handshake, with:
+
+```
+goose refused the request (-32000): Authentication required
+```
+
+measured on the NAS against `http://nas:4000` (a bare `goose.bin run` under an
+agent-like environment reproduces it: `401 Unauthorized … No api key passed in`).
+
+The `LITELLM_API_KEY` line in the templates is for exactly this. Master key for
+now; a per-agent virtual key with no budget is the better answer (`spikes/S2.md`,
+route 2) once attribution is worth splitting by key.
