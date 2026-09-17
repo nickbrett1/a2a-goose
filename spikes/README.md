@@ -10,7 +10,9 @@ the LiteLLM leg ran against the live proxy on the NAS (`nas:4000`). Raw evidence
 is quoted in each file; the sanitised S3 frames are committed as
 `tests/fixtures/acp-turn.jsonl`. S11 and S14 were additionally run on the
 **mac-studio host** on 2026-09-17 against a published release (v0.1.16); S9 was
-run on the **NAS** on 2026-09-17 against the live proxy (`litellm 1.103.0`).
+run on the **NAS** on 2026-09-17 against the live proxy (`litellm 1.103.0`), and
+**re-probed** the same day once the NAS's tailnet was fixed — the re-probe
+moved `card.url` to `http://100.77.144.14:10001`.
 
 | # | Question | Verdict |
 | --- | -------- | ------- |
@@ -22,7 +24,7 @@ run on the **NAS** on 2026-09-17 against the live proxy (`litellm 1.103.0`).
 | [S6](S6.md) | Does the deployed goose advertise `sessionCapabilities.close`? | **PASS** — `close`, `list` and `delete` are all advertised |
 | [S7](S7.md) | Does `protocolVersion: "1.0"` survive a caller with no `a2a-version` header? | **PASS** — the server never reads the header |
 | [S8](S8.md) | Can the agent run as a host process on DSM 7? | **NOT RUN** — needs the NAS shell |
-| [S9](S9.md) | Can the LiteLLM container reach the agent at its `card.url`? | **SPLIT** — addressing **PASS** (LAN literal; no tailnet); card fetch **FAIL** — LiteLLM 1.103.0 never fetches the card, 🚩 escalated, then **decided**: register the card ourselves |
+| [S9](S9.md) | Can the LiteLLM container reach the agent at its `card.url`? | **SPLIT** — addressing **PASS**, re-probed the same day: the **tailnet IP literal** `100.77.144.14:10001` works (the LAN literal it first passed on was a 24 h DHCP lease; the tailnet was unreachable when that was measured, then fixed); card fetch **FAIL** — LiteLLM 1.103.0 never fetches the card, 🚩 escalated, then **decided**: register the card ourselves |
 | [S10](S10.md) | Recipe mining: where do recipes live, and is the shape stable? | **PASS, with one correction to §6.1** |
 | [S11](S11.md) | Does the emitted launcher resolve the right triple, fail open, and *upgrade*? | **PASS on mac-studio** — the flip was a no-op on every upgrade, then fixed and proven by two real upgrades; item 4 and the DSM host pending |
 | [S12](S12.md) | Does the published binary run on the target host? | **NOT RUN** — needs both hosts and a release |
@@ -61,11 +63,19 @@ worth reading:
   its security scheme), so our skills are invisible to a proxy-side caller. And a
   second `POST /v1/agents` is a **400** on a duplicate name, so
   `re_register_on_card_change` must PUT. Its card-fetch path (the errors name the
-  legacy `/.well-known/agent.json`) could not be confirmed — the container has no
-  route to the agent, which is [S9](S9.md)'s question. Not a §12.6 escalation;
+  legacy `/.well-known/agent.json`) could not be confirmed — the container had no
+  route to the agent at the time, which was [S9](S9.md)'s question (the route
+  exists now; the fetch still does not, which is S9's *other* half). Not a §12.6
+  escalation;
   the card work is ours.
-- **S9** — the LiteLLM container **cannot** reach the tailnet at all (no DNS, peer
-  timeouts), so `card.url` is a **LAN literal**; and LiteLLM 1.103.0 **never
+- **S9** — the LiteLLM container **could not** reach the tailnet at all when this
+  was first measured (no DNS, peer timeouts) and did reach the agent on the LAN,
+  so `card.url` was a **LAN literal** — a 24 h DHCP lease. The NAS's Tailscale
+  was fixed later that day and the spike was **re-probed**: `100.77.144.14:10001`
+  now serves the real card from inside the container, MagicDNS still does not
+  resolve there (`TS_ACCEPT_DNS=false` on the sidecar), and since option A makes
+  the registered `url` ours to set, `card.url` is now the **static tailnet IP
+  literal**. Separately, and unaffected by any of that, LiteLLM 1.103.0 **never
   fetches the card** on the registration path — `POST /v1/agents` merges the
   posted `agent_card_params` and stamps its default `[chat]` skill into any card
   that lacks one. Re-registration cannot help (there is nothing to re-fetch), and
