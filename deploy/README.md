@@ -52,6 +52,14 @@ launcher ends in `exec`, so from the init system's point of view the launcher
 That also makes a crash-restart a possible silent upgrade: the next restart
 fetches whatever the newest release is. `NO_FETCH=1` pins a host.
 
+The launcher is itself a **release asset** (S11): the cold start above installs
+it, and every start it replaces itself with whatever the manifest advertises —
+verify the `sha256`, parse-check it, rename it over its own path, fail open. An
+init unit therefore names a fixed path that nothing else owns, not a checkout.
+The DSM *wrapper* is the one file still taken from a checkout, because it is the
+init glue itself; it is thirty lines and changes rarely, which is the property
+the launcher did not have.
+
 ## What is *not* here
 
 - **No container.** Hard constraint #7. `session/new` takes a working directory
@@ -75,13 +83,25 @@ address. `pkill -f 'goose serve'`, or unload whatever unit starts it, or set
 `goose.acp.serve: external` in the config and let it stay somebody else's job.
 
 ```bash
+# 1. Cold start: the launcher is a release asset, not a file in a checkout. It
+#    maintains itself from here on, so this path never changes again.
+dir="$HOME/.local/share/a2a-goose"; mkdir -p "$dir"
+curl -fsSL https://github.com/nickbrett1/a2a-goose/releases/latest/download/fetch-launch.sh \
+  -o "$dir/fetch-launch.sh"
+chmod +x "$dir/fetch-launch.sh"
+
+# 2. The agent, supervised. It starts and supervises goose itself.
 mkdir -p ~/Library/LaunchAgents ~/Library/Logs/a2a-goose
 cp deploy/launchd/com.nick.a2a-goose.plist ~/Library/LaunchAgents/
-# edit the checkout path in the copy if this host keeps the repo elsewhere
 launchctl bootstrap gui/"$(id -u)" ~/Library/LaunchAgents/com.nick.a2a-goose.plist
 launchctl print gui/"$(id -u)"/com.nick.a2a-goose | head
 tail -f ~/Library/Logs/a2a-goose/launcher.log
 ```
+
+The plist names `/Users/nick/.local/share/a2a-goose/fetch-launch.sh`; on a host
+with a different user, change that one path in the copy. It must not point back
+at a checkout — a launcher that is a repository file is a launcher that goes
+stale (S11), and the self-update cannot replace a file something else owns.
 
 DSM 7: Control Panel → Task Scheduler → Create → Triggered Task, event
 **Boot-up**, user = the user that owns goose's configuration (**not** root — root

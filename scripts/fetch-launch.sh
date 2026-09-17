@@ -48,6 +48,15 @@ ENV_FILE="${ENV_FILE:-$HOME/.config/a2a-goose/env}"
 MANIFEST_URL="${MANIFEST_URL:-https://github.com/nickbrett1/a2a-goose/releases/latest/download/manifest.json}"
 TIMEOUT="${TIMEOUT:-10}"
 
+# This file's own path, so it can replace itself (see self_update). launchd and
+# DSM run an absolute path, which is the case that matters; a relative `$0` is
+# resolved against the working directory the caller used.
+SELF=""
+case "$0" in
+  */*) SELF="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")" ;;
+  *) SELF="" ;;
+esac
+
 CURRENT="${DEPLOY_DIR}/current"
 RELEASES_DIR="${DEPLOY_DIR}/releases"
 TMP_DIR="${DEPLOY_DIR}/.fetch-launch-tmp"
@@ -102,6 +111,82 @@ sha256_of() {
   fi
 }
 
+# Replace this file with the one the manifest advertises, before the payload is
+# fetched. This is what makes the launcher a release asset: without it the code
+# that supervises everything else only changes when a human visits the box (a
+# real host ran a launcher four commits stale while its payload self-updated
+# happily underneath).
+#
+# THE FROZEN FLOOR IS THIS FUNCTION: read the manifest, verify a sha256, rename
+# over the path, exec, fail open. Everything above that floor changes with any
+# release, because the copy that runs it is the copy being replaced - so the
+# floor has to be small enough to be obviously right. Two rules keep it safe:
+#
+#   - Verify before swapping, and fail open. A truncated download, a GitHub
+#     error page, a checksum mismatch, or a file that does not parse leaves the
+#     working launcher exactly where it is and the host still boots. The sha256
+#     comes from the same manifest as the asset, so it guards against corruption
+#     and not against a hostile release - the same trust the payload already has.
+#   - Rename over the path; never write through it. bash reads a script lazily,
+#     off its inode, as it runs, so rewriting this file in place would corrupt
+#     the running process mid-execution. `mv` of a new file onto the name gives
+#     the new inode a fresh name and leaves this process reading the inode it
+#     already has open. (Same reasoning as the `current` flip below: the bug
+#     there was also a `mv` doing something other than the obvious.)
+#
+# A manifest with no "launcher" entry - an older release, or a project with no
+# release pipeline - is a no-op, not a failure.
+self_update() {
+  [ -n "${SELF:-}" ] || return 0
+  [ -f "${SELF}" ] || return 0
+  local entry file expected url new actual
+  entry="$(grep '"launcher"[[:space:]]*:' "$manifest" | head -1)"
+  [ -n "$entry" ] || return 0
+  file="$(printf '%s\n' "$entry" | sed -n 's/.*"file"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  expected="$(printf '%s\n' "$entry" | sed -n 's/.*"sha256"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  if [ -z "$file" ] || [ -z "$expected" ]; then
+    log "the manifest's launcher entry has no file/sha256 - keeping the launcher that is running"
+    return 0
+  fi
+  # Downloaded beside SELF, not into TMP_DIR: the swap below has to be a rename,
+  # and a cross-device `mv` would copy onto the destination instead - which is
+  # the write-through this function exists to avoid.
+  new="${SELF}.new.$$"
+  url="$(dirname "$MANIFEST_URL")/${file}"
+  if ! curl -fsSL --max-time "$TIMEOUT" -o "$new" "$url"; then
+    log "could not download the launcher ${url} - keeping the launcher that is running"
+    rm -f "$new"
+    return 0
+  fi
+  actual="$(sha256_of "$new")"
+  if [ "$actual" != "$expected" ]; then
+    log "sha256 mismatch for the launcher ${file}: expected ${expected}, got ${actual:-<no sha256 tool>}"
+    rm -f "$new"
+    return 0
+  fi
+  if ! bash -n "$new" 2>/dev/null; then
+    log "the launcher ${file} does not parse - keeping the launcher that is running"
+    rm -f "$new"
+    return 0
+  fi
+  # Already this launcher: nothing to do, and no reason to churn the file (or
+  # its mtime) on every boot.
+  if cmp -s "$new" "$SELF"; then
+    rm -f "$new"
+    return 0
+  fi
+  chmod +x "$new" 2>/dev/null || true
+  if mv -f "$new" "$SELF"; then
+    # Takes effect next start: this process is already reading the old inode,
+    # and it execs the payload in a moment anyway.
+    log "updated the launcher to ${version} (${file}) - it takes effect next start"
+  else
+    log "could not replace the launcher at ${SELF} - keeping the launcher that is running"
+    rm -f "$new"
+  fi
+  return 0
+}
+
 # The candidate labels for this host, most preferred first. The label is LOOKED
 # UP from this table, never constructed from `uname`: a concatenated triple is
 # where producer/consumer drift would live, and the launcher has no business
@@ -143,6 +228,12 @@ if [ -z "$version" ]; then
   log "manifest at ${MANIFEST_URL} has no version - starting what is installed"
   exec_current "$@"
 fi
+
+# The launcher is a release asset too. Do this before the "already at" return
+# below on purpose: a host whose payload is current can still be running a stale
+# launcher, and that is the case this exists to end. It fails open, so every path
+# through it ends in continuing as before.
+self_update
 
 label=""
 for candidate in $(candidates); do

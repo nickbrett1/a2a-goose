@@ -10,6 +10,13 @@
 
   Install (per user, no sudo):
 
+      # 1. Cold start: the launcher is a release asset, not a file in a checkout.
+      dir="$HOME/.local/share/a2a-goose"; mkdir -p "$dir"
+      curl -fsSL https://github.com/nickbrett1/a2a-goose/releases/latest/download/fetch-launch.sh \
+        -o "$dir/fetch-launch.sh"
+      chmod +x "$dir/fetch-launch.sh"
+
+      # 2. The agent, supervised; it starts and supervises goose itself.
       mkdir -p ~/Library/LaunchAgents ~/Library/Logs/a2a-goose
       cp deploy/launchd/com.nick.a2a-goose.plist ~/Library/LaunchAgents/
       launchctl bootstrap gui/"$(id -u)" ~/Library/LaunchAgents/com.nick.a2a-goose.plist
@@ -35,17 +42,18 @@
   <key>Label</key>
   <string>com.nick.a2a-goose</string>
 
-  <!-- The one host-specific line: where this host keeps its checkout of the
-       repository. The launcher is a repository file, not a release asset, so
-       it is installed by hand and stays put while the payload it fetches
-       changes underneath it. -->
+  <!-- The launcher, at the path the cold start above installed it. It is a
+       release asset, not a file in a checkout: every start it replaces itself
+       with whatever the newest release advertises, so the path is fixed and the
+       code behind it is not. Nothing here may point back at a repository -
+       that is what left this host running a stale launcher (S11). -->
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/nick/Projects/a2a-goose/scripts/fetch-launch.sh</string>
+    <string>/Users/nick/.local/share/a2a-goose/fetch-launch.sh</string>
   </array>
 
   <key>WorkingDirectory</key>
-  <string>/Users/nick/Projects/a2a-goose</string>
+  <string>/Users/nick/.local/share/a2a-goose</string>
 
   <!-- goose has to be resolvable from this PATH: the agent's first act is to
        verify it (src/goose.rs), and with goose.acp.serve: own the agent then

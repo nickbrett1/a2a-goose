@@ -11,14 +11,32 @@ scripts/fetch-launch.sh --help
 Flags are the payload's: the script forwards its arguments, so it never
 interprets them.
 
+## Cold start
+
+A host that has never run the launcher is the one case the launcher cannot fix
+for itself — something has to put the first copy down. Fetch it from the newest
+release, at the path the init unit will run:
+
+```bash
+dir="$HOME/.local/share/a2a-goose"; mkdir -p "$dir"
+curl -fsSL https://github.com/nickbrett1/a2a-goose/releases/latest/download/fetch-launch.sh \
+  -o "$dir/fetch-launch.sh" && chmod +x "$dir/fetch-launch.sh"
+```
+
+Point the unit at `$dir/fetch-launch.sh` — not at a checkout of this repository.
+Every start after that maintains that one file itself, so the path never changes
+again. `deploy/launchd/` and `deploy/dsm/` are already wired to it.
+
 ## What it does
 
 1. Fetches the release manifest from a URL that never contains a version.
-2. Looks up its **target** in that manifest.
-3. If the version is newer, downloads that target's tarball, verifies its
+2. Replaces **itself** with the launcher that manifest advertises, if it
+   advertises one (see *The launcher updates itself*).
+3. Looks up its **target** in that manifest.
+4. If the version is newer, downloads that target's tarball, verifies its
    `sha256`, unpacks it into `releases/<version>/`, and flips the `current`
    symlink.
-4. `exec`s `current/bin/a2a-goose`.
+5. `exec`s `current/bin/a2a-goose`.
 
 ```
 $DEPLOY_DIR/releases/<version>/     an unpacked payload; entry point bin/a2a-goose
@@ -43,6 +61,41 @@ before it can fetch. The tarball names it downloads are read **out of** the
 manifest (`assets[<target>].file`) rather than assembled from a naming
 convention, so the only string that has to match between the pipeline and the
 launcher is the target key — and both read that from one shared table.
+
+## The launcher updates itself
+
+The launcher is a release asset too, so a fix to *it* reaches a host the same way
+a fix to the payload does. The manifest advertises it in a top-level `launcher`
+entry beside `assets` — a separate key, because `assets` is keyed by *target* and
+the launcher is not one (a candidate list must never resolve to it):
+
+```json
+"launcher": { "file": "fetch-launch.sh", "sha256": "…" }
+```
+
+On every start the launcher downloads that file, verifies its `sha256`, checks
+that it parses (`bash -n`) and — only if it differs from the running copy —
+renames it over its own path. It then carries on with the payload, so the new
+launcher takes effect on the **next** start.
+
+Two properties are what make replacing yourself safe rather than exciting:
+
+- **It fails open.** A truncated download, an error page, a checksum mismatch, a
+  file that does not parse, or a directory the launcher cannot write to all log
+  and leave the running launcher exactly where it is. The host still starts.
+- **It replaces the name, not the file.** The swap is a `mv` onto the path, never
+  a write through it: bash reads a script lazily, off its inode, so rewriting the
+  file in place would corrupt the process doing the rewriting.
+
+A manifest with no `launcher` entry — an older release, or a release cut before
+this existed — is a no-op: the host keeps running the launcher it has.
+`NO_FETCH=1` skips this along with the rest of the fetch. The `sha256` comes from
+the same manifest as the asset, so it guards against a corrupt download rather
+than a hostile release — the trust the payload already has.
+
+That self-update is also why the launcher must live at a path the host owns and
+not inside a checkout: replacing the file is the mechanism, so nothing may be
+sharing it.
 
 ## Which target a host resolves
 

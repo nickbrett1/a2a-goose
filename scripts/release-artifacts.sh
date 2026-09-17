@@ -81,6 +81,25 @@ for target in aarch64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-lin
   fi
 done
 
+# --- the launcher ------------------------------------------------------------
+# The launcher is what launchd and DSM supervise, so a fix to *it* has to be
+# shippable the same way a fix to the payload is - otherwise the code that
+# supervises everything else only changes when a human visits the box. That is
+# not hypothetical here: mac-studio ran a launcher four commits stale while its
+# payload self-updated underneath (S11).
+#
+# Published verbatim rather than packed - it is one script, not a payload tree -
+# and advertised in the manifest's "launcher" entry, which the running launcher
+# reads to replace itself before it execs. `scripts/fetch-launch.sh` is
+# app-owned, so this is a guard and not a promise: if it is ever removed, the
+# release simply carries no launcher and the manifest no "launcher" key, which a
+# running launcher reads as "keep running me".
+if [ -f scripts/fetch-launch.sh ]; then
+  cp scripts/fetch-launch.sh "$OUT_DIR/fetch-launch.sh"
+  chmod +x "$OUT_DIR/fetch-launch.sh"
+  echo "published scripts/fetch-launch.sh as fetch-launch.sh"
+fi
+
 # Nothing at all was produced. Say so here, once, rather than attaching an empty
 # release with no explanation.
 if [ -z "$(ls -A "$OUT_DIR" 2>/dev/null)" ]; then
@@ -117,7 +136,17 @@ if [ -n "$(ls -A "$OUT_DIR" 2>/dev/null)" ]; then
       first=0
       printf '\n    "%s": { "file": "%s", "sha256": "%s" }' "$target" "$base" "$sha"
     done
-    printf '\n  }\n}\n'
+    printf '\n  }'
+    # The launcher, beside `assets` rather than inside it: `assets` is keyed by
+    # *target* and consumed by the launcher's candidate lookup, and the launcher
+    # is not a target - a candidate list must never resolve to it. Same one-line
+    # shape, so the launcher reads both with the same grep+sed and needs no JSON
+    # parser on a host that may not have one.
+    if [ -f "$OUT_DIR/fetch-launch.sh" ]; then
+      launcher_sha="$(sha256sum "$OUT_DIR/fetch-launch.sh" | cut -d' ' -f1)"
+      printf ',\n  "launcher": { "file": "fetch-launch.sh", "sha256": "%s" }' "$launcher_sha"
+    fi
+    printf '\n}\n'
   } > "$OUT_DIR/manifest.json"
   echo "wrote $OUT_DIR/manifest.json"
 fi
