@@ -275,17 +275,12 @@ steps:
     env:
       IMAGE: ghcr.io/nickbrett1/a2a-mcp
       CACHE_REF: ghcr.io/nickbrett1/a2a-mcp:buildcache
-    plugins:
-      - docker#v5.13.0:
-          # Only to get a docker CLI with buildx (and the daemon socket from the
-          # plugin). The image's own base is chosen by its Dockerfile.
-          image: "docker:27-cli"
-          platform: linux/arm64
-          workdir: /workdir
-          environment:
-            - IMAGE
-            - CACHE_REF
-            - DOPPLER_TOKEN
+    # No docker plugin: this runs on the agent itself, like nas-port-mcp's
+    # publish step. Inside `docker:27-cli` there is no curl and the credential
+    # lookup fails before anything is built - measured on build 90, which
+    # reported "GHCR_UPDATE_TOKEN is missing from Doppler" for a secret that was
+    # there. The agent has docker, buildx and curl; the image's own base is
+    # chosen by its Dockerfile, not by the step's container.
     commands:
       # Credentials are resolved from Doppler at runtime with the agent's
       # DOPPLER_TOKEN - the same channel the rust release step uses. Putting a
