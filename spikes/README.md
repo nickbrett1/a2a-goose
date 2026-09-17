@@ -8,7 +8,8 @@ Every spike below was run against **goose 1.50.0** (the version the hosts run) o
 2026-09-16, unless marked NOT RUN. The ACP leg ran against a real `goose serve`;
 the LiteLLM leg ran against the live proxy on the NAS (`nas:4000`). Raw evidence
 is quoted in each file; the sanitised S3 frames are committed as
-`tests/fixtures/acp-turn.jsonl`.
+`tests/fixtures/acp-turn.jsonl`. S11 and S14 were additionally run on the
+**mac-studio host** on 2026-09-17 against a published release (v0.1.16).
 
 | # | Question | Verdict |
 | --- | -------- | ------- |
@@ -22,10 +23,10 @@ is quoted in each file; the sanitised S3 frames are committed as
 | [S8](S8.md) | Can the agent run as a host process on DSM 7? | **NOT RUN** — needs the NAS shell |
 | [S9](S9.md) | Can the LiteLLM container reach the agent at its `card.url`? | **NOT RUN** — needs the NAS shell |
 | [S10](S10.md) | Recipe mining: where do recipes live, and is the shape stable? | **PASS, with one correction to §6.1** |
-| [S11](S11.md) | Does the emitted launcher resolve the right triple, fail open, and *upgrade*? | **Item 5 failed, now fixed** — the flip was a no-op on every upgrade; the rest needs a host |
+| [S11](S11.md) | Does the emitted launcher resolve the right triple, fail open, and *upgrade*? | **PASS on mac-studio** — the flip was a no-op on every upgrade, then fixed and proven by two real upgrades; item 4 and the DSM host pending |
 | [S12](S12.md) | Does the published binary run on the target host? | **NOT RUN** — needs both hosts and a release |
 | [S13](S13.md) | Is `a2a-rs` wire-compatible with LiteLLM's A2A routes? | **PASS** — the framing agrees; the *card* needs work on our side |
-| [S14](S14.md) | Does the agent really own `goose serve`? | **PASS on this box** — starts, gates, restarts, refuses; a host is [S8](S8.md)/[S12](S12.md) |
+| [S14](S14.md) | Does the agent really own `goose serve`? | **PASS, box and darwin host** — starts, gates, restarts, refuses; DSM is [S8](S8.md) |
 
 ## What the spikes changed
 
@@ -70,7 +71,13 @@ worth reading:
   address before it binds, and refuses to start rather than adopt a server it did
   not start. It also turned `goose.acp.url` into a contract — the address is
   *dialled* and the child is *started from it*, so with `serve: own` it must be
-  `http` on an IPv4 loopback with the bare `/acp` path.
+  `http` on an IPv4 loopback with the bare `/acp` path. On darwin the whole
+  thing now runs on mac-studio: goose is the agent's child (`ppid` = the agent),
+  `kill -9` gives a new pid with `restarts: 1`, and the next turn still completes.
+  The refusal earned its keep there too — a VS Code port forward on `*:3284`
+  answers a real ACP `initialize`, so the agent **correctly** declined to start
+  (the check is a *dial*, and a forwarded port is indistinguishable from a local
+  goose); the host moved `goose.acp.url` to `:3285`.
 - **S7** — `A2A-Version` is **decorative**: the pinned server never reads it, so
   a caller without the header is indistinguishable from one with it. That voids
   the risk it was gating — and also voids the plan's implied "a wrong version
@@ -82,11 +89,20 @@ worth reading:
   said so in the log. Fixed in the `fetch-launch` capability (genproj #28) and in
   this repo's seeded copy, with tests that run the launcher for real from a host
   that already has a release installed, because no static test could see it —
-  the buggy script passed all of them.
+  the buggy script passed all of them. mac-studio then ran **two real upgrades**
+  (0.1.14 → 0.1.15 → 0.1.16), `current` moving each time with no strays, which is
+  the proof the unit tests could not give.
+- **S11 — the launcher on a host is a *git checkout*, not a release.** launchd on
+  mac-studio runs `~/src/a2a-goose/scripts/fetch-launch.sh`, and it was **4
+  commits behind**, so the first reinstall still ran the buggy flip and `git
+  pull` was the actual fix. The code that supervises everything else is
+  un-pinned; the release tarball carries the agent, not the launcher. **Pin the
+  launcher or fetch it** is an open decision, flagged not taken.
 
 ## Not run, and what unblocks each
 
 | Spike | Blocked on |
 | ----- | ---------- |
 | S8, S9 | a shell on the NAS. S9 is now *narrowed*: the LiteLLM container cannot resolve the tailnet name, cannot reach the sandbox bridge, and **hangs** on the agent's tailnet IP — so the obstacle is routing, and a wrong card `url` fails as a hang. It also blocks two S13 follow-ups (which card path the proxy fetches, and whether it forwards `metadata`/SSE). |
-| S11, S12 | both hosts **and** a real GitHub Release (merge M0 to `main` first) |
+| S11 | item 4 (a bad download on a host) and the **DSM host** (items 1–5 never run there). mac-studio is done unless the launcher-provenance question above is settled. |
+| S12 | the **DSM** host. mac-studio now runs a published release (0.1.16), so the darwin half is seen. |
