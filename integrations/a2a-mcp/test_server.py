@@ -236,10 +236,11 @@ class Tools(unittest.TestCase):
 
     def test_the_deadline_is_advertised_where_a_model_will_read_it(self):
         # The timeout is a fact about the call, so it belongs in the tool the
-        # caller is about to use and not only in a README.
+        # caller is about to use and not only in a README. `list_agents` says it
+        # in its *answer* — its docstring is about the roster — so that half is
+        # asserted below, in ThroughTheWire.
         deadline = f"{server.TIMEOUT_SECONDS:g} s"
         self.assertIn(deadline, self.tools["ask_agent"].description)
-        self.assertIn(deadline, self.tools["list_agents"].description)
         self.assertIn("short-lived", self.tools["ask_agent"].description)
         self.assertIn(deadline, server.mcp.instructions or "")
 
@@ -319,6 +320,9 @@ class ThroughTheWire(unittest.TestCase):
         self.assertIn("nas-goose", listing)
         self.assertIn("mac-studio", listing)
         self.assertIn("2 agent(s)", listing)
+        # The model reads this answer, so the deadline travels with it.
+        self.assertIn(f"{server.TIMEOUT_SECONDS:g} s", listing)
+        self.assertIn("short-lived", listing)
 
     def test_listing_reports_the_agent_s_own_turn_ceiling(self):
         # The card's number and this process's are different, and a caller that
