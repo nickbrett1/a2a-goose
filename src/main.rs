@@ -55,6 +55,11 @@ async fn run() -> anyhow::Result<()> {
     );
 
     let config = Config::load()?;
+    // Non-fatal, and reported before anything else the operator will read: these
+    // are states the agent serves in, not states it refuses (see `Config::warnings`).
+    for warning in config.warnings() {
+        tracing::warn!(warning = %warning, "misconfiguration");
+    }
     let skills = SkillSet::load(&config.skills)?;
     let card = card::assemble(&config, &skills);
     let card_hash = card::hash(&card);

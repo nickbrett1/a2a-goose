@@ -893,6 +893,31 @@ impl Config {
         Ok(())
     }
 
+    /// The misconfigurations that are reported and not refused.
+    ///
+    /// One so far, and it is the shape of an agent nothing can dial: a loopback
+    /// `bind` with a non-loopback `publicUrl`. It is not refused because it is
+    /// also legitimate — something may *front* the port, in which case `publicUrl`
+    /// names the front and `bind` names the loopback behind it. But the dialer
+    /// for `card.url` is the LiteLLM container, in its own network namespace, so
+    /// when nothing fronts the port the agent registers an address that answers
+    /// nothing and every call fails with a connection error while the agent looks
+    /// healthy. Measured exactly that way (spikes/S15.md §6); the two cases are
+    /// indistinguishable from here, so this is a warning with the addresses in it.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if bind_is_loopback(&self.server.bind) && !is_loopback_url(&self.server.public_url) {
+            warnings.push(format!(
+                "server.bind is loopback ({}) but server.publicUrl is not ({}). The dialer for \
+                 card.url is the LiteLLM container, so unless something *fronts* this port the \
+                 agent is unreachable at the URL it registers - every call fails with a \
+                 connection error. Bind the address publicUrl names, not 127.0.0.1 (spikes/S15.md)",
+                self.server.bind, self.server.public_url
+            ));
+        }
+        warnings
+    }
+
     /// The refusals that only apply when this agent starts goose itself.
     ///
     /// All four are the same mistake wearing different clothes: `goose.acp.url`
@@ -977,6 +1002,17 @@ impl Config {
 /// `localhost`, `127.0.0.0/8` and `[::1]` all mean "this process" — and the
 /// process that dials the card is the LiteLLM container, where that is a
 /// different machine's idea of here.
+/// Is this a loopback *listen* address (`127.0.0.1:10001`, `[::1]:10001`)?
+///
+/// Unparseable is `false`: `validate` has already refused anything that is not a
+/// socket address, and a warning is not the place to re-raise that.
+pub fn bind_is_loopback(bind: &str) -> bool {
+    match bind.parse::<std::net::SocketAddr>() {
+        Ok(addr) => addr.ip().is_loopback(),
+        Err(_) => false,
+    }
+}
+
 pub fn is_loopback_url(url: &str) -> bool {
     let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
@@ -1044,6 +1080,36 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert!(matches!(err, ConfigError::MissingDefaultCwd), "{err}");
         assert!(err.to_string().contains("goose.defaults.cwd"), "{err}");
+    }
+
+    #[test]
+    fn a_loopback_bind_with_an_external_public_url_is_reported_and_not_refused() {
+        // The measured outage shape (spikes/S15.md §6): the box registered a
+        // tailnet `publicUrl` while binding loopback, so the LiteLLM container
+        // dialled an address nothing was listening on.
+        let mut config = valid();
+        config.server.bind = "127.0.0.1:10001".to_string();
+        config
+            .validate()
+            .expect("legitimate when something fronts the port");
+
+        let warnings = config.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("127.0.0.1:10001"), "{}", warnings[0]);
+        assert!(
+            warnings[0].contains("mac-studio.tail86fd19.ts.net:10001"),
+            "{}",
+            warnings[0]
+        );
+
+        // Binding what publicUrl names is the fix, and it is silent.
+        config.server.bind = "100.77.144.14:10001".to_string();
+        assert!(config.warnings().is_empty());
+
+        // So is a fronted loopback pair: both sides loopback, nothing to say.
+        config.server.bind = "127.0.0.1:10001".to_string();
+        config.server.public_url = "http://127.0.0.1:10001".to_string();
+        assert!(config.warnings().is_empty(), "{:?}", config.warnings());
     }
 
     #[test]
