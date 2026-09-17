@@ -18,6 +18,7 @@ a stub proxy, so the request that leaves here is asserted, not assumed.
 import asyncio
 import json
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -63,6 +64,18 @@ AGENT = {
         "description": "goose on the NAS",
         "protocolVersion": "1.0",
         "skills": [{"id": "ask", "name": "ask"}],
+        "capabilities": {
+            "streaming": True,
+            # What a real row carries: `docs/turn-deadline.md` says a2a-goose
+            # publishes its own prompt ceiling here.
+            "extensions": [
+                {
+                    "uri": "https://github.com/nickbrett1/a2a-goose/blob/main/docs/turn-deadline.md",
+                    "required": False,
+                    "params": {"promptSecs": 900, "cancelSecs": 10},
+                }
+            ],
+        },
     },
 }
 
@@ -221,6 +234,15 @@ class Tools(unittest.TestCase):
         instructions = server.mcp.instructions or ""
         self.assertIn("minutes", instructions)
 
+    def test_the_deadline_is_advertised_where_a_model_will_read_it(self):
+        # The timeout is a fact about the call, so it belongs in the tool the
+        # caller is about to use and not only in a README.
+        deadline = f"{server.TIMEOUT_SECONDS:g} s"
+        self.assertIn(deadline, self.tools["ask_agent"].description)
+        self.assertIn(deadline, self.tools["list_agents"].description)
+        self.assertIn("short-lived", self.tools["ask_agent"].description)
+        self.assertIn(deadline, server.mcp.instructions or "")
+
     def test_a_docstring_arrives_without_its_python_indentation(self):
         # FastMCP passes the docstring through verbatim, so without flattening
         # the model reads four spaces on every continuation line.
@@ -234,6 +256,9 @@ class ProxyStub(BaseHTTPRequestHandler):
 
     agents: list = []
     received: list = []
+    # Seconds to sit on a POST before answering, so a test can make the
+    # server's own deadline the thing that fires.
+    delay: float = 0.0
 
     def log_message(self, *args):  # keep the test output readable
         pass
@@ -255,6 +280,8 @@ class ProxyStub(BaseHTTPRequestHandler):
         ProxyStub.received.append(
             {"path": self.path, "request": request, "headers": dict(self.headers)}
         )
+        if ProxyStub.delay:
+            time.sleep(ProxyStub.delay)
         body = json.dumps(COMPLETED_TURN).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -285,12 +312,26 @@ class ThroughTheWire(unittest.TestCase):
 
     def setUp(self):
         ProxyStub.received.clear()
+        ProxyStub.delay = 0.0
 
     def test_listing_reports_the_roster_it_read(self):
         listing = asyncio.run(server.list_agents())
         self.assertIn("nas-goose", listing)
         self.assertIn("mac-studio", listing)
         self.assertIn("2 agent(s)", listing)
+
+    def test_listing_reports_the_agent_s_own_turn_ceiling(self):
+        # The card's number and this process's are different, and a caller that
+        # can only see one of them is guessing.
+        self.assertIn("turn ceiling: 900 s", asyncio.run(server.list_agents()))
+
+    def test_an_agent_that_advertises_nothing_reads_as_unknown(self):
+        self.assertIsNone(server.turn_ceiling(MAC["agent_card_params"]))
+        self.assertIsNone(server.turn_ceiling({}))
+
+    def test_a_junk_extension_is_not_mistaken_for_a_ceiling(self):
+        card = {"capabilities": {"extensions": [{"params": {"promptSecs": "soon"}}, "x"]}}
+        self.assertIsNone(server.turn_ceiling(card))
 
     def test_asking_lands_on_the_route_with_a_1_0_send_message(self):
         reply = asyncio.run(server.ask_agent(agent="the nas agent", message="say alpha"))
@@ -313,6 +354,22 @@ class ThroughTheWire(unittest.TestCase):
         )
         message = ProxyStub.received[-1]["request"]["params"]["message"]
         self.assertEqual(message["contextId"], "chat-42")
+
+    def test_a_timeout_is_not_reported_as_an_agent_failure(self):
+        # The measured failure mode behind this item: a caller gives up
+        # (`MCP error -32001`) while the turn is still running. The tool has to
+        # say that, and say what to do about it, rather than let a model read it
+        # as "the agent failed, try again".
+        before = server.TIMEOUT_SECONDS
+        server.TIMEOUT_SECONDS = 0.05
+        ProxyStub.delay = 1.0
+        try:
+            reply = asyncio.run(server.ask_agent(agent="nas-goose", message="slow one"))
+        finally:
+            server.TIMEOUT_SECONDS = before
+        self.assertIn("Gave up waiting for nas-goose after 0.05 s", reply)
+        self.assertIn("not cancelled", reply)
+        self.assertIn("write its result down", reply)
 
     def test_an_unknown_agent_never_reaches_the_proxy(self):
         with self.assertRaises(server.UnknownAgent):

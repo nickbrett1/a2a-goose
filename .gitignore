@@ -32,3 +32,7 @@ target/
 .rustc_info.json
 **/.rustc_info.json
 
+
+# Python bytecode from the compile-only checks (the integrations run in images)
+__pycache__/
+*.pyc
