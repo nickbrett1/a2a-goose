@@ -118,10 +118,7 @@ async fn run() -> anyhow::Result<()> {
         max_concurrent_sessions = config.registry.limits.max_concurrent_sessions,
         "turns will run over ACP"
     );
-    registry.spawn_registration(
-        config.server.public_url.clone(),
-        config.card.protocol_version.clone(),
-    );
+    registry.spawn_registration(&card);
 
     if let Some(status) = &serve_status {
         give_up_if_goose_will_not_stay_up(Arc::clone(status));

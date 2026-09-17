@@ -32,6 +32,21 @@
 //! bounds live in this process (`config.registry.limits`) and are enforced where
 //! they can actually be observed.
 //!
+//! **What *is* sent, and why.** LiteLLM does not fetch the card: `POST
+//! /v1/agents` merges the `agent_card_params` **given to it** and stamps in its
+//! own default `[chat]` skill when none were sent ([S9](../../spikes/S9.md)). So
+//! a registration that carries only `{name, url, protocolVersion}` is a
+//! registration whose skills no caller ever sees, however reachable the card
+//! URL is. We therefore register the card [`crate::card::assemble`] built from
+//! the host's own recipes — `id`, `name`, `description`, `tags` per skill, and
+//! nothing that carries dispatch detail (constraint #12) — so the directory
+//! reflects the host rather than the proxy's default. `url` and
+//! `protocolVersion` are lifted to the top level because LiteLLM reads them
+//! there (they are LiteLLM's stored-card shape, not A2A v1.0 card fields); the
+//! fields LiteLLM reserves for itself (`supportedInterfaces`, `securitySchemes`,
+//! `security`, `provider`) it overwrites during its merge, so they are left to
+//! be overwritten rather than sent.
+//!
 //! **Registration failing is not fatal.** A node agent whose proxy is down is
 //! still a useful node agent; it serves locally and says `unregistered` on
 //! `/status` (§9). What would be fatal is a boot that depends on another
@@ -40,6 +55,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use a2a::AgentCard;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -201,7 +217,7 @@ impl Registry {
     /// Background rather than inline because boot must not be gated on the
     /// proxy: the launcher execs this process, and a slow or absent LiteLLM is
     /// not a reason for the supervisor to see a failure.
-    pub fn spawn_registration(&self, public_url: String, protocol_version: String) {
+    pub fn spawn_registration(&self, card: &AgentCard) {
         let Some(client) = self.client.clone() else {
             tracing::info!(
                 key = %"LITELLM_MASTER_KEY",
@@ -210,24 +226,32 @@ impl Registry {
             return;
         };
 
+        // The card is what we register, not a three-field stub (S9): LiteLLM
+        // never fetches it, so the skills have to travel in the POST/PUT body.
+        let card = card.clone();
         let registry = self.clone();
         tokio::spawn(async move {
             registry.set_state(RegistryState::Registering);
 
             let mut backoff = REGISTER_BACKOFF;
             for attempt in 1..=REGISTER_ATTEMPTS {
-                match client.register(&public_url, &protocol_version).await {
+                match client.register(&card).await {
                     Ok(registration) => {
                         tracing::info!(
                             agent_id = %registration.agent_id,
                             skills = ?registration.skills,
                             "registered with LiteLLM"
                         );
-                        // S5's second finding: the response card is not
-                        // necessarily ours, so say so rather than implying the
-                        // registry mirrors the host.
-                        if registration.skills != vec!["chat".to_string()] {
-                            tracing::debug!("LiteLLM's card carries our skills back");
+                        // S5/S9: the response card is LiteLLM's merge of what
+                        // we sent plus its own overlays. Since we now send our
+                        // skills, `["chat"]` coming back means they did not
+                        // travel — the silent-default case S9 exists to prevent
+                        // — so say so rather than let `/status` look fine.
+                        if registration.skills == vec!["chat".to_string()] {
+                            tracing::warn!(
+                                "LiteLLM answered with its default `chat` skill; our skills did \
+                                 not reach the directory"
+                            );
                         }
                         registry.set_state(RegistryState::Registered {
                             agent_id: registration.agent_id,
@@ -380,6 +404,36 @@ fn plan(existing: Option<String>, may_rewrite: bool) -> Plan {
     }
 }
 
+/// The `agent_card_params` we register: our assembled card, with the two
+/// non-standard top-level fields LiteLLM reads lifted out of `supportedInterfaces`.
+///
+/// S9: LiteLLM **never fetches** `card.url` — `POST /v1/agents` merges the card
+/// it is handed and substitutes its own `[chat]` default when `skills` is
+/// missing — so the skills must be in the body. `url`/`protocolVersion` are
+/// hoisted because LiteLLM stores and reads them at the top level (they are not
+/// A2A v1.0 card fields). Everything LiteLLM reserves (`supportedInterfaces`,
+/// `securitySchemes`, `security`, `provider`) it overwrites during its merge, so
+/// those are left to be overwritten rather than carefully constructed here.
+///
+/// Serialising our own [`AgentCard`] rather than hand-rolling the JSON is the
+/// point (constraint #17): the wire shape is the SDK's, and a version bump that
+/// changes it is a `Cargo.lock` change we review, not a silent drift. The card's
+/// skills carry no dispatch detail — `card.rs` projects only
+/// `id`/`name`/`description`/`tags` (constraint #12).
+fn card_params(card: &AgentCard) -> Value {
+    let mut params = serde_json::to_value(card).expect("an AgentCard always serialises");
+    if let Some(object) = params.as_object_mut() {
+        if let Some(interface) = card.supported_interfaces.first() {
+            object.insert("url".to_string(), Value::String(interface.url.clone()));
+            object.insert(
+                "protocolVersion".to_string(),
+                Value::String(interface.protocol_version.clone()),
+            );
+        }
+    }
+    params
+}
+
 impl Client {
     /// The agent id already listed under this host's name, if any.
     ///
@@ -405,20 +459,14 @@ impl Client {
         find_by_name(&text, &self.agent_name)
     }
 
-    async fn register(
-        &self,
-        public_url: &str,
-        protocol_version: &str,
-    ) -> Result<Registration, RegistryError> {
-        // Exactly the three fields LiteLLM uses. See the module comment for what
-        // is deliberately absent, and `spikes/S2.md` for the measurement.
+    async fn register(&self, card: &AgentCard) -> Result<Registration, RegistryError> {
+        // The card, not a stub: LiteLLM merges exactly what it is given and
+        // never fetches `card.url` (S9), so skills omitted here are skills no
+        // caller can discover. See the module comment for what is deliberately
+        // absent, and `spikes/S2.md` for the cost-parameter measurement.
         let body = serde_json::json!({
             "agent_name": self.agent_name,
-            "agent_card_params": {
-                "name": self.agent_name,
-                "url": public_url,
-                "protocolVersion": protocol_version,
-            },
+            "agent_card_params": card_params(card),
         });
 
         let existing = self.find_agent_id().await?;
@@ -538,6 +586,63 @@ mod tests {
         config
     }
 
+    /// A card shaped like the one `card::assemble` builds: one `ask` skill on an
+    /// interface URL. The registration body is derived from this, so the tests
+    /// exercise the real shape rather than a hand-made stub.
+    fn test_card(url: &str) -> AgentCard {
+        let mut interface = a2a::AgentInterface::new(url, a2a::TRANSPORT_PROTOCOL_JSONRPC);
+        // `AgentInterface::new` pins the SDK's default version; pin ours.
+        interface.protocol_version = "1.0".to_string();
+        AgentCard {
+            name: "mac-studio-goose".to_string(),
+            description: "goose on the Mac Studio, via A2A".to_string(),
+            version: "1.2.3".to_string(),
+            supported_interfaces: vec![interface],
+            capabilities: a2a::AgentCapabilities {
+                streaming: Some(true),
+                push_notifications: Some(false),
+                extensions: None,
+                extended_agent_card: None,
+            },
+            default_input_modes: vec!["text/plain".to_string()],
+            default_output_modes: vec!["text/plain".to_string()],
+            skills: vec![a2a::AgentSkill {
+                id: "ask".to_string(),
+                name: "Ask".to_string(),
+                description: "Ask goose directly".to_string(),
+                tags: vec!["chat".to_string()],
+                examples: None,
+                input_modes: None,
+                output_modes: None,
+                security_requirements: None,
+            }],
+            provider: None,
+            documentation_url: None,
+            icon_url: None,
+            security_schemes: None,
+            security_requirements: None,
+            signatures: None,
+        }
+    }
+
+    #[test]
+    fn the_registration_body_carries_our_skills_not_a_stub() {
+        // S9: LiteLLM never fetches `card.url`, so a body without skills means
+        // the directory shows its default `[chat]` forever, however reachable
+        // the URL is. The card's skills must travel in `agent_card_params`.
+        let params = card_params(&test_card("http://192.168.1.33:10001"));
+        assert_eq!(
+            crate::card::skill_ids(&params),
+            vec!["ask".to_string()],
+            "agent_card_params must carry the host's skills"
+        );
+        // And LiteLLM's two non-standard top-level fields are lifted out of the
+        // interface, because that is where LiteLLM reads them.
+        assert_eq!(params["url"], "http://192.168.1.33:10001");
+        assert_eq!(params["protocolVersion"], "1.0");
+        assert_eq!(params["name"], "mac-studio-goose");
+    }
+
     #[test]
     fn no_master_key_is_unconfigured_not_a_failure() {
         let mut config = config();
@@ -551,7 +656,7 @@ mod tests {
         let registry = Registry::new(&config);
         assert_eq!(registry.state(), RegistryState::Unconfigured);
         // And spawning is a no-op rather than a panic.
-        registry.spawn_registration("http://x:1".to_string(), "1.0".to_string());
+        registry.spawn_registration(&test_card("http://x:1"));
         assert_eq!(registry.state(), RegistryState::Unconfigured);
     }
 
@@ -798,7 +903,7 @@ mod tests {
     async fn a_first_boot_creates_the_entry() {
         let (base, calls) = stub_litellm(false).await;
         let registration = client_against(base, true)
-            .register("http://mac-studio.tail86fd19.ts.net:10099", "1.0")
+            .register(&test_card("http://mac-studio.tail86fd19.ts.net:10099"))
             .await
             .expect("register");
 
@@ -817,7 +922,7 @@ mod tests {
         // a card nobody can discover while looking registered.
         let (base, calls) = stub_litellm(true).await;
         let registration = client_against(base, true)
-            .register("http://mac-studio.tail86fd19.ts.net:10099", "1.0")
+            .register(&test_card("http://mac-studio.tail86fd19.ts.net:10099"))
             .await
             .expect("register");
 
@@ -835,7 +940,7 @@ mod tests {
     async fn a_host_that_may_not_rewrite_cards_adopts_the_entry() {
         let (base, calls) = stub_litellm(true).await;
         let registration = client_against(base, false)
-            .register("http://mac-studio.tail86fd19.ts.net:10099", "1.0")
+            .register(&test_card("http://mac-studio.tail86fd19.ts.net:10099"))
             .await
             .expect("register");
 
