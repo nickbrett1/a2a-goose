@@ -5,11 +5,14 @@ version: 0.1.0
 required_open_webui_version: 0.11.0
 license: MIT
 description: >-
-  Reaches an a2a-goose agent through LiteLLM's `/a2a/{agent_id}` JSON-RPC route,
-  which is the only LiteLLM path that can talk to an A2A 1.0 agent today.
-  Install as an Open WebUI **Pipe** function; it appears in the model dropdown
-  as one model. See `integrations/openwebui/README.md` (and `spikes/S15.md` for
-  why this is a function and not a model id).
+  Every agent in LiteLLM's registry, as an Open WebUI model. Install as an Open
+  WebUI **Pipe** function and it offers one model per registered agent, named
+  from the registry, appearing and disappearing as agents are registered and
+  cleared — a manifold rather than a fixed binding. It reaches each one through
+  LiteLLM's `/a2a/{agent_id}` JSON-RPC route, which is the only LiteLLM path
+  that can talk to an A2A 1.0 agent today. See
+  `integrations/openwebui/README.md` (and `spikes/S15.md` for why this is a
+  function and not a model id).
 """
 
 import json
@@ -39,6 +42,21 @@ from pydantic import BaseModel, Field
 # is reported to the user instead of being mistaken for an empty answer.
 COMPLETED = "TASK_STATE_COMPLETED"
 
+# Discovery, and why it is a *manifold*.
+#
+# Open WebUI builds one model per entry in a pipe's `pipes` attribute, and it
+# evaluates that attribute every time it builds the model list — so a `pipes`
+# that reads the proxy's registry gives a dropdown that is the registry:
+# register an agent and it appears, clear one and it goes. The alternative (one
+# function per host, with the agent id in a valve) is a roster maintained by
+# hand, and a stale valve is invisible: the model is still in the dropdown and
+# every turn fails with `Agent '<id>' not found`.
+#
+# The sub-model ids are the **agent ids**, and the names are the agents' own
+# `agent_name`s: no slug, no mapping table, and nothing to rename when an agent
+# is re-registered. `GET /v1/agents` answers to the same virtual key the route
+# needs (measured), so this costs no extra credential.
+
 
 class Pipe:
     """An a2a-goose agent as an Open WebUI model."""
@@ -62,9 +80,11 @@ class Pipe:
         AGENT_ID: str = Field(
             default="",
             description=(
-                "The agent's `agent_id` from `GET /v1/agents` on the proxy. "
-                "Agents never appear in `GET /v1/models`, so this id is the only "
-                "handle the proxy has for it."
+                "The agent's `agent_id` from `GET /v1/agents`. Used as a "
+                "**fallback** only: normally the agent comes from the model "
+                "picked in the dropdown, and from the registry when the "
+                "dropdown is built. Set it to keep one agent offered even if "
+                "the registry cannot be read."
             ),
         )
         LITELLM_API_KEY: str = Field(
@@ -82,8 +102,78 @@ class Pipe:
     def __init__(self):
         self.type = "pipe"
         self.id = "a2a_goose"
-        self.name = "A2A Goose"
+        # Deliberately no `self.name`: Open WebUI *prefixes* a manifold's
+        # sub-model names with it, and the sub-model names are the agents'.
         self.valves = self.Valves()
+
+    async def pipes(self):
+        """One model per registered agent, read when Open WebUI lists models.
+
+        This is what makes the dropdown the registry. A registry that cannot be
+        read is not allowed to empty the dropdown: the valve's agent is offered
+        as a fallback, so a working deployment keeps working when the proxy is
+        being restarted.
+        """
+        try:
+            agents = await self._registry()
+        except Exception as e:
+            print(f"a2a bridge: could not read the agent registry: {e}")
+            agents = []
+
+        entries = [
+            {"id": a["agent_id"], "name": agent_name}
+            for a in agents
+            if (agent_name := (a.get("agent_name") or a.get("agent_id")))
+            and a.get("agent_id")
+        ]
+        if not entries and self.valves.AGENT_ID:
+            entries = [{"id": self.valves.AGENT_ID, "name": "A2A Goose"}]
+        return entries
+
+    async def _registry(self) -> list:
+        url = self._registry_url(self.valves.A2A_ROUTE)
+        headers = {}
+        if self.valves.LITELLM_API_KEY:
+            headers["Authorization"] = f"Bearer {self.valves.LITELLM_API_KEY}"
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.get(url, headers=headers)
+        response.raise_for_status()
+
+        payload = response.json()
+        # `{"agents": [...]}` and a bare list have both been seen; the roster is
+        # read either way rather than guessed at.
+        agents = payload.get("agents", payload) if isinstance(payload, dict) else payload
+        return [a for a in agents if isinstance(a, dict)]
+
+    @staticmethod
+    def _registry_url(route: str) -> str:
+        """`…/a2a` → `…/v1/agents`: the registry is the route's sibling.
+
+        Derived rather than configured, because two URL valves that must agree
+        is the loopback-bind shape again — one edited, one not, and the failure
+        is `getaddrinfo` at list time.
+        """
+        base = (route or "").rstrip("/")
+        for suffix in ("/a2a", "/a2a/"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        return f"{base.rstrip('/')}/v1/agents"
+
+    def _agent_id(self, body) -> str:
+        """The agent the dropdown chose, or the valve's fallback.
+
+        Open WebUI passes a manifold's model id as `<function id>.<sub id>`, and
+        the sub id here is the agent id — so the choice travels in the request
+        and nothing has to be looked up again.
+        """
+        model = body.get("model") or ""
+        if "." in model:
+            sub = model.split(".", 1)[1].strip()
+            if sub:
+                return sub
+        return self.valves.AGENT_ID
 
     async def pipe(self, body, __metadata__=None, __event_emitter__=None):
         """One Open WebUI turn → one A2A `SendMessage` → one answer.
@@ -118,8 +208,15 @@ class Pipe:
             },
         }
 
+        agent_id = self._agent_id(body)
+        if not agent_id:
+            return (
+                "No agent selected and no AGENT_ID configured. Pick a model from "
+                "the dropdown, or set the valve."
+            )
+
         try:
-            answer = await self._call(request)
+            answer = await self._call(request, agent_id)
         except Exception as e:
             await self._status(__event_emitter__, f"Agent failed: {e}", done=True)
             raise
@@ -127,13 +224,8 @@ class Pipe:
         await self._status(__event_emitter__, "Answer received", done=True)
         return answer
 
-    async def _call(self, request) -> str:
-        if not self.valves.AGENT_ID:
-            raise ValueError(
-                "AGENT_ID is not set. Read it from `GET /v1/agents` on the proxy."
-            )
-
-        url = f"{self.valves.A2A_ROUTE.rstrip('/')}/{self.valves.AGENT_ID}"
+    async def _call(self, request, agent_id) -> str:
+        url = f"{self.valves.A2A_ROUTE.rstrip('/')}/{agent_id}"
         headers = {"Content-Type": "application/json"}
         if self.valves.LITELLM_API_KEY:
             headers["Authorization"] = f"Bearer {self.valves.LITELLM_API_KEY}"

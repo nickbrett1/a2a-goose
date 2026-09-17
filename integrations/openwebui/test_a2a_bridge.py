@@ -128,6 +128,48 @@ class MessagePicking(unittest.TestCase):
         self.assertEqual(Pipe._last_user_message({}), "")
 
 
+class Discovery(unittest.TestCase):
+    """The manifold's two moving parts: where the roster is read, and which
+    agent the dropdown's choice names."""
+
+    def test_the_registry_is_the_route_s_sibling(self):
+        self.assertEqual(
+            Pipe._registry_url("http://litellm:4000/a2a"),
+            "http://litellm:4000/v1/agents",
+        )
+
+    def test_a_trailing_slash_does_not_move_the_registry(self):
+        self.assertEqual(
+            Pipe._registry_url("http://litellm:4000/a2a/"),
+            "http://litellm:4000/v1/agents",
+        )
+
+    def test_a_sub_model_id_is_the_agent_id(self):
+        # `get_pipe_id` splits the model id on its first dot, so everything
+        # after it is the agent this turn is for.
+        body = {"model": "a2a_goose.0a2d93c6-2b0e-471b-9507-a055b5cfe97d"}
+        self.assertEqual(
+            Pipe._agent_id(_valves(""), body),
+            "0a2d93c6-2b0e-471b-9507-a055b5cfe97d",
+        )
+
+    def test_the_valve_is_the_fallback_when_there_is_no_sub_id(self):
+        self.assertEqual(Pipe._agent_id(_valves("the-valve"), {"model": "a2a_goose"}), "the-valve")
+        self.assertEqual(Pipe._agent_id(_valves("the-valve"), {}), "the-valve")
+
+    def test_a_cleared_agent_id_reports_the_agent_rather_than_a_blank(self):
+        # This is what a stale binding looks like from the proxy, and the text a
+        # user should see names the id rather than "400".
+        with self.assertRaises(RuntimeError) as caught:
+            Pipe._answer({"error": {"message": "Agent 'x' not found"}})
+        self.assertIn("Agent 'x' not found", str(caught.exception))
+
+
+def _valves(agent_id):
+    """A minimal stand-in for an instance, for the static helpers."""
+    return type("boom", (), {"valves": type("v", (), {"AGENT_ID": agent_id})()})()
+
+
 class Context(unittest.TestCase):
     def test_a_chat_id_keeps_the_conversation_on_one_agent_session(self):
         self.assertEqual(Pipe._context_id({}, {"chat_id": "abc"}), "abc")

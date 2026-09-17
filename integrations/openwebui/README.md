@@ -83,9 +83,38 @@ way, and `GET /v1/agents` needs the master key rather than a virtual one.
 | valve | default | notes |
 | --- | --- | --- |
 | `A2A_ROUTE` | `http://litellm:4000/a2a` | no trailing agent id. Must resolve **from the Open WebUI container** — the container name on the shared network, not the NAS host name ([S12](../../spikes/S12.md): a musl payload could not resolve DSM's uppercase host name; the same class of mistake, one container over). |
-| `AGENT_ID` | — | from `GET /v1/agents`. |
+| `AGENT_ID` | — | **fallback only.** Normally the agent is the model chosen in the dropdown; this keeps one agent offered if the registry cannot be read. |
 | `LITELLM_API_KEY` | — | a virtual key. Not the agent's bearer. |
 | `TIMEOUT_SECONDS` | `180` | a goose turn is an agent loop, not a completion. |
+
+## How models appear and disappear
+
+The function is a **manifold**: Open WebUI asks it for a list of sub-models
+every time it builds the model list, and `pipes()` answers with the proxy's
+registry (`GET /v1/agents`, derived from `A2A_ROUTE` — its sibling `/v1/agents`,
+because two URL valves that must agree is the loopback-bind shape again). Each
+sub-model is `a2a_goose.<agent_id>`, **named** by the agent's own `agent_name`:
+
+| in LiteLLM | in Open WebUI |
+| --- | --- |
+| a new agent registers | a model appears, named from the registry — nothing to install |
+| an agent is cleared | the model goes |
+| an agent is re-registered under a new id | a model for the new id; the old one goes with the old row |
+
+No mapping table, no slug, nothing to rename, because the sub-model id *is* the
+agent id: the dropdown's choice travels in the request, so a turn needs no
+lookup. Measured on the NAS — the dropdown went from a fixed "A2A Goose" to:
+
+```
+id=a2a_goose.0a2d93c6-2b0e-471b-9507-a055b5cfe97d   name='nas-goose'
+```
+
+(`nas-goose` is nowhere in the function; it came from the registry.) A turn
+through that id answered `NAS`.
+
+If the registry cannot be read — a proxy restart, a wrong key — the valve's
+`AGENT_ID` is still offered, so a working deployment keeps working and a broken
+one says so rather than silently emptying the dropdown.
 
 ## Measured, 2026-09-17, on the NAS
 
