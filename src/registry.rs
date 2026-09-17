@@ -62,13 +62,20 @@ use serde_json::Value;
 use crate::config::Config;
 
 /// How many times boot registration is attempted before giving up and reporting
-/// `failed`. M4 owns the ongoing retry; M1 gets the agent listed and makes the
-/// failure visible.
-const REGISTER_ATTEMPTS: u32 = 4;
+/// `failed`. M1 picked 4 to get the agent listed and make a failure visible;
+/// M4 raised it, because the thing being waited for is usually a *proxy that is
+/// not up yet* — a LiteLLM restart outlasts four seconds of trying, and the
+/// cost of the extra attempts is invisible next to the cost of a host that is
+/// serving but unreachable.
+const REGISTER_ATTEMPTS: u32 = 8;
 
 /// First backoff step; doubles each attempt. Long enough to ride out a proxy
 /// restart, short enough that a boot is not held up for minutes.
 const REGISTER_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Ceiling on that doubling. Uncapped, attempt 8 would wait over two minutes
+/// for its last try, which buys nothing a 30s wait has not already.
+const REGISTER_BACKOFF_CAP: Duration = Duration::from_secs(30);
 
 /// What `/status` reports about the registry. Modelled as a state rather than a
 /// bool so a reader can tell "not configured here" from "configured and failing"
@@ -135,6 +142,26 @@ impl std::fmt::Display for RegistryError {
 
 impl std::error::Error for RegistryError {}
 
+impl RegistryError {
+    /// Does this failure mean "that name is already taken"?
+    ///
+    /// Keyed on the **body**, not the status, because the two disagree here:
+    /// S13 recorded a `400` for a duplicate `agent_name`, and the live proxy
+    /// answers `500` with Prisma's
+    /// `Unique constraint failed on the fields: (agent_name)`. A status test
+    /// would miss the case that actually happens, and a status of `500` is not
+    /// otherwise distinguishable from a real server fault — so the string is
+    /// the honest key, contained in one place.
+    fn is_duplicate_name(&self) -> bool {
+        match self {
+            Self::Status { body, .. } => {
+                body.contains("Unique constraint failed") || body.contains("already exists")
+            }
+            _ => false,
+        }
+    }
+}
+
 impl From<reqwest::Error> for RegistryError {
     fn from(err: reqwest::Error) -> Self {
         RegistryError::Request(err)
@@ -152,6 +179,11 @@ struct Client {
     base_url: String,
     master_key: String,
     agent_name: String,
+    /// The token **this agent serves with**, to be handed to LiteLLM as a
+    /// `static_headers` entry so its route can authenticate to us. `None` only
+    /// when the environment has no bearer token, which the server refuses to
+    /// start without — so in practice this is always `Some`.
+    bearer_token: Option<String>,
     /// Whether an entry that already exists may be **rewritten**. `false` adopts
     /// the existing entry and leaves its card alone, for a host whose registry
     /// entry is managed from elsewhere.
@@ -181,6 +213,7 @@ impl Registry {
                     .to_string(),
                 master_key,
                 agent_name: config.registry.agent_name.clone(),
+                bearer_token: config.bearer_token().ok(),
                 re_register_on_card_change: config.registry.re_register_on_card_change,
                 http: reqwest::Client::new(),
             })
@@ -273,7 +306,7 @@ impl Registry {
                         }
                         tracing::debug!(attempt, error = %err, "registration attempt failed");
                         tokio::time::sleep(backoff).await;
-                        backoff *= 2;
+                        backoff = (backoff * 2).min(REGISTER_BACKOFF_CAP);
                     }
                 }
             }
@@ -434,6 +467,33 @@ fn card_params(card: &AgentCard) -> Value {
     params
 }
 
+/// The `POST`/`PUT` body: our name, our card, and — when this host has one —
+/// the bearer LiteLLM's own route must present to us.
+///
+/// M4, and measured before it was written: `static_headers` goes at the **top
+/// level** of the request. A copy nested under `litellm_params` is accepted and
+/// stored there, but the row the `/a2a/{agent_id}` route reads is the top-level
+/// one — a probe registered both ways and read them back, and only the
+/// top-level entry came back where the working entry on the NAS has it. Before
+/// this, the token had to be installed by hand with an admin `PUT`, which
+/// nothing in this repository could restore, and three surfaces depended on it.
+///
+/// This is the agent's *own* serving token, not a key of ours: it travels from
+/// one place we already hold it to the one place that needs it, and it is not
+/// logged (the `Authorization` value is never printed at any level).
+fn registration_body(agent_name: &str, card: &AgentCard, bearer_token: Option<&str>) -> Value {
+    let mut body = serde_json::json!({
+        "agent_name": agent_name,
+        "agent_card_params": card_params(card),
+    });
+    if let Some(token) = bearer_token {
+        body["static_headers"] = serde_json::json!({
+            "Authorization": format!("Bearer {token}"),
+        });
+    }
+    body
+}
+
 impl Client {
     /// The agent id already listed under this host's name, if any.
     ///
@@ -464,19 +524,35 @@ impl Client {
         // never fetches `card.url` (S9), so skills omitted here are skills no
         // caller can discover. See the module comment for what is deliberately
         // absent, and `spikes/S2.md` for the cost-parameter measurement.
-        let body = serde_json::json!({
-            "agent_name": self.agent_name,
-            "agent_card_params": card_params(card),
-        });
+        let body = registration_body(&self.agent_name, card, self.bearer_token.as_deref());
 
         let existing = self.find_agent_id().await?;
         match plan(existing, self.re_register_on_card_change) {
-            Plan::Create => {
-                let text = self
-                    .send(reqwest::Method::POST, "/v1/agents", &body)
-                    .await?;
-                parse_registration(&text)
-            }
+            Plan::Create => match self.send(reqwest::Method::POST, "/v1/agents", &body).await {
+                Ok(text) => parse_registration(&text),
+                // The name is taken although the listing did not show it: the
+                // entry appeared between the scan and the POST, or the listing
+                // was filtered by the key we registered with. Either way we now
+                // know an id exists for our name, so the reclaim is another
+                // scan and an in-place rewrite — the same `Plan::Update` the
+                // happy path would have taken, reached one request later.
+                Err(err) if err.is_duplicate_name() => {
+                    let agent_id = self.find_agent_id().await?.ok_or(err)?;
+                    tracing::warn!(
+                        %agent_id,
+                        "the name was already taken on POST; reclaiming the existing entry"
+                    );
+                    let text = self
+                        .send(
+                            reqwest::Method::PUT,
+                            &format!("/v1/agents/{agent_id}"),
+                            &body,
+                        )
+                        .await?;
+                    parse_registration(&text)
+                }
+                Err(err) => Err(err),
+            },
             Plan::Update(agent_id) => {
                 tracing::info!(
                     %agent_id,
@@ -623,6 +699,157 @@ mod tests {
             security_requirements: None,
             signatures: None,
         }
+    }
+
+    #[test]
+    fn the_registration_body_hands_litellm_the_bearer_its_route_must_present() {
+        // M4. Our own `/a2a` refuses to serve without a bearer, so LiteLLM's
+        // route has to send one — and the only place it can read it from is the
+        // agent row. Top-level, because that is the entry the route reads
+        // (measured against the live proxy: the same value nested under
+        // `litellm_params` is stored and read back from there instead).
+        let body = registration_body(
+            "mac-studio-goose",
+            &test_card("http://host:10001"),
+            Some("secret-token"),
+        );
+        assert_eq!(
+            body["static_headers"]["Authorization"],
+            "Bearer secret-token"
+        );
+        // And the shape the rest of the body already had is untouched.
+        assert_eq!(body["agent_name"], "mac-studio-goose");
+        assert_eq!(
+            crate::card::skill_ids(&body["agent_card_params"]),
+            vec!["ask".to_string()]
+        );
+
+        // No token in the environment: no header, rather than an empty one that
+        // would make the route fail with something less obvious than "absent".
+        let body = registration_body("mac-studio-goose", &test_card("http://host:10001"), None);
+        assert!(body.get("static_headers").is_none());
+    }
+
+    #[test]
+    fn a_taken_name_is_recognised_from_the_body_not_the_status() {
+        // The live proxy answers 500 with Prisma's constraint text where S13
+        // recorded a 400, and a bare 500 is not otherwise distinguishable from a
+        // real fault — so the string is what is tested.
+        let live = RegistryError::Status {
+            status: 500,
+            body: r#"{"detail":"Unique constraint failed on the fields: (agent_name)"}"#
+                .to_string(),
+        };
+        assert!(live.is_duplicate_name());
+
+        let documented = RegistryError::Status {
+            status: 400,
+            body: r#"{"detail":"Agent with name mac-studio-goose already exists"}"#.to_string(),
+        };
+        assert!(documented.is_duplicate_name(), "S13's documented shape too");
+
+        // A 500 that is not about the name must not be mistaken for a reclaim.
+        let real_fault = RegistryError::Status {
+            status: 500,
+            body: r#"{"detail":"connection to database timed out"}"#.to_string(),
+        };
+        assert!(!real_fault.is_duplicate_name());
+    }
+
+    /// A stub whose listing **hides** our entry while its POST refuses the
+    /// name: the race M4's reclaim exists for — an entry that was created by a
+    /// previous process, or by a key whose listing is filtered, so the lookup
+    /// cannot see what the constraint already knows about.
+    async fn stub_litellm_with_a_hidden_entry() -> (String, Arc<Mutex<Vec<String>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let revealed = Arc::new(Mutex::new(false));
+        let app = axum::Router::new()
+            .fallback(hidden_stub)
+            .with_state(Hidden {
+                calls: calls.clone(),
+                revealed: revealed.clone(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        (format!("http://{addr}"), calls)
+    }
+
+    #[derive(Clone)]
+    struct Hidden {
+        calls: Arc<Mutex<Vec<String>>>,
+        revealed: Arc<Mutex<bool>>,
+    }
+
+    async fn hidden_stub(
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+        axum::extract::State(stub): axum::extract::State<Hidden>,
+    ) -> (axum::http::StatusCode, axum::Json<Value>) {
+        use axum::http::StatusCode;
+
+        let path = uri.path().to_string();
+        stub.calls
+            .lock()
+            .expect("call log")
+            .push(format!("{method} {path}"));
+
+        let registration = serde_json::json!({
+            "agent_id": "id-1",
+            "agent_name": "mac-studio-goose",
+            "agent_card_params": {"name": "mac-studio-goose", "skills": []},
+        });
+
+        match (method.as_str(), path.as_str()) {
+            ("GET", "/v1/agents") => {
+                let revealed = *stub.revealed.lock().expect("revealed");
+                let listing = if revealed {
+                    serde_json::json!([{"agent_id": "id-1",
+                                        "agent_name": "mac-studio-goose"}])
+                } else {
+                    serde_json::json!([])
+                };
+                (StatusCode::OK, axum::Json(listing))
+            }
+            ("POST", "/v1/agents") => {
+                // The entry becomes visible as a side effect, exactly as it
+                // would if another process had just created it.
+                *stub.revealed.lock().expect("revealed") = true;
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(serde_json::json!({
+                        "detail": "Unique constraint failed on the fields: (agent_name)"
+                    })),
+                )
+            }
+            ("PUT", "/v1/agents/id-1") => (StatusCode::OK, axum::Json(registration)),
+            _ => (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({}))),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_name_taken_although_it_was_not_listed_is_reclaimed_rather_than_failed() {
+        let (base, calls) = stub_litellm_with_a_hidden_entry().await;
+        let registration = client_against(base, true)
+            .register(&test_card("http://mac-studio.tail86fd19.ts.net:10099"))
+            .await
+            .expect("the second lookup finds the id the POST refused to give");
+
+        assert_eq!(registration.agent_id, "id-1");
+        assert_eq!(
+            *calls.lock().expect("call log"),
+            vec![
+                "GET /v1/agents",
+                "POST /v1/agents",
+                "GET /v1/agents",
+                "PUT /v1/agents/id-1"
+            ],
+            "a scan, a refused create, then the same scan and rewrite the happy path would have done"
+        );
     }
 
     #[test]
@@ -894,6 +1121,7 @@ mod tests {
             base_url,
             master_key: "sk-test".to_string(),
             agent_name: "mac-studio-goose".to_string(),
+            bearer_token: Some("agent-serving-token".to_string()),
             re_register_on_card_change: may_rewrite,
             http: reqwest::Client::new(),
         }
