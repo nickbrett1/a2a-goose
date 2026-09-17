@@ -64,25 +64,39 @@ AGENT = {
         "description": "goose on the NAS",
         "protocolVersion": "1.0",
         "skills": [{"id": "ask", "name": "ask"}],
-        "capabilities": {
-            "streaming": True,
-            # What a real row carries: `docs/turn-deadline.md` says a2a-goose
-            # publishes its own prompt ceiling here.
-            "extensions": [
-                {
-                    "uri": "https://github.com/nickbrett1/a2a-goose/blob/main/docs/turn-deadline.md",
-                    "required": False,
-                    "params": {"promptSecs": 900, "cancelSecs": 10},
-                }
-            ],
-        },
+        # Measured, 2026-09-17: LiteLLM stores a *normalised* card, and a real
+        # row's capabilities come back as {"streaming": true} — the
+        # `extensions` entry the agent publishes is dropped. So the row is
+        # modelled as it really arrives and the ceiling is asserted against
+        # `card_url` below, the agent's own endpoint, which is the only place
+        # the number survives.
+        "capabilities": {"streaming": True},
+    },
+}
+
+# What `nas-goose` serves at its own `/.well-known/agent-card.json`: the same
+# card, with the part the proxy dropped still on it.
+AGENT_CARD = {
+    "name": "nas-goose",
+    "url": "http://100.82.223.13:10001",
+    "capabilities": {
+        "streaming": True,
+        "extensions": [
+            {
+                "uri": "https://github.com/nickbrett1/a2a-goose/blob/main/docs/turn-deadline.md",
+                "required": False,
+                "params": {"promptSecs": 900, "cancelSecs": 10},
+            }
+        ],
     },
 }
 
 MAC = {
     "agent_id": "11111111-2222-3333-4444-555555555555",
     "agent_name": "mac-studio",
-    "agent_card_params": {"url": "http://192.168.1.4:10001", "skills": []},
+    # Nothing is listening here, so a listing that reaches for this agent's card
+    # is refused immediately rather than waiting out CARD_TIMEOUT_SECONDS.
+    "agent_card_params": {"url": "http://127.0.0.1:1", "skills": []},
 }
 
 
@@ -253,10 +267,17 @@ class Tools(unittest.TestCase):
 
 
 class ProxyStub(BaseHTTPRequestHandler):
-    """A stand-in for LiteLLM: the two endpoints this server uses, nothing else."""
+    """A stand-in for LiteLLM: the two endpoints this server uses, nothing else.
+
+    It also stands in for an *agent* — `card` is what `/.well-known/agent-card.json`
+    answers with — because the deadline is fetched from the agent itself, and a
+    stub that cannot be reached is how the fail-open path is tested.
+    """
 
     agents: list = []
     received: list = []
+    # What an agent's own card endpoint serves. `None` means "nothing answers".
+    card: dict | None = None
     # Seconds to sit on a POST before answering, so a test can make the
     # server's own deadline the thing that fires.
     delay: float = 0.0
@@ -265,10 +286,19 @@ class ProxyStub(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path == "/.well-known/agent-card.json":
+            if ProxyStub.card is None:
+                self.send_error(404)
+                return
+            self._json(ProxyStub.card)
+            return
         if self.path != "/v1/agents":
             self.send_error(404)
             return
-        body = json.dumps(self.agents).encode()
+        self._json(self.agents)
+
+    def _json(self, payload):
+        body = json.dumps(payload).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -300,20 +330,29 @@ class ThroughTheWire(unittest.TestCase):
         cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), ProxyStub)
         threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
 
+        # The agent the row names is this stub, so "ask the agent for its own
+        # card" is a request the test can actually make — and the row's copy is
+        # the stripped one LiteLLM really stores.
+        cls.address = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+        AGENT["agent_card_params"]["url"] = cls.address
+        ProxyStub.card = AGENT_CARD
+
         cls.original_route = server.A2A_ROUTE
         cls.original_key = server.LITELLM_API_KEY
-        server.A2A_ROUTE = f"http://127.0.0.1:{cls.httpd.server_address[1]}/a2a"
+        server.A2A_ROUTE = f"{cls.address}/a2a"
         server.LITELLM_API_KEY = "sk-virtual"
 
     @classmethod
     def tearDownClass(cls):
         server.A2A_ROUTE = cls.original_route
         server.LITELLM_API_KEY = cls.original_key
+        ProxyStub.card = None
         cls.httpd.shutdown()
 
     def setUp(self):
         ProxyStub.received.clear()
         ProxyStub.delay = 0.0
+        ProxyStub.card = AGENT_CARD
 
     def test_listing_reports_the_roster_it_read(self):
         listing = asyncio.run(server.list_agents())
@@ -326,8 +365,24 @@ class ThroughTheWire(unittest.TestCase):
 
     def test_listing_reports_the_agent_s_own_turn_ceiling(self):
         # The card's number and this process's are different, and a caller that
-        # can only see one of them is guessing.
-        self.assertIn("turn ceiling: 900 s", asyncio.run(server.list_agents()))
+        # can only see one of them is guessing. The row cannot supply it, so the
+        # listing has to ask the agent.
+        listing = asyncio.run(server.list_agents())
+        self.assertIn("turn ceiling: 900 s", listing)
+        self.assertIsNone(server.turn_ceiling(AGENT["agent_card_params"]))
+
+    def test_an_agent_that_does_not_answer_has_no_ceiling(self):
+        # Nothing answers either agent's card endpoint here. A listing must
+        # still list them, and must not invent a number for them.
+        ProxyStub.card = None
+        listing = asyncio.run(server.list_agents())
+        self.assertIn("mac-studio", listing)
+        self.assertIn("nas-goose", listing)
+        self.assertNotIn("turn ceiling:", listing)
+
+    def test_a_card_that_is_not_json_reads_as_advertising_nothing(self):
+        self.assertIsNone(asyncio.run(server.own_turn_ceiling({"url": "not a url"})))
+        self.assertIsNone(asyncio.run(server.own_turn_ceiling({})))
 
     def test_an_agent_that_advertises_nothing_reads_as_unknown(self):
         self.assertIsNone(server.turn_ceiling(MAC["agent_card_params"]))

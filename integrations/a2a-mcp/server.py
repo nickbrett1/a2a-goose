@@ -80,6 +80,9 @@ LITELLM_API_KEY = os.environ.get("LITELLM_API_KEY") or ""
 # description cannot drift from the behaviour.
 TIMEOUT_SECONDS = float(os.environ.get("TIMEOUT_SECONDS") or 300)
 REGISTRY_TIMEOUT_SECONDS = float(os.environ.get("REGISTRY_TIMEOUT_SECONDS") or 15)
+# The deadline is asked of the agent itself, and an agent that is down must not
+# hold up a listing. Five seconds is a card fetch on a tailnet, not a turn.
+CARD_TIMEOUT_SECONDS = float(os.environ.get("CARD_TIMEOUT_SECONDS") or 5)
 
 # The paragraph both callers read. It is a module constant rather than a
 # docstring because it carries `TIMEOUT_SECONDS` and a docstring cannot be
@@ -303,6 +306,12 @@ def turn_ceiling(card: dict[str, Any]) -> float | None:
     and LiteLLM carries the card into the row, so reading it back is what makes
     the roster useful for budgeting. An agent that advertises nothing — or a row
     whose card was rewritten — reads as `None` rather than as a guess.
+
+    Read the row's copy first and stop there when it has one. LiteLLM stores a
+    *normalised* card and drops `capabilities.extensions` (measured 2026-09-17:
+    a registered a2a-goose row comes back with `capabilities` = `{"streaming":
+    true}` while the agent's own card carries the extension), so today the row
+    never has one — `own_turn_ceiling` is what actually finds it.
     """
     capabilities = card.get("capabilities") or {}
     if not isinstance(capabilities, dict):
@@ -315,6 +324,33 @@ def turn_ceiling(card: dict[str, Any]) -> float | None:
         if isinstance(seconds, (int, float)) and not isinstance(seconds, bool):
             return float(seconds)
     return None
+
+
+async def own_turn_ceiling(card: dict[str, Any]) -> float | None:
+    """The ceiling an agent advertises, read from the agent when the row has none.
+
+    The proxy's copy cannot be trusted to carry it — see `turn_ceiling` — so the
+    fallback is the agent's own card endpoint, which is the same card the proxy
+    was handed and is served by the process that will actually run the turn.
+    Fail-open in every direction: no url, a refused connection, a timeout, a
+    body that is not JSON, or a card with no extension all read as "advertises
+    nothing", which is what a caller assumed before any of this existed. One
+    agent being down must not cost the roster its other entries.
+    """
+    documented = turn_ceiling(card)
+    if documented is not None:
+        return documented
+    url = str(card.get("url") or "").strip()
+    if not url:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=CARD_TIMEOUT_SECONDS) as client:
+            response = await client.get(f"{url.rstrip('/')}/.well-known/agent-card.json")
+        response.raise_for_status()
+        published = response.json()
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError):
+        return None
+    return turn_ceiling(published if isinstance(published, dict) else {})
 
 
 def roster(agents: list[dict[str, Any]]) -> str:
@@ -392,7 +428,7 @@ async def list_agents() -> str:
             lines.append(f"    protocol: {card['protocolVersion']}")
         if card.get("description"):
             lines.append(f"    description: {card['description']}")
-        ceiling = turn_ceiling(card)
+        ceiling = await own_turn_ceiling(card)
         if ceiling is not None:
             lines.append(
                 f"    its own turn ceiling: {ceiling:g} s "
