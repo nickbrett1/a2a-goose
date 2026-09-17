@@ -244,3 +244,67 @@ steps:
         else
           gh release create "$$TAG" --title "$$TAG" --generate-notes --verify-tag
         fi
+
+  - label: ":python: Test (a2a-mcp tools)"
+    key: test_a2a_mcp
+    agents:
+      queue: mac-studio-linux
+    # Hand-added, not generated - like the fmt/clippy lines on the rust build step
+    # above. This is the Python MCP server in integrations/a2a-mcp/, a separate
+    # artefact from the Rust agent: the Rust steps neither cover it nor build
+    # its image, so it carries its own gate.
+    plugins:
+      - docker#v5.13.0:
+          image: "python:3.12-slim"
+          # The fleet is Apple silicon. Without this, docker resolves a
+          # multi-arch tag to linux/amd64 and runs the whole step emulated (with
+          # a warning, and native modules built for the wrong architecture).
+          platform: linux/arm64
+          workdir: /workdir
+    commands:
+      - python -m pip install --no-cache-dir -r integrations/a2a-mcp/requirements.txt
+      - python -m unittest discover -s integrations/a2a-mcp -p 'test_*.py' -v
+
+  - label: ":docker: Build and publish image (GHCR, a2a-mcp)"
+    key: docker_publish_a2a_mcp
+    depends_on:
+      - test_a2a_mcp
+    if: build.branch == "main"
+    agents:
+      queue: mac-studio-linux
+    env:
+      IMAGE: ghcr.io/nickbrett1/a2a-mcp
+      CACHE_REF: ghcr.io/nickbrett1/a2a-mcp:buildcache
+    plugins:
+      - docker#v5.13.0:
+          # Only to get a docker CLI with buildx (and the daemon socket from the
+          # plugin). The image's own base is chosen by its Dockerfile.
+          image: "docker:27-cli"
+          platform: linux/arm64
+          workdir: /workdir
+          environment:
+            - IMAGE
+            - CACHE_REF
+            - DOPPLER_TOKEN
+    commands:
+      # Credentials are resolved from Doppler at runtime with the agent's
+      # DOPPLER_TOKEN - the same channel the rust release step uses. Putting a
+      # registry token in the agent's environment hook would expose it to every
+      # job on the fleet; the value is only ever in this job's shell.
+      - |
+        GHCR_USERNAME=nickbrett1
+        GHCR_TOKEN="$$(curl -fsS -H "Authorization: Bearer $$DOPPLER_TOKEN" "https://api.doppler.com/v3/configs/config/secret?project=common&config=prd&name=GHCR_UPDATE_TOKEN" | sed -n 's/.*"raw"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+        if [ -z "$$GHCR_TOKEN" ]; then
+          echo "GHCR_UPDATE_TOKEN is missing from Doppler (common/prd) - cannot publish." >&2
+          exit 1
+        fi
+        echo "$$GHCR_TOKEN" | docker login ghcr.io -u "$$GHCR_USERNAME" --password-stdin
+      - docker buildx create --use --bootstrap || true
+      # linux/amd64: the NAS is x86_64, the agents are Apple silicon. The
+      # context is integrations/a2a-mcp - its Dockerfile is the one that ships.
+      - >
+        docker buildx build --platform linux/amd64
+        --cache-from type=registry,ref=$$CACHE_REF
+        --cache-to type=registry,ref=$$CACHE_REF,mode=max
+        -t $$IMAGE:$$BUILDKITE_COMMIT -t $$IMAGE:latest --push
+        integrations/a2a-mcp

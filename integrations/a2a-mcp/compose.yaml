@@ -1,8 +1,11 @@
 # NAS-side stack for the a2a-mcp tool server: /volumeUSB1/usbshare/docker/a2a-mcp/
 #
-# Deployed by copying server.py, requirements.txt, Dockerfile and this file into
-# that directory and running `sudo docker compose up -d --build`. The repo copy
-# is the source of truth; the NAS copy is what runs, and the two are compared by
+# The image is built and published by CI (Buildkite, on main:
+# ":docker: Build and publish image (GHCR, a2a-mcp)") to ghcr.io/nickbrett1/a2a-mcp, and
+# the box pulls it from there — watchtower-nick updates this stack on its own.
+# Deployed by copying this file into that directory and running
+# `sudo docker compose pull && sudo docker compose up -d`. The repo copy is the
+# source of truth; the NAS copy is what runs, and the two are compared by
 # checksum when something looks wrong (see README.md).
 #
 # Secrets come from a `.env` beside this file, which is *not* in the repo:
@@ -12,8 +15,7 @@
 # Nothing else needs setting; the defaults below match this NAS.
 services:
   a2a-mcp:
-    build: .
-    image: a2a-mcp:latest
+    image: ghcr.io/nickbrett1/a2a-mcp:latest
     container_name: a2a-mcp
     restart: always
     mem_limit: 512m
@@ -37,10 +39,12 @@ services:
       - "traefik.http.routers.a2a-mcp.middlewares=a2a-mcp-strip"
       - "traefik.http.services.a2a-mcp.loadbalancer.server.port=8090"
       - "traefik.http.middlewares.a2a-mcp-strip.stripprefix.prefixes=/a2a-mcp"
-      # Locally built, no registry push: watchtower cannot update this one.
-      # Rebuild after changing server.py:
-      #   cd /volumeUSB1/usbshare/docker/a2a-mcp && sudo docker compose up -d --build
-      - "com.centurylinklabs.watchtower.enable=false"
+      # Published by CI to GHCR (see the header) and pulled from there, so
+      # watchtower-nick keeps this stack current on its own. To ship a change:
+      # merge it to main, let the publish step run, and watchtower picks it up
+      # within a minute — or `sudo docker compose pull && up -d` to take it now.
+      - "com.centurylinklabs.watchtower.enable=true"
+      - "com.centurylinklabs.watchtower.scope=nick"
     healthcheck:
       # A TCP check, not an HTTP one: /mcp answers 400 to a bare GET by design
       # (it wants a POST and an Accept header), so only the port is meaningful.
