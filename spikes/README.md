@@ -21,7 +21,10 @@ M3 control surface against a real runner, and a spend-log row naming the host.
 S15 was run on the **NAS** on 2026-09-17 too, against the live proxy and a
 registered `nas-goose`, to answer the question the cancelled n8n leg left behind
 (how Open WebUI reaches the agent) — it closed the "the agent appears as a model"
-assumption as **false**, and with it the reason it was assumed.
+assumption as **false**, and with it the reason it was assumed. S16 was run on the
+**NAS** on 2026-09-17 as well, to answer the follow-on question ("can a session with
+*any* model find and message the agents?") — it turned the agents into MCP tools
+served through mcphub, which is the surface both goose and Open WebUI already use.
 
 | # | Question | Verdict |
 | --- | -------- | ------- |
@@ -40,6 +43,7 @@ assumption as **false**, and with it the reason it was assumed.
 | [S13](S13.md) | Is `a2a-rs` wire-compatible with LiteLLM's A2A routes? | **PASS** — the framing agrees; the *card* needs work on our side |
 | [S14](S14.md) | Does the agent really own `goose serve`? | **PASS, box and darwin host** — starts, gates, restarts, refuses; DSM is [S8](S8.md) |
 | [S15](S15.md) | Can Open WebUI reach the agent through LiteLLM? | **SPLIT** — LiteLLM's `/a2a/{agent_id}` route reaches it and a real turn came back (`pong`), but the path an OpenAI-compatible client can use — an agent as a **model** (`a2a/<name>`) — is blocked: LiteLLM 1.103.0 sends the A2A **0.3** dialect (`message/send`) while `a2a-lf` speaks **1.0** (`SendMessage`), with no negotiation and no fallback. Decided **and built the same day**: a small Open WebUI bridge onto the route (`integrations/openwebui/`), which answered a real turn through Open WebUI's own API — `zeta`, remembered on the second turn of the same chat (§7) |
+| [S16](S16.md) | Can a session with *any* model find and message the agents? | **PASS** — the agents became two MCP tools (`list_agents`, `ask_agent`) in `integrations/a2a-mcp/`, registered in every one of mcphub's nine groups, so a goose session and an Open WebUI model get them the same way they get memos: `the nas agent` resolved, the agent answered (`NAS`), and through the hub `ask_agent(…) → hub`. From Open WebUI, mcphub's own log shows `a2a.list_agents` then `a2a.ask_agent` in group `core` (§4). The roster is read live per call, so a new agent appears by itself |
 
 ## What the spikes changed
 
@@ -151,6 +155,23 @@ worth reading:
   `/healthz` on the box and nothing at the address everything was dialling. The
   bind is fixed on the box, in both `deploy/env` templates, and the agent now
   **warns** at startup when `bind` is loopback and `publicUrl` is not.
+- **S16** — an agent as a *model* is half the story; the other half is a **tool**.
+  A conversation with any *other* model could not discover an agent at all, so the
+  agents were turned into two MCP tools (`list_agents`, `ask_agent`) —
+  `integrations/a2a-mcp/` — and registered in **every** mcphub group, which is how
+  both a goose session and an Open WebUI model already reach their tools. The
+  finding that made it nearly free: Open WebUI's tool servers *are* mcphub group
+  endpoints (`http://mcphub:3000/mcp/<group>`) and the `core` workspace model is
+  bound to one of them (`meta.toolIds`), so adding the server to the group is the
+  whole integration. Two API details cost time and are now scripted: mcphub's
+  dashboard API wants the JWT in **`x-auth-token`** (not `Authorization: Bearer`,
+  and it says only "No token"), and adding a server to a group takes
+  `{"serverName": …}` while `{"name": …}` is a 400. On Open WebUI's side, the
+  requests are not interchangeable: `tool_ids` is what attaches a tool server, a
+  `chat_id` turns the call into a background task whose answer arrives over the
+  socket (so a REST poll sees an empty chat), and with neither, tool resolution is
+  skipped — one run had the model *narrate* its tool call as JSON text. The wiring
+  is ours; whether a given model reaches for the tool is the model's.
 - **S7** — `A2A-Version` is **decorative**: the pinned server never reads it, so
   a caller without the header is indistinguishable from one with it. That voids
   the risk it was gating — and also voids the plan's implied "a wrong version
@@ -181,3 +202,4 @@ worth reading:
 | [S8](S8.md) | not blocked — the reboot is done. One measurement is still un-run but nothing gates on it: a real DSM **package** upgrade, whose answer ("cannot orphan the wrapper, because its `ppid` is 1") is structural. §5's registry lockout is a `registry.rs` fix, tracked there, not a spike blocker. |
 | S11 | item 4 (a bad download on a host) and the launcher **self-update's swap** — the verify-then-`cmp` path now runs on every start on both hosts, but no host has yet had a launcher actually replaced. The DSM half is no longer blocked: S8 ran the launcher there. |
 | [S15](S15.md) | not blocked — LiteLLM's route reaches the agent today, and the bridge onto it is built and measured ([S15](S15.md) §7, `integrations/openwebui/`). Owed rather than blocked: `static_headers` in `registry.rs` so the route's credential comes from the agent row rather than an admin's `PUT`, and a LiteLLM bug report (its A2A *model* paths send 0.3 method names to a card that advertises 1.0). |
+| [S16](S16.md) | not blocked — the tools are built, registered in every mcphub group and measured from a goose session, a raw MCP client and Open WebUI. Un-run, and named as such in §5: mcphub's and Open WebUI's **tool-call timeouts** against a multi-minute turn, and whether a given model reliably *chooses* the tool (`deepseek-v4-flash` called it on some runs and rendered the call as JSON text on another). Both are properties of the callers, not of this server. |

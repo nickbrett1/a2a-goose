@@ -1,0 +1,204 @@
+# a2a-mcp — the registered agents, as MCP tools
+
+The Open WebUI bridge in [`../openwebui/`](../openwebui/) turns each registered
+agent into a **model**: what you want when the agent is the thing you are talking
+to. This is the other direction — a conversation with *any* model that wants to
+**hand work** to an agent:
+
+> "please follow up with the nas agent and finish the task"
+
+A model cannot discover an agent it has no tool for, so this is that tool. MCP is
+the surface both callers already speak: goose as an extension, Open WebUI 0.11+
+as a Tool Server. One server, two consumers, no duplication between them.
+
+```
+integrations/a2a-mcp/
+├── server.py          the MCP server: two tools, one proxy
+├── test_server.py     27 tests, run in the image that ships
+├── smoke.py           against a live server: what a client sees, and one real turn
+├── wire_mcphub.py     registers the server in mcphub and offers it in every group
+├── requirements.txt   pinned to what Open WebUI 0.11.3 itself runs
+├── Dockerfile         python:3.12-slim, one dependency tree, unprivileged
+└── compose.yaml       the NAS stack (source of truth for the deployed copy)
+```
+
+## The two tools
+
+| Tool | What it does |
+| ---- | ------------ |
+| `list_agents()` | The roster, read live from `GET /v1/agents` on **every call** — so an agent that has just come up is askable immediately and one that has been cleared is not offered. |
+| `ask_agent(agent, message, context_id=None)` | One A2A 1.0 `SendMessage` to `/a2a/{agent_id}`, answered. `context_id` continues the agent's own conversation; omit it and the turn is a fresh one. |
+
+`agent` is matched generously on purpose, because the request that motivated this
+is phrased in prose: `the nas agent` → `nas` → `nas-goose`. Exact match first,
+then a unique substring either way round. An unknown *or ambiguous* name is an
+error that **lists the roster**, so a model corrects itself in one step instead of
+guessing twice.
+
+Three things are deliberately *not* done here, each for a measured reason
+([`../../spikes/S15.md`](../../spikes/S15.md)):
+
+- **The 1.0 request is built by hand.** LiteLLM's `/a2a/{agent_id}` route forwards
+  a JSON-RPC method verbatim, so a hand-built `SendMessage`/`ROLE_USER` reaches an
+  `a2a-lf` agent; LiteLLM's own model paths speak the 0.3 dialect and fail.
+- **The credential is a proxy virtual key.** The agent's bearer stays in its
+  LiteLLM row's `static_headers`; this process never holds it.
+- **The answer is collected, not indexed.** A completed turn carries a second,
+  empty `answer` artifact, so `artifacts[0].parts[0].text` would work only by luck.
+
+## Deploying on the NAS
+
+```bash
+sudo mkdir -p /volumeUSB1/usbshare/docker/a2a-mcp
+cd /volumeUSB1/usbshare/docker/a2a-mcp
+# copy server.py, test_server.py, smoke.py, requirements.txt, Dockerfile, compose.yaml
+umask 077 && printf 'LITELLM_API_KEY=%s\n' 'sk-…' > .env     # a **virtual** key
+sudo docker compose up -d --build
+```
+
+`LITELLM_API_KEY` must be a LiteLLM virtual key, not the agent's bearer and not
+the master key. It only needs to be able to reach `GET /v1/agents` and the
+`/a2a/{agent_id}` route — both answer to a virtual key (measured).
+
+The container joins the external `ai_proxy` network, which is where `litellm` and
+`mcphub` live too, so `http://litellm:4000/a2a` and the container's own name
+resolve without a published port. Traefik publishes it at
+**`http://100.82.223.13:8092/a2a-mcp/mcp`** for MCP clients elsewhere on the
+Tailnet. The image is built on the NAS rather than pushed, so
+`watchtower.enable=false`: after editing `server.py`, re-run
+`sudo docker compose up -d --build`.
+
+## Wiring it in
+
+### mcphub (goose sessions, and everything else)
+
+```bash
+# on the NAS
+python3 wire_mcphub.py --all-groups            # reads MCPHUB_ADMIN_PASSWORD
+```
+
+It creates one mcphub server (`a2a`, `type: streamable-http`,
+`url: http://a2a-mcp:8090/mcp`) and adds it to **every** group, so whichever group
+endpoint a client uses — `/mcp/core`, `/mcp/dev`, `/mcp/container`, … — it now
+also offers `a2a-list_agents` and `a2a-ask_agent`. That is the same footing the
+memos tools have: foundational, everywhere.
+
+Two things about mcphub's API are worth knowing, and the script exists so nobody
+has to rediscover them:
+
+- the dashboard API reads its JWT from **`x-auth-token`**, not
+  `Authorization: Bearer` — the failure is a bare
+  `{"message":"No token, authorization denied"}`;
+- adding a server to a group takes `{"serverName": "…"}`, and the obvious
+  `{"name": "…"}` is a 400.
+
+mcphub caches a server's tool list from when it connected, so after a change to
+`server.py` reload it (`POST /api/servers/a2a/reload`) or restart mcphub.
+
+### Open WebUI (any model, `core` included)
+
+Nothing to add if the deployment already points at the hub: Open WebUI's existing
+tool servers **are** mcphub group endpoints (`http://mcphub:3000/mcp/<group>`,
+`type: mcp`, `config.enable: true`), and the workspace model `core` is bound to
+one of them (`meta.toolIds: ["server:mcp:mcphub"]` → the `core` group). Adding the
+server to the group is what puts `mcphub_a2a-list_agents` /
+`mcphub_a2a-ask_agent` in that model's tool list.
+
+To point Open WebUI at this server directly instead — just the two agent tools,
+without the rest of the group — add a connection like the others:
+
+```
+POST /api/v1/configs/tool_servers            (admin; replaces the whole list)
+{"TOOL_SERVER_CONNECTIONS": [ …existing…, {
+  "type": "mcp", "url": "http://a2a-mcp:8090", "path": "/mcp",
+  "auth_type": "none", "headers": {},
+  "config": {"enable": true, "function_name_filter_list": "", "access_grants": []},
+  "info": {"id": "a2a", "name": "A2A agents", "description": "list_agents, ask_agent"},
+  "id": "a2a", "name": "A2A agents"}]}
+```
+
+then `POST /api/v1/configs/tool_servers/verify` with the same connection object to
+see the tools it discovers, and bind it to a model with
+`meta.toolIds: ["server:mcp:a2a"]`.
+
+### goose (a human session)
+
+Either add the hub group the session already uses, or point an extension straight
+at it — the same shape as any other streamable-HTTP MCP extension:
+
+```yaml
+extensions:
+  a2a-agents:
+    type: streamable_http
+    uri: http://nas:8092/a2a-mcp/mcp
+    enabled: true
+    timeout: 300
+```
+
+The hub route is the better default: it is one place to change, and every session
+that already has a group gets the agent tools without editing config.
+
+## Tests
+
+The dev box this repo is worked on has no working Python packaging, so the tests
+run in the image they ship in:
+
+```bash
+cd /volumeUSB1/usbshare/docker/a2a-mcp
+sudo docker run --rm -v "$PWD/test_server.py":/app/test_server.py -w /app \
+    a2a-mcp:latest python -m unittest -v test_server        # 27 tests
+```
+
+They cover the three things the design leans on: addressing (`/a2a` → `/v1/agents`
+is derived, not configured), naming (`the nas agent` → `nas-goose`, and an
+ambiguous name is an error, not a coin toss), and parsing (the captured live turn,
+second empty artifact and all). `ThroughTheWire` finishes the job: it drives
+`ask_agent` over real HTTP against a stub proxy and asserts the request that left
+— the path, the 1.0 method, `ROLE_USER`, the text, the `contextId`, the bearer.
+
+Then, against the live thing:
+
+```bash
+sudo docker run --rm --network ai_proxy \
+    -v "$PWD/smoke.py":/app/smoke.py a2a-mcp:latest python /app/smoke.py
+# and through the hub, exactly as a goose session gets it:
+sudo docker run --rm --network ai_proxy -e MCP_URL=http://mcphub:3000/mcp/core \
+    -v "$PWD/smoke.py":/app/smoke.py a2a-mcp:latest \
+    python /app/smoke.py "the nas agent" "Which host runs you? One word."
+```
+
+## Measured (NAS, 2026-09-17)
+
+| What | Result |
+| ---- | ------ |
+| 27 tests in the image | `OK` |
+| `smoke.py` direct to the server | `a2a-agents 1.27.2`; tools `['list_agents', 'ask_agent']`; `ask_agent('the nas agent', …)` → `NAS` (14.7 s, cold) |
+| `smoke.py` through `/mcp/core` | `mcphub_core_group 1.0.38`; tools `memos-*`, `fetch-fetch`, `a2a-list_agents`, `a2a-ask_agent`; a turn → `hub` |
+| mcphub | connected, 2 tools, added to all 9 groups (`core`, `media`, `container`, `llm-cost`, `dev`, `ops`, `dev-ui`, `doppler`, `vikunja`) |
+| Traefik | `GET http://100.82.223.13:8092/a2a-mcp/mcp` → `406` — routed and answered by the server, which is POST-only by design |
+| Open WebUI | its MCP client connects to `http://mcphub:3000/mcp/core` and lists the tools; mcphub's activity log records `a2a.list_agents` (128 ms) then `a2a.ask_agent` (2.1 s), `status=success`, `group_name=core` — from Open WebUI chats on the `core` model |
+
+## Caveats
+
+- **It inherits the M4 hole.** Like the bridge, this reaches the agent through
+  LiteLLM's route, so it depends on the agent row's `static_headers` carrying the
+  bearer. On the NAS that is currently a hand-made admin `PUT`; nothing in the
+  repo restores it. `registry.rs` owes that, and now three surfaces depend on it.
+- **A tool call blocks for the whole turn.** `TIMEOUT_SECONDS` is 300 by default,
+  but the caller's ceiling is lower: mcphub's and Open WebUI's tool-call timeouts
+  were not measured. A turn measured here took 2.1 s warm, 14.7 s cold — how a
+  multi-minute turn behaves through a hub is untested.
+- **A turn is unary.** Nothing streams; `SendStreamingMessage` exists on the agent
+  and the route would forward it, but relaying a stream is unmeasured.
+- **The parse-and-call code is a copy of the bridge's**, not an import. The bridge
+  must stay a single file that installs through Open WebUI's UI, so a shared
+  package would break exactly that. It is two small functions; the tests on both
+  sides are what keep them honest.
+- **FastMCP reads a `.env` from the working directory.** Not a problem in the
+  image (`/app` has no `.env`), but it is why the test command mounts
+  `test_server.py` at `/app` rather than running from the deployment directory,
+  where the `.env` is 0600 and owned by another user.
+- **The SDK's DNS-rebinding guard is switched off deliberately.** It is a host
+  allowlist, and an allowlist would have to name every container name and proxy
+  hostname that reaches this port — the same maintenance trap as two URLs that
+  must agree. The bind and the Docker network are the boundary.

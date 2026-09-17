@@ -1,0 +1,5 @@
+# Pinned to the versions Open WebUI 0.11.3 itself runs, so the client side of
+# this server is exercised by something already in production on the NAS.
+mcp==1.27.2
+httpx==0.28.1
+pydantic==2.13.4

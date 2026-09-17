@@ -1,0 +1,61 @@
+# NAS-side stack for the a2a-mcp tool server: /volumeUSB1/usbshare/docker/a2a-mcp/
+#
+# Deployed by copying server.py, requirements.txt, Dockerfile and this file into
+# that directory and running `sudo docker compose up -d --build`. The repo copy
+# is the source of truth; the NAS copy is what runs, and the two are compared by
+# checksum when something looks wrong (see README.md).
+#
+# Secrets come from a `.env` beside this file, which is *not* in the repo:
+#
+#   LITELLM_API_KEY=sk-…      # a LiteLLM **virtual key**, not the agent's bearer
+#
+# Nothing else needs setting; the defaults below match this NAS.
+services:
+  a2a-mcp:
+    build: .
+    image: a2a-mcp:latest
+    container_name: a2a-mcp
+    restart: always
+    mem_limit: 512m
+    memswap_limit: 512m
+    environment:
+      - TZ=US/Eastern
+      # The proxy, by container name: this container is on ai_proxy with it.
+      - A2A_ROUTE=${A2A_ROUTE:-http://litellm:4000/a2a}
+      - LITELLM_API_KEY=${LITELLM_API_KEY:?set LITELLM_API_KEY in the .env beside this file}
+      # An agent turn is an agent loop. mcphub and Open WebUI each impose their
+      # own ceiling on top of this one; see README.md.
+      - TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-300}
+    labels:
+      # Reachable from anywhere on the Tailnet/LAN as
+      # http://100.82.223.13:8092/a2a-mcp/mcp (Traefik strips the /a2a-mcp
+      # prefix). mcphub and Open WebUI use the container name on ai_proxy
+      # instead; this is for other MCP clients.
+      - "traefik.enable=true"
+      - "traefik.http.routers.a2a-mcp.rule=PathPrefix(`/a2a-mcp`)"
+      - "traefik.http.routers.a2a-mcp.service=a2a-mcp"
+      - "traefik.http.routers.a2a-mcp.middlewares=a2a-mcp-strip"
+      - "traefik.http.services.a2a-mcp.loadbalancer.server.port=8090"
+      - "traefik.http.middlewares.a2a-mcp-strip.stripprefix.prefixes=/a2a-mcp"
+      # Locally built, no registry push: watchtower cannot update this one.
+      # Rebuild after changing server.py:
+      #   cd /volumeUSB1/usbshare/docker/a2a-mcp && sudo docker compose up -d --build
+      - "com.centurylinklabs.watchtower.enable=false"
+    healthcheck:
+      # A TCP check, not an HTTP one: /mcp answers 400 to a bare GET by design
+      # (it wants a POST and an Accept header), so only the port is meaningful.
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import socket; socket.create_connection(('127.0.0.1', 8090), 3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - ai_proxy
+
+networks:
+  ai_proxy:
+    external: true
