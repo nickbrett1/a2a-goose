@@ -35,6 +35,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use serde_json::Value;
 use tokio::sync::{Mutex, Semaphore, mpsc};
@@ -44,7 +45,8 @@ use crate::acp::pool::{Acquired, Claim, Idle, Pool};
 use crate::acp::transport::AcpError;
 use crate::config::Config;
 use crate::turn::{
-    ContextUsage, Limit, TurnError, TurnEvent, TurnHealth, TurnRequest, Turns, Usage,
+    ContextUsage, Limit, SessionClose, SessionInfo, TurnError, TurnEvent, TurnHealth, TurnRequest,
+    Turns, Usage,
 };
 
 /// How many A2A frames may be buffered for a caller that is reading slowly.
@@ -78,6 +80,14 @@ pub struct AcpTurns {
 struct Retained {
     session: Session,
     updates: mpsc::Receiver<Value>,
+    /// The skill of the turn that last ran here, for `GET /sessions`.
+    ///
+    /// Kept beside the session rather than in the pool because the pool's
+    /// [`Idle`] is policy — which session, until when — and a skill is not part
+    /// of either question. It is refreshed on every retain, because the skill is
+    /// chosen per turn and §6.3 is explicit that a context may legally run under
+    /// a different one without forking its conversation.
+    skill: String,
 }
 
 impl Retained {
@@ -172,6 +182,77 @@ impl Turns for AcpTurns {
         // A poisoned lock reads as zero rather than panicking: `/status` is what
         // an operator asks when something is already wrong.
         self.connection.pool.lock().map_or(0, |pool| pool.len())
+    }
+
+    fn sessions(&self) -> Vec<SessionInfo> {
+        // One lock, one pass, then the lock is gone: everything below renders
+        // from copies, so a serialisation of this listing cannot hold the pool
+        // against the next turn.
+        let now = Instant::now();
+        self.connection
+            .pool
+            .lock()
+            .map(|pool| {
+                pool.iter()
+                    .map(|(context, idle)| SessionInfo {
+                        context_id: context.to_string(),
+                        session_id: idle.session.session.id().to_string(),
+                        cwd: idle.cwd.clone(),
+                        skill_id: idle.session.skill.clone(),
+                        idle_secs: now.saturating_duration_since(idle.last_used).as_secs(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn close_session(&self, context: String) -> BoxFuture<'static, SessionClose> {
+        let connection = Arc::clone(&self.connection);
+        Box::pin(async move {
+            // The lock is taken, one session is removed, and it is dropped
+            // before anything is awaited: `session/close` is I/O, and holding a
+            // `std` mutex across an await is the one thing this pool's lock
+            // order forbids.
+            let taken = match connection.pool.lock() {
+                Ok(mut pool) => pool.take(&context),
+                // A poisoned pool is somebody else's bug. Reporting "nothing
+                // here" is the honest answer for a control route that must not
+                // add a second panic on its way out.
+                Err(poisoned) => poisoned.into_inner().take(&context),
+            };
+
+            match taken {
+                Some(idle) => {
+                    let session_id = idle.session.session.id().to_string();
+                    // Closed, never forgotten: this is the same eviction the
+                    // pool describes, and it means the same thing here. The
+                    // session is *not* deleted — goose's `sessions.db` is the
+                    // record, and it is durable by design (constraint #6).
+                    idle.session.close().await;
+                    tracing::info!(
+                        %context,
+                        %session_id,
+                        "closed the session held for a context, on request"
+                    );
+                    SessionClose::Closed { session_id }
+                }
+                None => {
+                    // Not held. Either a turn has it checked out, or the context
+                    // has no session at all — and the caller is told which,
+                    // because `tasks/cancel` is the answer to only one of them.
+                    let busy = connection
+                        .pool
+                        .lock()
+                        .map(|pool| pool.is_claimed(&context))
+                        .unwrap_or(false);
+                    if busy {
+                        SessionClose::Busy
+                    } else {
+                        SessionClose::Absent
+                    }
+                }
+            }
+        })
     }
 }
 
@@ -312,7 +393,9 @@ async fn run_turn(
     // arrives with its update stream, so nothing is re-subscribed.
     let (session, mut updates) = match acquired {
         Some(idle) => {
-            let Retained { session, updates } = idle.session;
+            let Retained {
+                session, updates, ..
+            } = idle.session;
             (session, updates)
         }
         None => match client.new_session(&request.cwd).await {
@@ -360,7 +443,11 @@ async fn run_turn(
     // is goose's own `sessions.db` (hard constraint #1).
     match (context, outcome.is_ok() && owns) {
         (Some(context), true) => {
-            let retained = Retained { session, updates };
+            let retained = Retained {
+                session,
+                updates,
+                skill: request.skill.clone(),
+            };
             for idle in retain_session(config, connection, context, retained, request.cwd.clone()) {
                 idle.session.close().await;
             }

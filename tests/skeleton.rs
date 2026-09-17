@@ -24,7 +24,8 @@ use a2a_goose::goose::{Goose, Version};
 use a2a_goose::registry::Registry;
 use a2a_goose::server::{self, Agent};
 use a2a_goose::skills::SkillSet;
-use a2a_goose::turn::{TurnError, TurnEvent, TurnRequest, Turns, Usage};
+use a2a_goose::turn::{SessionClose, SessionInfo, TurnError, TurnEvent, TurnRequest, Turns, Usage};
+use futures::future::BoxFuture;
 use serde_json::Value;
 
 const TOKEN: &str = "skeleton-test-token";
@@ -43,6 +44,12 @@ struct FakeTurns {
     /// What each turn was asked to do, so a test can assert the *prompt* the
     /// executor built and not just the answer it produced.
     requests: std::sync::Mutex<Vec<TurnRequest>>,
+    /// What `GET /sessions` reports. Empty unless a test puts something there,
+    /// which is the honest default for a runner that holds no sessions.
+    held: std::sync::Mutex<Vec<SessionInfo>>,
+    /// What `DELETE /sessions/{contextId}` finds. `Absent` by default, for the
+    /// same reason.
+    closing: std::sync::Mutex<SessionClose>,
 }
 
 impl Turns for FakeTurns {
@@ -62,6 +69,28 @@ impl Turns for FakeTurns {
                 },
             }),
         ]))
+    }
+
+    fn sessions(&self) -> Vec<SessionInfo> {
+        self.held.lock().expect("lock").clone()
+    }
+
+    /// Kept in step with [`Self::sessions`] on purpose. The real runner reads
+    /// both from one pool, so the two answers agree there by construction; a
+    /// fake that disagreed with itself would let a `sessions` envelope pass a
+    /// test that no real host could run.
+    fn retained(&self) -> usize {
+        self.held.lock().expect("lock").len()
+    }
+
+    /// The outcome is scripted rather than derived from the context: this file
+    /// pins the *wire*, and the part of the close that is this repo's code is
+    /// the mapping from an outcome to a status code, not the lookup. The lookup
+    /// is proved against a fake `goose serve`, where a session is a thing that
+    /// can actually be closed (`tests/session_reuse.rs`).
+    fn close_session(&self, _context: String) -> BoxFuture<'static, SessionClose> {
+        let outcome = self.closing.lock().expect("lock").clone();
+        Box::pin(async move { outcome })
     }
 }
 
@@ -509,4 +538,110 @@ async fn status_reports_the_card_the_registry_and_the_goose_it_verified() {
         .collect();
     assert_eq!(ids, vec!["ask", "code-review", "scaffold-project"]);
     assert_eq!(payload["skills"][0]["default"], true);
+}
+
+#[tokio::test]
+async fn the_session_control_surface_is_not_open_to_anyone_who_asks() {
+    // The bearer layer covers these routes too, and the reason is not symmetry:
+    // `/sessions` names the directories other callers are working in, and the
+    // `DELETE` ends a conversation's memory. `/status` is open because it
+    // carries no secret — these two are a different question.
+    let fixture = boot().await;
+    let client = reqwest::Client::new();
+
+    let listed = client
+        .get(format!("{}/sessions", fixture.base))
+        .send()
+        .await
+        .expect("GET /sessions without a token");
+    let deleted = client
+        .delete(format!("{}/sessions/c1", fixture.base))
+        .send()
+        .await
+        .expect("DELETE /sessions/{id} without a token");
+
+    for (what, response) in [("GET /sessions", listed), ("DELETE", deleted)] {
+        assert_eq!(response.status(), 401, "{what} must 401 without a token");
+        assert_eq!(
+            response
+                .headers()
+                .get("www-authenticate")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer"),
+            "{what}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sessions_reports_what_the_runner_is_holding() {
+    let fixture = boot().await;
+    fixture.turns.held.lock().expect("lock").push(SessionInfo {
+        context_id: "c1".to_string(),
+        session_id: "sess_0001".to_string(),
+        cwd: PathBuf::from("/tmp"),
+        skill_id: "ask".to_string(),
+        idle_secs: 3,
+    });
+
+    let payload: Value = reqwest::Client::new()
+        .get(format!("{}/sessions", fixture.base))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .expect("GET /sessions")
+        .json()
+        .await
+        .expect("sessions is JSON");
+
+    assert_eq!(payload["retained"], 1);
+    assert_eq!(payload["inFlight"], 0);
+    assert_eq!(payload["sessions"][0]["contextId"], "c1");
+    assert_eq!(payload["sessions"][0]["sessionId"], "sess_0001");
+    assert_eq!(payload["sessions"][0]["cwd"], "/tmp");
+    assert_eq!(payload["sessions"][0]["skillId"], "ask");
+    assert_eq!(payload["sessions"][0]["idleSecs"], 3);
+}
+
+#[tokio::test]
+async fn deleting_a_session_maps_the_outcome_onto_the_status_code() {
+    let fixture = boot().await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/sessions/c1", fixture.base);
+    let close = || client.delete(url.clone()).bearer_auth(TOKEN).send();
+
+    // Nothing is held. 404, and deliberately not treated as a failure: a
+    // retried DELETE must be as safe as the first one (the shape S5 recorded
+    // for the registry — 200 then 404).
+    let response = close().await.expect("DELETE with nothing held");
+    assert_eq!(response.status(), 404);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"], "no_such_session");
+    assert_eq!(body["contextId"], "c1");
+
+    *fixture.turns.closing.lock().expect("lock") = SessionClose::Closed {
+        session_id: "sess_0001".to_string(),
+    };
+    let response = close().await.expect("DELETE with a session held");
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["closed"], true);
+    assert_eq!(body["sessionId"], "sess_0001");
+
+    // A turn is running for this context, so the session is checked out and
+    // this route must not touch it. The caller is told which request to make
+    // instead rather than being left with a 404 that reads like "your
+    // conversation is gone".
+    *fixture.turns.closing.lock().expect("lock") = SessionClose::Busy;
+    let response = close().await.expect("DELETE mid-turn");
+    assert_eq!(response.status(), 409);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"], "session_busy");
+    assert!(
+        body["message"]
+            .as_str()
+            .expect("message")
+            .contains("tasks/cancel"),
+        "the refusal must say what to do instead: {body}"
+    );
 }

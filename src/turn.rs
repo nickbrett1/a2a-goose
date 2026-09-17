@@ -16,6 +16,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 
 use crate::acp::CwdError;
@@ -133,6 +134,15 @@ pub struct TurnRequest {
     pub context: Option<String>,
     pub cwd: PathBuf,
     pub prompt: String,
+    /// The skill this turn runs under.
+    ///
+    /// Carried for the same reason `context` is, and no more: the control
+    /// surface reports which skill a held session last ran, and the executor is
+    /// the only place that knows. It is **not** part of a session's identity
+    /// (§6.3) — reusing a context under another skill is legal and must not
+    /// start a second session — so this is display data that the pool carries
+    /// and never routes on.
+    pub skill: String,
     /// The ceiling for the whole turn. Enforced where the waiting actually
     /// happens — inside the ACP implementation — because a bound checked only
     /// between events would never fire on a turn that has gone quiet.
@@ -151,6 +161,62 @@ pub enum TurnHealth {
     Idle,
     /// A live connection; the next turn will reuse it.
     Connected,
+}
+
+/// One session being held for reuse, as `GET /sessions` reports it.
+///
+/// A *snapshot value*, not a handle. The pool can move under a reader — a turn
+/// can start, a TTL can expire — so the listing is taken in one go and rendered
+/// from copies. Holding anything live across the render is the one thing a
+/// control route must never do, because `/sessions` is what an operator asks
+/// when a turn will not finish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    /// The A2A `contextId` the session is held for.
+    pub context_id: String,
+    /// goose's own id for it — what a `session/close` or a goose log names.
+    pub session_id: String,
+    /// The directory it is rooted at. Part of the session's *identity*, not
+    /// decoration: a turn asking for another directory is never handed this one.
+    pub cwd: PathBuf,
+    /// The skill its **last** turn ran under. See [`TurnRequest::skill`]: this
+    /// is what ran most recently, not what the session *is*.
+    pub skill_id: String,
+    /// Seconds since it was last used. The number that says whether the idle TTL
+    /// is about to take it.
+    pub idle_secs: u64,
+}
+
+/// What `DELETE /sessions/{contextId}` found.
+///
+/// Three outcomes rather than a boolean, because the caller does something
+/// different for each: nothing (closed), `tasks/cancel` (busy), or nothing at
+/// all (absent) — and collapsing "busy" into "absent" would tell a caller their
+/// conversation was gone when it was mid-sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionClose {
+    /// There was a session held for this context, and it is now closed.
+    Closed { session_id: String },
+    /// A turn is running for this context, so its session is checked out and is
+    /// not this route's to close. The caller has a `taskId`; `tasks/cancel` is
+    /// how a running turn is stopped. Closing it here would race the turn's own
+    /// teardown for the same session, which is exactly the second-owner problem
+    /// the executor's `cancel` refuses to create.
+    Busy,
+    /// Nothing is held for this context: it never had a session, or it was
+    /// already closed. Not an error — a retried `DELETE` must not fail the
+    /// second time for having been right the first time (the shape S5 recorded
+    /// for the registry: `200` then `404`).
+    Absent,
+}
+
+impl Default for SessionClose {
+    /// `Absent`, and it is not arbitrary: it is the same answer the trait's own
+    /// [`Turns::close_session`] default gives, so a runner that holds no
+    /// sessions has one meaning for "nothing here" rather than two.
+    fn default() -> Self {
+        Self::Absent
+    }
 }
 
 /// Runs turns. Implemented for real over ACP in [`crate::acp::turns`], and by a
@@ -177,6 +243,27 @@ pub trait Turns: Send + Sync + 'static {
     /// have no memory" question).
     fn retained(&self) -> usize {
         0
+    }
+
+    /// The sessions being held for reuse, for `GET /sessions`.
+    ///
+    /// Synchronous, like [`Self::health`] and [`Self::retained`]: it is a
+    /// snapshot of in-memory state, and a control route that had to await a
+    /// lock would be the thing that hangs when a turn is stuck. The default is
+    /// empty, which is the honest answer for anything that holds no sessions.
+    fn sessions(&self) -> Vec<SessionInfo> {
+        Vec::new()
+    }
+
+    /// Closes the session held for `context` and forgets it, for
+    /// `DELETE /sessions/{contextId}`.
+    ///
+    /// A boxed future rather than an `async fn` because this trait is used as
+    /// `Arc<dyn Turns>`: an injected lifetime would make it non-object-safe.
+    /// The future is `'static` — the implementation clones what it needs out of
+    /// `&self` before returning — so the handler can hold it across an await.
+    fn close_session(&self, _context: String) -> BoxFuture<'static, SessionClose> {
+        Box::pin(async { SessionClose::Absent })
     }
 }
 

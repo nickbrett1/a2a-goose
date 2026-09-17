@@ -1,5 +1,5 @@
 //! The HTTP surface: the card LiteLLM fetches, the A2A JSON-RPC endpoint, and
-//! the two control routes.
+//! the control routes.
 //!
 //! | Route | Purpose |
 //! |---|---|
@@ -7,6 +7,8 @@
 //! | `POST /` | A2A JSON-RPC (router from `a2a-server`) |
 //! | `GET /healthz` | Liveness only — no dependency checks |
 //! | `GET /status` | Deep: registry, skills, card hash, limits |
+//! | `GET /sessions` | The sessions held for reuse (§6.6) — **bearer** |
+//! | `DELETE /sessions/{contextId}` | Close and forget one — **bearer** |
 //!
 //! `/healthz` and `/status` are deliberately different questions. `/healthz`
 //! answers *"should the supervisor restart me?"*, so it stays 200 when something
@@ -15,6 +17,11 @@
 //! anything wrong?"* for a human, and for a hang probe — which is why it is not
 //! behind the bearer token. It carries no secret: no key, no token, no recipe
 //! content, and goose's path is a fact the tailnet already implies.
+//!
+//! **The session routes are the exception, and sit behind the token with
+//! `POST /`.** `GET /sessions` names the directories other callers are working
+//! in, and `DELETE /sessions/{contextId}` ends a conversation's memory: neither
+//! is a liveness question, and whoever asks either already holds the token.
 //!
 //! **Bearer auth is a layer, not a handler.** Constraint #3 requires a token on
 //! every `POST /`, and §5.4 wants a **401** when it is wrong. The SDK's
@@ -33,11 +40,11 @@ use a2a_server::jsonrpc::jsonrpc_router;
 use a2a_server::task_store::InMemoryTaskStore;
 use axum::{
     Json, Router,
-    extract::{Request, State},
+    extract::{Path, Request, State},
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{delete, get},
 };
 use serde_json::{Value, json};
 
@@ -47,7 +54,7 @@ use crate::goose::{Goose, MIN_GOOSE_VERSION};
 use crate::registry::Registry;
 use crate::serve::ServeStatus;
 use crate::skills::{Dispatch, SkillSet};
-use crate::turn::{TurnHealth, Turns};
+use crate::turn::{SessionClose, TurnHealth, Turns};
 
 /// Everything a handler needs. Shared, and never mutated: the mutable state is
 /// inside `registry`, inside the SDK's task store, and behind `turns`.
@@ -87,15 +94,32 @@ pub fn router(agent: Arc<Agent>, bearer_token: Arc<str>) -> Router {
         ),
         InMemoryTaskStore::new(),
     ));
-    let a2a =
-        jsonrpc_router(handler).layer(middleware::from_fn_with_state(bearer_token, require_bearer));
+    let a2a = jsonrpc_router(handler).layer(middleware::from_fn_with_state(
+        bearer_token.clone(),
+        require_bearer,
+    ));
 
     let control = Router::new()
         .route("/healthz", get(healthz))
         .route("/status", get(status))
+        .with_state(agent.clone());
+
+    // The session control surface (§6.6), and the one part of it that is
+    // **behind the token**.
+    //
+    // `/status` is open because it carries no secret and is what a human — or a
+    // hang probe — asks when something is already wrong. These two are not the
+    // same question: `GET /sessions` names every context this host is holding
+    // and the *directory* each one is rooted in, which is a map of what other
+    // callers are working on, and `DELETE` ends somebody's conversation memory.
+    // A caller doing either already has the token; nobody else has a reason to.
+    let sessions = Router::new()
+        .route("/sessions", get(list_sessions))
+        .route("/sessions/{context_id}", delete(close_session))
+        .layer(middleware::from_fn_with_state(bearer_token, require_bearer))
         .with_state(agent);
 
-    card.merge(a2a).merge(control)
+    card.merge(a2a).merge(control).merge(sessions)
 }
 
 /// Serves until the process is asked to stop.
@@ -225,6 +249,92 @@ pub fn status_payload(agent: &Agent) -> Value {
             "retained": agent.turns.retained(),
         },
     })
+}
+
+/// `GET /sessions` (§6.6) — the sessions this host is holding, and the two
+/// counts `/status` already reports, so a reader comparing the routes is not
+/// looking at two different definitions of "a session".
+///
+/// It lists *retained* sessions. A context with a turn in flight has no retained
+/// session — it is checked out, see pool rule 1 — so it is visible as a gap
+/// between `inFlight` and the length of this list rather than as a row that
+/// would have to be invented for it.
+async fn list_sessions(State(agent): State<Arc<Agent>>) -> Json<Value> {
+    Json(sessions_payload(&agent))
+}
+
+pub fn sessions_payload(agent: &Agent) -> Value {
+    let sessions: Vec<Value> = agent
+        .turns
+        .sessions()
+        .into_iter()
+        .map(|session| {
+            json!({
+                "contextId": session.context_id,
+                "sessionId": session.session_id,
+                "cwd": session.cwd.display().to_string(),
+                "skillId": session.skill_id,
+                "idleSecs": session.idle_secs,
+            })
+        })
+        .collect();
+
+    json!({
+        "inFlight": agent.turns.in_flight(),
+        "retained": agent.turns.retained(),
+        "sessions": sessions,
+    })
+}
+
+/// `DELETE /sessions/{contextId}` (§6.6) — close the session a context is
+/// holding, and forget it.
+///
+/// Three answers, and the status code is the one that says which: `200` closed,
+/// `409` a turn is running for this context (stop it with `tasks/cancel`, which
+/// is addressed to the task the caller already has, rather than by racing the
+/// turn's own teardown here), `404` nothing was held. `404` is not a failure —
+/// deleting twice must be as safe as deleting once, which is the same shape S5
+/// recorded for the registry.
+///
+/// The conversation is not deleted. `session/close` ends the *session*; the
+/// transcript is goose's own `sessions.db` and is durable by design
+/// (constraint #6). A caller who wants it back reattaches with `session/load`.
+async fn close_session(
+    State(agent): State<Arc<Agent>>,
+    Path(context_id): Path<String>,
+) -> Response {
+    match agent.turns.close_session(context_id.clone()).await {
+        SessionClose::Closed { session_id } => (
+            StatusCode::OK,
+            Json(json!({
+                "contextId": context_id,
+                "sessionId": session_id,
+                "closed": true,
+            })),
+        )
+            .into_response(),
+        SessionClose::Busy => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "session_busy",
+                "contextId": context_id,
+                "message": "a turn is running for this context, so its session is checked out; \
+                            cancel the task (`tasks/cancel`) rather than closing the session \
+                            underneath it",
+            })),
+        )
+            .into_response(),
+        SessionClose::Absent => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "no_such_session",
+                "contextId": context_id,
+                "message": "this context holds no session: it never had one, or it was already \
+                            closed",
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// The variable names the launcher exports on the way to its `exec`.

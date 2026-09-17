@@ -35,7 +35,7 @@ use tokio::sync::{Notify, mpsc};
 
 use a2a_goose::acp::{ACP_PATH, AcpTurns, CONNECTION_ID_HEADER, SESSION_ID_HEADER};
 use a2a_goose::config::Config;
-use a2a_goose::turn::{TurnError, TurnEvent, TurnRequest, Turns};
+use a2a_goose::turn::{SessionClose, TurnError, TurnEvent, TurnRequest, Turns};
 
 /// What the fake goose was asked to do. The counts are the assertions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -328,6 +328,7 @@ impl World {
             context: context.map(str::to_string),
             cwd: PathBuf::from("/tmp"),
             prompt: prompt.to_string(),
+            skill: "ask".to_string(),
             wall_clock: Duration::from_secs(20),
         };
         let mut events = Vec::new();
@@ -433,6 +434,7 @@ async fn a_turn_that_finds_its_context_busy_runs_alone_and_gives_up_its_session(
                 context: Some("c1".to_string()),
                 cwd: PathBuf::from("/tmp"),
                 prompt: "the long one".to_string(),
+                skill: "ask".to_string(),
                 wall_clock: Duration::from_secs(60),
             };
             turns.run(request).collect::<Vec<_>>().await
@@ -590,4 +592,135 @@ async fn turning_reuse_off_gives_back_exactly_m1() {
     );
     assert_eq!(world.fake.closes().len(), 2, "and closes it");
     assert_eq!(world.retained(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_control_surface_lists_what_the_host_is_holding() {
+    // `GET /sessions` is only worth anything if it names the sessions that are
+    // really being held, on the sessions a caller is really talking to. Both
+    // halves are asserted here: the rows, and that each row's `sessionId` is the
+    // session the turn actually ran on.
+    let world = World::start(|_| {}).await;
+    world.turn(Some("c1")).await.expect("c1");
+    world.turn(Some("c2")).await.expect("c2");
+
+    let mut held = world.turns.sessions();
+    held.sort_by(|a, b| a.context_id.cmp(&b.context_id));
+    let opened = world.fake.created();
+
+    assert_eq!(
+        held.iter()
+            .map(|session| session.context_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["c1", "c2"]
+    );
+    assert_eq!(
+        held.iter()
+            .map(|session| session.session_id.clone())
+            .collect::<Vec<_>>(),
+        opened,
+        "each context is listed with the session its turn really ran on"
+    );
+    for session in &held {
+        assert_eq!(session.cwd, PathBuf::from("/tmp"));
+        assert_eq!(session.skill_id, "ask");
+        assert!(
+            session.idle_secs < 60,
+            "a session just used is not reported as idle for minutes: {session:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closing_a_context_closes_its_goose_session_and_forgets_it() {
+    let world = World::start(|_| {}).await;
+    world.turn(Some("c1")).await.expect("c1");
+    world.turn(Some("c2")).await.expect("c2");
+    let session = world.fake.created()[0].clone();
+
+    assert_eq!(
+        world.turns.close_session("c1".to_string()).await,
+        SessionClose::Closed {
+            session_id: session.clone()
+        }
+    );
+    assert_eq!(
+        world.fake.closes(),
+        vec![session],
+        "goose was asked to close exactly that one session"
+    );
+    assert_eq!(world.retained(), 1, "the other context is untouched");
+    let held = world.turns.sessions();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].context_id, "c2");
+
+    // Deleting twice is as safe as deleting once: the second is `Absent`, not
+    // an error. A caller retrying a close must not be told something broke.
+    assert_eq!(
+        world.turns.close_session("c1".to_string()).await,
+        SessionClose::Absent
+    );
+    assert_eq!(world.fake.closes().len(), 1, "and nothing was closed twice");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closing_a_context_that_was_never_used_is_not_an_error() {
+    let world = World::start(|_| {}).await;
+    assert_eq!(
+        world.turns.close_session("never-used".to_string()).await,
+        SessionClose::Absent
+    );
+    assert!(world.fake.closes().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closing_a_context_mid_turn_is_refused_and_succeeds_once_the_turn_is_done() {
+    // A checked-out session looks exactly like one that was never there, and
+    // the two want opposite answers: "your turn is running" is not "you have no
+    // conversation". This is the test that keeps `DELETE` from racing the
+    // turn's own teardown for the same session.
+    let world = World::start(|config| {
+        config.goose.acp.timeouts.prompt_secs = 60;
+    })
+    .await;
+
+    world.fake.hold_next.store(true, Ordering::SeqCst);
+    let first = tokio::spawn({
+        let turns = Arc::clone(&world.turns);
+        async move {
+            let request = TurnRequest {
+                context: Some("c1".to_string()),
+                cwd: PathBuf::from("/tmp"),
+                prompt: "the long one".to_string(),
+                skill: "ask".to_string(),
+                wall_clock: Duration::from_secs(60),
+            };
+            turns.run(request).collect::<Vec<_>>().await
+        }
+    });
+
+    // Wait until the turn is actually inside goose, so "mid-turn" means
+    // mid-turn rather than "one after the other by luck".
+    world.fake.prompt_seen.notified().await;
+    assert_eq!(
+        world.turns.close_session("c1".to_string()).await,
+        SessionClose::Busy,
+        "the session is checked out, so it is the turn's to close"
+    );
+    assert!(
+        world.fake.closes().is_empty(),
+        "nothing was closed underneath a running turn"
+    );
+
+    world.fake.release.notify_one();
+    let first = first.await.expect("the first turn finishes");
+    assert!(first.iter().all(Result::is_ok), "{first:?}");
+
+    assert!(
+        matches!(
+            world.turns.close_session("c1".to_string()).await,
+            SessionClose::Closed { .. }
+        ),
+        "once the turn is done the session is the context's again and can be closed"
+    );
 }
