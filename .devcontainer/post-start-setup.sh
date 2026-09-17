@@ -29,4 +29,11 @@ else
     echo "WARN: goose not found, skipping update"
 fi
 
+echo "INFO: Checking the container agent..."
+if [ -x "/workspaces/a2a-goose/scripts/agent-dev.sh" ]; then
+    "/workspaces/a2a-goose/scripts/agent-dev.sh" start || true
+else
+    echo "WARN: scripts/agent-dev.sh not found, skipping the container agent"
+fi
+
 echo "INFO: Services check/startup complete."
