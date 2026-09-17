@@ -96,13 +96,15 @@ worth reading:
   mac-studio runs `~/src/a2a-goose/scripts/fetch-launch.sh`, and it was **4
   commits behind**, so the first reinstall still ran the buggy flip and `git
   pull` was the actual fix. The code that supervises everything else is
-  un-pinned; the release tarball carries the agent, not the launcher. **Pin the
-  launcher or fetch it** is an open decision, flagged not taken.
+  un-pinned; the release tarball carries the agent, not the launcher. **Decided:
+  fetch it, digest-pinned** — the launcher becomes a release asset and replaces
+  itself (verify sha256, `bash -n`, rename over the path) before it execs, with a
+  `curl` cold start in the README. The contract is at the end of [S11](S11.md).
 
 ## Not run, and what unblocks each
 
 | Spike | Blocked on |
 | ----- | ---------- |
 | S8, S9 | a shell on the NAS. S9 is now *narrowed*: the LiteLLM container cannot resolve the tailnet name, cannot reach the sandbox bridge, and **hangs** on the agent's tailnet IP — so the obstacle is routing, and a wrong card `url` fails as a hang. It also blocks two S13 follow-ups (which card path the proxy fetches, and whether it forwards `metadata`/SSE). |
-| S11 | item 4 (a bad download on a host) and the **DSM host** (items 1–5 never run there). mac-studio is done unless the launcher-provenance question above is settled. |
+| S11 | item 4 (a bad download on a host), the **DSM host** (items 1–5 never run there), and the launcher **self-update** (decided, not yet on a host). |
 | S12 | the **DSM** host. mac-studio now runs a published release (0.1.16), so the darwin half is seen. |
