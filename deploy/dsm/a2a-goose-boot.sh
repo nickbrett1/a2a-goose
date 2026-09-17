@@ -35,11 +35,13 @@
 # before the first run of a payload that owns goose.
 set -uo pipefail
 
-# Where this host keeps its checkout of the repository. Overridable so the same
-# script works on a host whose paths differ; the launcher is a repository file,
-# not a release asset.
-A2A_GOOSE_REPO="${A2A_GOOSE_REPO:-/volume1/homes/nick/a2a-goose}"
-LAUNCHER="${A2A_GOOSE_REPO}/scripts/fetch-launch.sh"
+# Where this host keeps the launcher and the releases it fetches. The launcher
+# is a release asset, not a file in a checkout (S11): the cold start in
+# LAUNCHING.md puts it here, and every start it replaces itself with whatever the
+# newest release advertises. Overridable so the same script works on a host whose
+# paths differ.
+A2A_GOOSE_DEPLOY_DIR="${A2A_GOOSE_DEPLOY_DIR:-${HOME}/.local/share/a2a-goose}"
+LAUNCHER="${A2A_GOOSE_DEPLOY_DIR}/fetch-launch.sh"
 
 # Seconds between restarts. Long enough that a payload which dies instantly does
 # not spin, short enough that a transient failure is not a night-long outage.
@@ -53,7 +55,7 @@ log() {
 }
 
 if [ ! -x "$LAUNCHER" ]; then
-  log "no launcher at ${LAUNCHER} - check A2A_GOOSE_REPO"
+  log "no launcher at ${LAUNCHER} - run the cold start in LAUNCHING.md, or set A2A_GOOSE_DEPLOY_DIR"
   exit 1
 fi
 
