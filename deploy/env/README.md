@@ -14,6 +14,27 @@ so a new host has something to start from; they must never contain a real secret
 which is why every value that is a secret is a *placeholder* here and the real
 one comes from wherever that host already keeps secrets.
 
+## `bind` and `publicUrl` name the same address
+
+`A2A_GOOSE_PUBLIC_URL` is what goes on the card and what LiteLLM dials;
+`A2A_GOOSE_BIND` is what the agent listens on. The dialer runs in the LiteLLM
+container, so **the bind address has to be the address `publicUrl` names** — the
+host's tailnet IP literal on both hosts.
+
+Loopback here is not a hardening measure, it is an outage. Measured on the NAS
+(2026-09-17, v0.1.25): with `A2A_GOOSE_BIND="127.0.0.1:10001"` and a
+`publicUrl` of `http://100.82.223.13:10001`, `/healthz` answered 200 *on the box*
+while the container's dial to `100.82.223.13:10001` was refused — the agent
+registered an address nothing listened on, and every call through LiteLLM failed
+with `Cannot connect to host 100.82.223.13:10001` (spikes/S15.md §6). Binds are
+not forwarded: the tailnet address is a `/32` on `lo`, so a `127.0.0.1` listener
+does not answer it even from the same host.
+
+Loopback *is* legitimate in one shape: when something fronts the port (a reverse
+proxy that dials `127.0.0.1` and is itself what `publicUrl` names). The agent
+cannot tell that case from the mistake, so it **warns at startup** when `bind` is
+loopback and `publicUrl` is not, naming both addresses.
+
 ## The attribution variables, and why they are here
 
 LiteLLM will not account activity per agent on its own: with one shared

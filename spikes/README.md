@@ -18,6 +18,10 @@ time either half of the DSM deployment has been exercised on the box, and S8 was
 then closed by a **real reboot** of the NAS. S12's run
 went past `/status` to a real A2A turn on the host (`TASK_STATE_COMPLETED`), the
 M3 control surface against a real runner, and a spend-log row naming the host.
+S15 was run on the **NAS** on 2026-09-17 too, against the live proxy and a
+registered `nas-goose`, to answer the question the cancelled n8n leg left behind
+(how Open WebUI reaches the agent) — it closed the "the agent appears as a model"
+assumption as **false**, and with it the reason it was assumed.
 
 | # | Question | Verdict |
 | --- | -------- | ------- |
@@ -35,10 +39,11 @@ M3 control surface against a real runner, and a spend-log row naming the host.
 | [S12](S12.md) | Does the published binary run on the target host? | **PASS on DSM** — the x86_64 musl static-PIE payload execs, `check-goose.sh` passes on the host, the version refusal precedes the bind, `/status` names the host's real goose, the manifest→tarball→running-payload digests agree, and a real turn answers `TASK_STATE_COMPLETED` with the host's name on LiteLLM's row; the darwin half was seen on mac-studio in S11/S14 |
 | [S13](S13.md) | Is `a2a-rs` wire-compatible with LiteLLM's A2A routes? | **PASS** — the framing agrees; the *card* needs work on our side |
 | [S14](S14.md) | Does the agent really own `goose serve`? | **PASS, box and darwin host** — starts, gates, restarts, refuses; DSM is [S8](S8.md) |
+| [S15](S15.md) | Can Open WebUI reach the agent through LiteLLM? | **SPLIT** — LiteLLM's `/a2a/{agent_id}` route reaches it and a real turn came back (`pong`), but the path an OpenAI-compatible client can use — an agent as a **model** (`a2a/<name>`) — is blocked: LiteLLM 1.103.0 sends the A2A **0.3** dialect (`message/send`) while `a2a-lf` speaks **1.0** (`SendMessage`), with no negotiation and no fallback. Decided: a small Open WebUI bridge onto the route |
 
 ## What the spikes changed
 
-Ten spikes changed the plan, this repo, or the launcher. They are the ones
+Eleven spikes changed the plan, this repo, or the launcher. They are the ones
 worth reading:
 
 - **S2** — cost control changes shape, twice over. goose 1.50.x cannot carry a
@@ -125,6 +130,25 @@ worth reading:
   shape as S14, one level out: not "a healthy agent nobody can talk to" but "a
   healthy agent nobody is registered to route to". The fix (bounded retry,
   treat an `agent_name` conflict as an update) is owed to `registry.rs`.
+- **S15** — the chain works, but not down the path an OpenAI-compatible caller
+  can take, and this is the finding that replaced the assumption the n8n work
+  died with. LiteLLM's **route** `/a2a/{agent_id}` is a transparent JSON-RPC
+  proxy: whatever method the caller sends is what the agent receives, and with
+  `static_headers` on the agent row carrying the bearer, a real goose turn came
+  back (`TASK_STATE_COMPLETED`, `pong`). LiteLLM's **model** paths
+  (`a2a/<agent_name>` on `/v1/chat/completions` *and* `/v1/responses`) build the
+  request themselves with the 0.3 method name `message/send`, role `"user"` and
+  `parts[{"kind":"text"}]` — hardcoded, card not consulted, no fallback on
+  `method not found` — while `a2a-lf`/`a2a-server-lf` accept only the 1.0 names
+  (`SendMessage`, `ROLE_USER`). So "the agent appears as a model in the proxy" is
+  not available to us, and Open WebUI needs one small function onto the route.
+  Two faults on the way: the proxy sends **no** credential unless told to
+  (`static_headers` are honoured on the route, ignored by the model paths;
+  `litellm_params.api_key` is stored and ignored everywhere), and the NAS agent
+  was binding **loopback** while registering a tailnet URL — so it answered
+  `/healthz` on the box and nothing at the address everything was dialling. The
+  bind is fixed on the box, in both `deploy/env` templates, and the agent now
+  **warns** at startup when `bind` is loopback and `publicUrl` is not.
 - **S7** — `A2A-Version` is **decorative**: the pinned server never reads it, so
   a caller without the header is indistinguishable from one with it. That voids
   the risk it was gating — and also voids the plan's implied "a wrong version
@@ -154,3 +178,4 @@ worth reading:
 | ----- | ---------- |
 | [S8](S8.md) | not blocked — the reboot is done. One measurement is still un-run but nothing gates on it: a real DSM **package** upgrade, whose answer ("cannot orphan the wrapper, because its `ppid` is 1") is structural. §5's registry lockout is a `registry.rs` fix, tracked there, not a spike blocker. |
 | S11 | item 4 (a bad download on a host) and the launcher **self-update's swap** — the verify-then-`cmp` path now runs on every start on both hosts, but no host has yet had a launcher actually replaced. The DSM half is no longer blocked: S8 ran the launcher there. |
+| [S15](S15.md) | not blocked — LiteLLM's route reaches the agent today. Owed rather than blocked: the Open WebUI bridge (**decided**, [S15](S15.md) §5), `static_headers` in `registry.rs` so the route has a credential, and a LiteLLM bug report (its A2A *model* paths send 0.3 method names to a card that advertises 1.0). |
