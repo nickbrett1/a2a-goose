@@ -10,7 +10,10 @@ description: >-
   from the registry, appearing and disappearing as agents are registered and
   cleared — a manifold rather than a fixed binding. It reaches each one through
   LiteLLM's `/a2a/{agent_id}` JSON-RPC route, which is the only LiteLLM path
-  that can talk to an A2A 1.0 agent today. See
+  that can talk to an A2A 1.0 agent today. A turn here is a whole agent loop, so
+  this function waits `TIMEOUT_SECONDS` (180 s by default) for it: treat these
+  models as **relatively short-lived work**, and if a task will run longer, ask
+  the agent to write its result down and pick it up in a later message. See
   `integrations/openwebui/README.md` (and `spikes/S15.md` for why this is a
   function and not a model id).
 """
@@ -96,7 +99,12 @@ class Pipe:
         )
         TIMEOUT_SECONDS: int = Field(
             default=180,
-            description="A goose turn is an agent loop, not a completion. Seconds.",
+            description=(
+                "A goose turn is an agent loop, not a completion. Seconds to "
+                "wait for one; the chat shows a timeout if it is exceeded, and "
+                "the agent keeps working. Raise it for heavy work, or ask the "
+                "agent to write its result down and read it later."
+            ),
         )
 
     def __init__(self):
@@ -217,6 +225,20 @@ class Pipe:
 
         try:
             answer = await self._call(request, agent_id)
+        except httpx.TimeoutException:
+            # A deadline is not a failed turn. Say so, and say what it takes to
+            # keep the result: the agent is still working, and a message asking
+            # it to write the answer down is what makes that work collectable.
+            seconds = self.valves.TIMEOUT_SECONDS
+            await self._status(
+                __event_emitter__, f"No answer within {seconds} s", done=True
+            )
+            return (
+                f"No answer within {seconds} s. The turn was not cancelled — the "
+                "agent is most likely still working. For a task like this, ask "
+                "it in a new message to write its result down somewhere you can "
+                "read it (a memo, a file) and then collect that."
+            )
         except Exception as e:
             await self._status(__event_emitter__, f"Agent failed: {e}", done=True)
             raise

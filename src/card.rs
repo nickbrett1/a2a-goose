@@ -22,9 +22,13 @@
 //! card is therefore documentation rather than enforcement, and it is left off
 //! until S13 has shown what LiteLLM's card parser accepts.
 
-use a2a::{AgentCapabilities, AgentCard, AgentInterface, AgentSkill, TRANSPORT_PROTOCOL_JSONRPC};
+use a2a::{
+    AgentCapabilities, AgentCard, AgentExtension, AgentInterface, AgentSkill,
+    TRANSPORT_PROTOCOL_JSONRPC,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
 use crate::config::Config;
 use crate::skills::SkillSet;
@@ -32,6 +36,23 @@ use crate::skills::SkillSet;
 /// The card's input/output modes. Text only in phase 1: the ACP hop is text in,
 /// text out, and tool/file parts are summarised rather than embedded (§5.1).
 pub const TEXT_PLAIN: &str = "text/plain";
+
+/// The extension that says how long a turn may take.
+///
+/// Every caller this agent has is bounded by a timeout it did not choose — a
+/// hub tool call, an Open WebUI valve, an editor — and none of them can see
+/// this agent's `promptSecs`, which is the ceiling the agent actually enforces.
+/// The A2A spec has no field for it, and `capabilities.extensions` is exactly
+/// the place for a fact that an unaware client may ignore: `required: false`,
+/// describe it in words, and put the numbers in `params` so a caller that *does*
+/// read it can act without parsing prose.
+///
+/// This is advertising, not enforcement (constraint #5, §5.3): the deadline is
+/// enforced by the ACP transport. Note also that it changes the card, and the
+/// card is hashed — so changing a timeout re-registers the agent, which is the
+/// intended behaviour of §6.2 rather than a cost to avoid.
+pub const TURN_DEADLINE_URI: &str =
+    "https://github.com/nickbrett1/a2a-goose/blob/main/docs/turn-deadline.md";
 
 /// Builds the card from configuration and the merged skill catalogue.
 pub fn assemble(config: &Config, skills: &SkillSet) -> AgentCard {
@@ -53,7 +74,7 @@ pub fn assemble(config: &Config, skills: &SkillSet) -> AgentCard {
             // as an executor returns more than one event.
             streaming: Some(true),
             push_notifications: Some(false),
-            extensions: None,
+            extensions: Some(vec![turn_deadline(config)]),
             extended_agent_card: None,
         },
         default_input_modes: vec![TEXT_PLAIN.to_string()],
@@ -68,6 +89,31 @@ pub fn assemble(config: &Config, skills: &SkillSet) -> AgentCard {
         security_schemes: None,
         security_requirements: None,
         signatures: None,
+    }
+}
+
+/// The deadline as an extension: the numbers in `params`, the sentence in
+/// `description`, and `required: false` — a client that has never heard of this
+/// must be able to ignore it (`card.rs`'s rule about advertising without
+/// enforcing).
+fn turn_deadline(config: &Config) -> AgentExtension {
+    let prompt_secs = config.goose.acp.timeouts.prompt_secs;
+    let cancel_secs = config.goose.acp.timeouts.cancel_secs;
+    let mut params = HashMap::new();
+    params.insert("promptSecs".to_string(), Value::from(prompt_secs));
+    params.insert("cancelSecs".to_string(), Value::from(cancel_secs));
+
+    AgentExtension {
+        uri: TURN_DEADLINE_URI.to_string(),
+        description: Some(format!(
+            "One turn on this agent may take up to {prompt_secs} seconds, and a cancel is \
+             acknowledged within {cancel_secs}. Agent-to-agent calls are meant for relatively \
+             short-lived work: a caller that gives up before the turn finishes does not stop it, \
+             so a long task is better asked to write its result down somewhere durable and \
+             collected afterwards."
+        )),
+        required: Some(false),
+        params: Some(params),
     }
 }
 
@@ -221,6 +267,48 @@ mod tests {
         assert_eq!(card.skills[0].id, "ask");
         assert_eq!(card.skills[0].name, "Ask");
         assert_eq!(card.capabilities.streaming, Some(true));
+    }
+
+    #[test]
+    fn the_card_advertises_the_turn_deadline() {
+        // A caller's timeout is the one thing about this agent it cannot
+        // discover and did not choose (see TURN_DEADLINE_URI).
+        let mut config = config();
+        config.goose.acp.timeouts.prompt_secs = 1234;
+        config.goose.acp.timeouts.cancel_secs = 7;
+        let skills = SkillSet::load(&config.skills).expect("skills");
+        let card = assemble(&config, &skills);
+
+        let advertised = card
+            .capabilities
+            .extensions
+            .as_ref()
+            .expect("capabilities carry extensions")
+            .iter()
+            .find(|extension| extension.uri == TURN_DEADLINE_URI)
+            .expect("the turn deadline is one of them");
+
+        // Ignorable by a client that has never heard of it...
+        assert_eq!(advertised.required, Some(false));
+        // ...readable by one that has, without parsing prose...
+        let params = advertised.params.as_ref().expect("params");
+        assert_eq!(params["promptSecs"], Value::from(1234u64));
+        assert_eq!(params["cancelSecs"], Value::from(7u64));
+        // ...and said in words for a model that is only reading the card.
+        let description = advertised.description.as_deref().unwrap_or_default();
+        assert!(description.contains("1234"), "{description}");
+    }
+
+    #[test]
+    fn a_changed_timeout_changes_the_card_hash() {
+        // Timeouts come from config and the card is hashed, so a host that
+        // raises its ceiling re-registers — which is what §6.2 is for.
+        let skills = SkillSet::load(&config().skills).expect("skills");
+        let base = hash(&assemble(&config(), &skills));
+
+        let mut slower = config();
+        slower.goose.acp.timeouts.prompt_secs += 60;
+        assert_ne!(base, hash(&assemble(&slower, &skills)));
     }
 
     #[test]

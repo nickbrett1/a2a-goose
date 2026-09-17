@@ -85,7 +85,7 @@ way, and `GET /v1/agents` needs the master key rather than a virtual one.
 | `A2A_ROUTE` | `http://litellm:4000/a2a` | no trailing agent id. Must resolve **from the Open WebUI container** — the container name on the shared network, not the NAS host name ([S12](../../spikes/S12.md): a musl payload could not resolve DSM's uppercase host name; the same class of mistake, one container over). |
 | `AGENT_ID` | — | **fallback only.** Normally the agent is the model chosen in the dropdown; this keeps one agent offered if the registry cannot be read. |
 | `LITELLM_API_KEY` | — | a virtual key. Not the agent's bearer. |
-| `TIMEOUT_SECONDS` | `180` | a goose turn is an agent loop, not a completion. |
+| `TIMEOUT_SECONDS` | `180` | a goose turn is an agent loop, not a completion. On expiry the chat gets a message saying the turn was **not** cancelled and the agent is probably still working — the deadline is not a failure of the agent. These models suit **relatively short-lived work**; for a longer task, ask the agent to write its result down and collect it in a later message. |
 
 ## How models appear and disappear
 
