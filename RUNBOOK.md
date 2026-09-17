@@ -29,6 +29,13 @@ session transcripts:
 | restart | `SIGTERM` to the payload → `deregistered from LiteLLM fd34ec17-…` (20:23:59Z) → wrapper relaunched the launcher → `registered with LiteLLM 51f7c550-…` (20:24:45Z) |
 | verified | the row created at registration carries `Authorization` = `"Bearer <the new env token>"` (`sha256[0:16] 4196f2d9659ee06c`) and is *not* the pre-rotation value; turns answered through `/a2a/{id}` afterwards |
 
+The same script and sequence ran unchanged on the other host the same day
+(**macOS**, `mac-studio`, `v0.1.37`): backup, leak scan (246 files, 0 unexpected
+holders), one line rewritten in place, then `SIGTERM` → `registered` **8 seconds
+later** with the new value on the row (`sha256[0:16] dac03790527ac379`). The 69 s
+shutdown in the table is the NAS's with a session in flight; here nothing was
+running, so the difference is the session, not the platform.
+
 The sequence to run, per host:
 
 1. `cp -p "$ENV" "$ENV.bak-rotate-$(date -u +%Y%m%dT%H%M%SZ)"` and check the copy
@@ -76,6 +83,54 @@ The backups an operator makes are copies of a *leaked* secret, and the oldest on
 (`env.bak-s9reach`) is mode `0777`. Purge backups once a rotation is verified —
 keep at most the most recent, `0600` — and treat any world-readable file under
 `~/.config/a2a-goose/` as a finding in its own right.
+
+## The macOS host: restarting it, and the editor that takes ports
+
+`deploy/launchd/com.nick.a2a-goose.plist`, `gui/<uid>`, logs in
+`~/Library/Logs/a2a-goose/launcher.log`. The full investigation is
+[spikes/S17.md](spikes/S17.md); this is what an operator has to know.
+
+**Restart, and never `SIGKILL`** — the same rule as DSM, with a different
+surface:
+
+| State | Command |
+| --- | --- |
+| payload running | `kill -TERM <payload pid>` — graceful; launchd's `KeepAlive` relaunches |
+| job down (`state = spawn scheduled`, `last exit code = 1`) | `launchctl kickstart gui/<uid>/com.nick.a2a-goose` — starts a job that is not running |
+| payload running | **not** `launchctl kickstart -k` — `-k` is a `SIGKILL` and orphans the goose child |
+
+Measured: `SIGTERM` → `serve: ready` and `registered` in **8 s** with no
+sessions in flight.
+
+**The editor can take the agent's ACP port, and it is not a bug in the agent.**
+Measured on mac-studio: with `"remote.autoForwardPortsSource": "hybrid"` (VS
+Code user settings) the editor forwards ports found in **terminal output**, and a
+forwarded port is a listener bound on `remote.localPortHost` — here
+`"allInterfaces"`, so `*:<port>` on every interface. The agent's config printing
+its own ACP URL was enough to lose `3284`, `3285`, `3286` and then `32840`; the
+symptom is the refusal in S14 (`is already in use: … did not answer an ACP
+initialize`) with no goose process anywhere. Fixed by setting the source to
+`"process"` (container processes only — verified: a port printed before the
+change was forwarded within 25 s, one printed after was not), then moving the
+agent to `127.0.0.1:32841`. **The Ports panel keeps the stale entries**: they bind
+all interfaces until a human stops forwarding them, and one of them (`*:10001`)
+silently masked the agent's LAN address — TCP connected, HTTP never answered,
+which is why the card's `url` is the tailnet address. Treat "the port is taken
+and nothing is listening" as *the editor's*, and check `lsof -nP -iTCP:<port>`
+before believing `ps`.
+
+**Turn latency is the task, and nothing else.** S17 briefly recorded **~8
+minutes** for the first turn on a fresh `contextId` and blamed session startup;
+[S18](spikes/S18.md) overturns that by measurement on this host. A brand-new
+`contextId` on a warm payload answers in **1.9 s**, the first turn after a
+`SIGTERM` restart in **2.4 s**, three simultaneous turns on three new contexts
+on a just-restarted payload in **2.4–2.8 s** each, and a substantive tool-using
+turn in **3.9 s**. There is no warm-up to buy: size a caller's timeout to the
+task, not to startup. Keep the two habits that are still worth it — reuse a
+`contextId` for continuity, and make a long-running agent **write its result
+down** before it explains, so a caller that gives up at 90 s loses the reply and
+not the work. Note also that **`agent_id` changes on every payload restart**:
+resolve agents by name, never hold a literal id.
 
 ## The three framings that keep being asked for
 
