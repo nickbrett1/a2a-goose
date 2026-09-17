@@ -4,6 +4,10 @@ Host-process boot persistence. **genproj emits no `deploy/`** — these files ar
 authored here (phase-1 plan, §2.2), because the deployment channel is a GitHub
 Release consumed by `scripts/fetch-launch.sh`, not an image.
 
+Day-two operations — rotating a host's agent bearer, and the framings around
+"why is my agent not in the model list" — are in [../RUNBOOK.md](../RUNBOOK.md),
+with `scripts/rotate-bearer.py` as the rotation itself.
+
 Two files, one per OS, both doing the same job: run the **launcher** at boot and
 restart it when it exits.
 
