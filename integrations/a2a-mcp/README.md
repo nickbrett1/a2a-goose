@@ -196,6 +196,7 @@ sudo docker run --rm --network ai_proxy -e MCP_URL=http://mcphub:3000/mcp/core \
 | mcphub | connected, 2 tools, added to all 9 groups (`core`, `media`, `container`, `llm-cost`, `dev`, `ops`, `dev-ui`, `doppler`, `vikunja`) |
 | Traefik | `GET http://100.82.223.13:8092/a2a-mcp/mcp` → `406` — routed and answered by the server, which is POST-only by design |
 | Open WebUI | its MCP client connects to `http://mcphub:3000/mcp/core` and lists the tools; mcphub's activity log records `a2a.list_agents` (128 ms) then `a2a.ask_agent` (2.1 s), `status=success`, `group_name=core` — from Open WebUI chats on the `core` model |
+| CI publishes, the box updates itself | Build 92 (`:docker: Build and publish image (GHCR, a2a-mcp)`) passed; watchtower-nick's following poll logged `Found new image container=a2a-mcp new_id=3efcb7d873d3`, `Stopping container`, `Started new container`, `Removing image image_id=3a0a17503fe4`, `updated=1` — with no hand on the box. Its scan count had gone 15 → 16 when the scope label was added, while the unscoped nightly instance's container list still excluded `a2a-mcp` |
 
 ## Caveats
 
