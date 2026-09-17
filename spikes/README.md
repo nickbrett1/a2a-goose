@@ -12,22 +12,26 @@ is quoted in each file; the sanitised S3 frames are committed as
 **mac-studio host** on 2026-09-17 against a published release (v0.1.16); S9 was
 run on the **NAS** on 2026-09-17 against the live proxy (`litellm 1.103.0`), and
 **re-probed** the same day once the NAS's tailnet was fixed — the re-probe
-moved `card.url` to `http://100.77.144.14:10001`.
+moved `card.url` to `http://100.77.144.14:10001`. S8 and S12 were run on the
+**NAS** on 2026-09-17 as well, against a published release (v0.1.25) — the first
+time either half of the DSM deployment has been exercised on the box. S12's run
+went past `/status` to a real A2A turn on the host (`TASK_STATE_COMPLETED`), the
+M3 control surface against a real runner, and a spend-log row naming the host.
 
 | # | Question | Verdict |
 | --- | -------- | ------- |
 | [S1](S1.md) | Which `goose serve` invocation? | **PASS** — identical surface; pin the bare one |
-| [S2](S2.md) | Does goose forward `X-LiteLLM-Trace-Id` to its provider calls? | **FAIL as specified** — 🚩 escalated, then **decided**: bound the loop, not the wallet |
+| [S2](S2.md) | Does goose forward `X-LiteLLM-Trace-Id` to its provider calls? | **FAIL as specified** — 🚩 escalated, then **decided**: bound the loop, not the wallet. Addendum 2026-09-17: the variable's syntax (`Name: value` lines, *not* JSON — the JSON spelling breaks the provider) |
 | [S3](S3.md) | Exact shapes of the ACP methods | **PASS** — fixtures committed; the transport is POST **+ SSE** |
 | [S4](S4.md) | Does one `goose serve` handle concurrent sessions? | **PASS** — concurrent, isolated, 2.0s for two turns |
 | [S5](S5.md) | Does `DELETE /v1/agents/{id}` 404 on an already-deleted id? | **PASS** — 404; the sweeper's guard #3 holds |
 | [S6](S6.md) | Does the deployed goose advertise `sessionCapabilities.close`? | **PASS** — `close`, `list` and `delete` are all advertised |
 | [S7](S7.md) | Does `protocolVersion: "1.0"` survive a caller with no `a2a-version` header? | **PASS** — the server never reads the header |
-| [S8](S8.md) | Can the agent run as a host process on DSM 7? | **NOT RUN** — needs the NAS shell |
+| [S8](S8.md) | Can the agent run as a host process on DSM 7? | **PASS** — one boot-up task, created by CLI, owned by init (`ppid 1`), bringing the agent up from a cold box; a real reboot is the one measurement outstanding |
 | [S9](S9.md) | Can the LiteLLM container reach the agent at its `card.url`? | **SPLIT** — addressing **PASS**, re-probed the same day: the **tailnet IP literal** `100.77.144.14:10001` works (the LAN literal it first passed on was a 24 h DHCP lease; the tailnet was unreachable when that was measured, then fixed); card fetch **FAIL** — LiteLLM 1.103.0 never fetches the card, 🚩 escalated, then **decided**: register the card ourselves |
 | [S10](S10.md) | Recipe mining: where do recipes live, and is the shape stable? | **PASS, with one correction to §6.1** |
 | [S11](S11.md) | Does the emitted launcher resolve the right triple, fail open, and *upgrade*? | **PASS on mac-studio** — the flip was a no-op on every upgrade, then fixed and proven by two real upgrades; item 4 and the DSM host pending |
-| [S12](S12.md) | Does the published binary run on the target host? | **NOT RUN** — needs both hosts and a release |
+| [S12](S12.md) | Does the published binary run on the target host? | **PASS on DSM** — the x86_64 musl static-PIE payload execs, `check-goose.sh` passes on the host, the version refusal precedes the bind, `/status` names the host's real goose, the manifest→tarball→running-payload digests agree, and a real turn answers `TASK_STATE_COMPLETED` with the host's name on LiteLLM's row; the darwin half was seen on mac-studio in S11/S14 |
 | [S13](S13.md) | Is `a2a-rs` wire-compatible with LiteLLM's A2A routes? | **PASS** — the framing agrees; the *card* needs work on our side |
 | [S14](S14.md) | Does the agent really own `goose serve`? | **PASS, box and darwin host** — starts, gates, restarts, refuses; DSM is [S8](S8.md) |
 
@@ -130,6 +134,5 @@ worth reading:
 
 | Spike | Blocked on |
 | ----- | ---------- |
-| S8 | a shell on the NAS. |
-| S11 | item 4 (a bad download on a host), the **DSM host** (items 1–5 never run there), and the launcher **self-update** (decided, not yet on a host). |
-| S12 | the **DSM** host. mac-studio now runs a published release (0.1.16), so the darwin half is seen. |
+| S8 | one measurement: a real reboot of the NAS (the boot-up event itself has been fired for real, against a cold box). |
+| S11 | item 4 (a bad download on a host) and the launcher **self-update's swap** — the verify-then-`cmp` path now runs on every start on both hosts, but no host has yet had a launcher actually replaced. The DSM half is no longer blocked: S8 ran the launcher there. |

@@ -103,22 +103,48 @@ with a different user, change that one path in the copy. It must not point back
 at a checkout — a launcher that is a repository file is a launcher that goes
 stale (S11), and the self-update cannot replace a file something else owns.
 
-DSM 7: Control Panel → Task Scheduler → Create → Triggered Task, event
-**Boot-up**, user = the user that owns goose's configuration (**not** root — root
-has its own `$HOME` and therefore its own, empty, recipe directory), script =
-`deploy/dsm/a2a-goose-boot.sh`. Details are in the script's header.
+DSM 7, as the user that owns goose:
+
+The task's script is **one line**, not this file's path, and the file lives in a
+*checkout* — the only deployment file that does (the launcher is a release asset,
+S11). Create the boot-up task from the GUI (Control Panel → Task Scheduler →
+Create → Triggered Task, event **Boot-up**, user = the user that owns goose's
+configuration — **not** root) or from the CLI, which is what S8 measured:
+
+```bash
+sudo /usr/syno/sbin/esynoscheduler --create task_name=a2a-goose event=bootup \
+  'description=a2a-goose node agent (host process, DSM)' \
+  'owner={"1026":"nick"}' enable=true operation_type=script \
+  'operation=nohup /volume1/homes/nick/a2a-goose/deploy/dsm/a2a-goose-boot.sh \
+     >> /volume1/homes/nick/.local/share/a2a-goose/boot.log 2>&1 &'
+```
+
+The `nohup … &` is not decoration: the boot-up event runs its tasks
+*synchronously*, so a body that ran the wrapper's loop in the foreground would
+hold the event open and starve every other boot-up task on the box. Both the
+identities — the uid in `owner`, the path in the operation — are the NAS's; see
+the script's header for the two traps (`synoschedtask` cannot create tasks at
+all; the task's environment is root's, whichever uid owns it).
 
 ## Before trusting either one
 
 - **S8** — does the agent come back after a DSM reboot, and survive a DSM update?
-  Not yet run. It now also owns a question of its own: the agent stops the goose
-  it started on `SIGTERM`/`SIGINT`, and launchd's default is to kill a job's
-  remaining processes when the job exits — but nothing here has proven that a
-  **`SIGKILL`ed** agent on DSM does not leave a goose behind. The answer matters
-  because the next boot would then refuse to start ("something is already
-  listening there"), which is loud and correct but not self-healing.
+  **Run** (2026-09-17, v0.1.25): the task fires, the loop starts, the payload and
+  goose come up, a killed payload is restarted, and a cold box comes up through
+  the real boot-up event — one wrapper, owned by init. Two limits, both recorded
+  in `spikes/S8.md`: a real reboot has not been run, and a **`SIGKILL`ed** agent
+  *does* leave a goose behind — the restarted payload refuses to adopt it (loudly,
+  correctly, every 30 s) and the host stays down until a human kills the orphan or
+  the box reboots.
 - **S12** — does the published binary actually `exec` on both hosts (musl/static
-  on DSM, the ad-hoc signature on a downloaded Darwin binary)?
+  on DSM, the ad-hoc signature on a downloaded Darwin binary)? **Run on DSM**
+  (2026-09-17, v0.1.25): the x86_64 musl static-PIE payload execs, `check-goose.sh`
+  passes against the host's goose, the version refusal precedes the bind, and
+  `/status` names the host's real goose. It also produced the deployment's first
+  host-specific trap: the published binary is musl, and musl matches `/etc/hosts`
+  names exactly where glibc matches them case-insensitively, so DSM's own
+  uppercase `NAS` line is invisible to it — `LITELLM_BASE_URL` is an address on
+  that host, not a name (`spikes/S12.md`).
 - **S14** — does the agent really own goose, on a host, against the host's goose?
   Run: `spikes/S14.md` records what has been proven (start, readiness gate, the
   key, a crash and the restart, the refusal, a clean stop) and what has not (a
@@ -132,7 +158,7 @@ has its own `$HOME` and therefore its own, empty, recipe directory), script =
 `deploy/env/README.md`. The load-bearing line in each is the host naming itself:
 
 ```sh
-LITELLM_CUSTOM_HEADERS='{"User-Agent":"a2a-goose/mac-studio"}'
+LITELLM_CUSTOM_HEADERS='User-Agent: a2a-goose/mac-studio'
 ```
 
 LiteLLM records that as `metadata.user_agent` on every spend-log row, which is
@@ -140,10 +166,20 @@ what makes "which agent did this" answerable — with one shared master key, eve
 row is otherwise filed under `litellm_proxy_master_key`. **Attribution only: no
 budget is attached anywhere, deliberately** (the decision is in `spikes/S2.md`).
 
+That variable is `Name: value` lines, **not JSON**: a JSON value makes goose exit
+`Error invalid HTTP header name`, after which every turn fails with `-32603 …
+"Provider not set"`. Measured on the NAS, 2026-09-17 — the table is in
+`deploy/env/README.md`. Nothing written down here had it right before that run.
+The agent refuses both bad spellings at startup, before it binds a port, so a host
+deployed with one does not come up at all.
+
 The env file is also where a host's identity belongs rather than the code,
 because the agent is one-per-host and `cwd` is the namespace: the host is the
 unit, so it sets its own name once at deploy.
 
-Both halves of that mechanism are proven but not yet proven *together*
-(LiteLLM records the header; goose forwards `LITELLM_CUSTOM_HEADERS`) — the
-end-to-end check needs a host, so it rides with **S8/S12**.
+Both halves of the mechanism are no longer merely proven separately: on the NAS
+(v0.1.25, goose 1.50.0) a real turn came back `TASK_STATE_COMPLETED` and the row
+LiteLLM wrote for it carried `metadata.user_agent = 'a2a-goose/nas'` (S12). The
+same run found the second requirement — `ENV_FILE` is also the only place the
+*child* goose's provider key can come from, since the agent starts `goose serve`
+itself and it inherits that file's environment and nothing else.

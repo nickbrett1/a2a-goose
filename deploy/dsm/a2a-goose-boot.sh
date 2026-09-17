@@ -19,10 +19,44 @@
 #               mines. As root you would mine an empty recipe directory and
 #               serve a card with one skill in it.
 #   Event       Boot-up
-#   Script      /volume1/homes/nick/a2a-goose/deploy/dsm/a2a-goose-boot.sh
+#   Script      one line, below - not this file's path, and not its body
 #
-# Verify with S8 (does the agent actually come back after a DSM reboot, and does
-# it survive a DSM update) before trusting any of this. S8 has not been run yet.
+# The task's whole body is the detach below, because the body runs
+# *synchronously* during the boot event and this script never returns (S8,
+# 2026-09-17: a 20-second task took 21 seconds, and
+# esynoscheduler-bootup.service is a `oneshot` with `TimeoutStartSec=0`). A task
+# that ran the loop in the foreground would hold the boot-up event open forever
+# and starve every other boot-up task on the box - including whichever one
+# starts Tailscale. So the task detaches the loop and returns:
+#
+#   nohup /volume1/homes/nick/a2a-goose/deploy/dsm/a2a-goose-boot.sh \
+#     >> /volume1/homes/nick/.local/share/a2a-goose/boot.log 2>&1 &
+#
+# The same task can be created without the GUI: DSM keeps event-driven tasks in a
+# sqlite database and ships a CLI for them. Measured on DSM 7.4.1 -
+#
+#   sudo /usr/syno/sbin/esynoscheduler --create task_name=a2a-goose event=bootup \
+#     'owner={"1026":"nick"}' enable=true operation_type=script \
+#     'operation=<the nohup line above>'
+#
+#   --list / --get / --run / --delete take `task_name=<name>`, and owner is a
+#   JSON object mapping uid to user name: the uid carries the identity, the
+#   environment does not (see the HOME note below). `--run` fires it immediately,
+#   which is how S8 started the loop without rebooting the box.
+#
+# What this design does not detect is the loop itself dying. launchd restarts a
+# job that exits; nothing here restarts the wrapper. It is thirty lines of bash
+# in a `while :` loop whose only exit is a missing launcher, so the realistic
+# exposure is "a reboot fixes it" rather than "it dies quietly under load" - but
+# it is a real difference in kind from the macOS deployment, so it is written
+# down here instead of being discovered later.
+#
+# S8 ran this on the box (v0.1.25, 2026-09-17): the task fires, the loop is
+# started, the payload and goose come up under it, a SIGTERM to the payload is
+# restarted, and the whole thing comes back from a cold start through the real
+# boot-up event. spikes/S8.md has the evidence and the two limits that remain (a
+# real reboot; a SIGKILLed payload leaves an orphaned goose the payload refuses
+# to adopt, so that one is a human's or a reboot's to fix).
 #
 # What is run is the LAUNCHER, not the agent (hard constraint #14): the fetch
 # happens first, and the launcher ends in `exec`, so the payload replaces this
@@ -34,6 +68,30 @@
 # not something to adopt - so if this host ran goose by hand before, stop it
 # before the first run of a payload that owns goose.
 set -uo pipefail
+
+# $HOME is NOT the user's home here, and this is the one thing about DSM that
+# costs an afternoon. The Task Scheduler runs a task as the user set on it, but
+# hands it *root's* environment: measured on DSM 7.4.1 (S8, 2026-09-17), a
+# boot-up task owned by uid 1026 reported HOME=/root, USER=root, LOGNAME=root
+# while `id` reported the owner. A deploy dir built from that $HOME is
+# /root/.local/share/a2a-goose, the launcher is "not found" at every boot, and
+# the goose the payload spawns looks for /root/.config/goose - which is exactly
+# the empty recipe directory hard constraint #9's "the owner, not root" is about,
+# reached with the right uid and the wrong home.
+#
+# So ask passwd for the invoking user's home (`id -un` is the owner; only the
+# environment lies), and *export* it: the launcher reads $HOME/.config/a2a-goose/env
+# on its way to the exec, and the payload and the goose under it inherit this
+# environment. A2A_GOOSE_HOME overrides, for a host whose paths differ.
+if [ -n "${A2A_GOOSE_HOME:-}" ]; then
+  user_home="${A2A_GOOSE_HOME}"
+else
+  user_home="$(awk -F: -v u="$(id -un)" '$1 == u { print $6; exit }' /etc/passwd 2>/dev/null)"
+  [ -n "$user_home" ] || user_home="${HOME:-}"
+fi
+if [ -n "$user_home" ]; then
+  export HOME="$user_home"
+fi
 
 # Where this host keeps the launcher and the releases it fetches. The launcher
 # is a release asset, not a file in a checkout (S11): the cold start in
