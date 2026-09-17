@@ -37,6 +37,23 @@ It is a deliberate copy of the bridge's registry-and-answer handling rather than
 an import of it: the bridge has to stay a single file that installs into Open
 WebUI through its own UI, and a shared package would break exactly that. The
 duplication is two small functions, and `README.md` says so out loud.
+
+## A call has a deadline; the agent does not
+
+`TIMEOUT_SECONDS` is where *this* process gives up, and every caller in front of
+it — mcphub, Open WebUI, a goose session — usually gives up sooner. Giving up
+does not stop the turn: the agent keeps working with nobody listening, which is
+how a caller learns that "the tool call failed" and "the agent failed" are
+different claims (`RUNBOOK.md`). So both tools say the number out loud and say
+what to do about it, which is the advertising half of the timeout item and not
+a change in behaviour.
+
+What is advertised is deliberately about **what to send**, because the deadline
+is a property of the task and not of the agent waking up: measured on
+mac-studio, a new conversation on a running agent answers in ~2 s, the first
+turn after a restart in ~2 s, and three simultaneous turns in ~3 s
+(`spikes/S18.md`). There is no warm-up to budget for — there is work, and work
+can outlive the call.
 """
 
 from __future__ import annotations
@@ -57,9 +74,26 @@ LITELLM_API_KEY = os.environ.get("LITELLM_API_KEY") or ""
 
 # A turn here is an agent loop, not a completion: minutes, not seconds. The
 # caller's own timeout is the real ceiling — mcphub and Open WebUI each impose
-# one — so this is deliberately the more patient of the two.
+# one — so this is deliberately the more patient of the two. Where it lands
+# *and what to do about it* is in the module docstring; what matters here is
+# that the number is read once and then advertised verbatim, so the tool
+# description cannot drift from the behaviour.
 TIMEOUT_SECONDS = float(os.environ.get("TIMEOUT_SECONDS") or 300)
 REGISTRY_TIMEOUT_SECONDS = float(os.environ.get("REGISTRY_TIMEOUT_SECONDS") or 15)
+
+# The paragraph both callers read. It is a module constant rather than a
+# docstring because it carries `TIMEOUT_SECONDS` and a docstring cannot be
+# formatted at import without a decorator that exists only to do that.
+DEADLINE = (
+    f"One call waits up to {TIMEOUT_SECONDS:g} s for an answer, and the client's "
+    "own tool-call timeout is often lower still. Agent-to-agent calls are meant "
+    "for relatively short-lived work: a turn is a whole agent loop, so send a "
+    "task that finishes inside that window. If the work will outlive the call, "
+    "say so in the message and ask the agent to write its result down as it goes "
+    "— a memo, a file — because a call that gives up does not stop the turn, and "
+    "the result is only lost if nobody wrote it down. Reuse the same context_id "
+    "on a later call to collect it in the same conversation."
+)
 
 MCP_HOST = os.environ.get("MCP_HOST") or "0.0.0.0"
 MCP_PORT = int(os.environ.get("MCP_PORT") or 8090)
@@ -74,7 +108,11 @@ mcp = FastMCP(
         "Hand work to the user's own A2A agents. They are separate agent "
         "processes on the user's machines (a NAS, a Mac Studio), reachable "
         "through the LiteLLM proxy, and they can take minutes to answer. Call "
-        "list_agents to see who is registered before sending anything."
+        "list_agents to see who is registered before sending anything. These "
+        f"calls are for relatively short-lived work: one waits up to "
+        f"{TIMEOUT_SECONDS:g} s before giving up, the turn carries on without "
+        "you if it does, and a long task is better asked to write its result "
+        "down somewhere you can read it."
     ),
     host=MCP_HOST,
     port=MCP_PORT,
@@ -256,6 +294,29 @@ def name_of(agent: dict[str, Any]) -> str:
     return str(agent.get("agent_name") or agent.get("agent_id") or "").strip()
 
 
+def turn_ceiling(card: dict[str, Any]) -> float | None:
+    """The agent's *own* turn ceiling, if its card advertises one.
+
+    This process's deadline and the agent's are different numbers, and a caller
+    that can only see one of them is guessing. An a2a-goose agent publishes its
+    `promptSecs` as a `capabilities.extensions` entry (`docs/turn-deadline.md`)
+    and LiteLLM carries the card into the row, so reading it back is what makes
+    the roster useful for budgeting. An agent that advertises nothing — or a row
+    whose card was rewritten — reads as `None` rather than as a guess.
+    """
+    capabilities = card.get("capabilities") or {}
+    if not isinstance(capabilities, dict):
+        return None
+    for extension in capabilities.get("extensions") or []:
+        if not isinstance(extension, dict):
+            continue
+        params = extension.get("params") or {}
+        seconds = params.get("promptSecs")
+        if isinstance(seconds, (int, float)) and not isinstance(seconds, bool):
+            return float(seconds)
+    return None
+
+
 def roster(agents: list[dict[str, Any]]) -> str:
     """Who there is, for an error the model can act on.
 
@@ -331,6 +392,12 @@ async def list_agents() -> str:
             lines.append(f"    protocol: {card['protocolVersion']}")
         if card.get("description"):
             lines.append(f"    description: {card['description']}")
+        ceiling = turn_ceiling(card)
+        if ceiling is not None:
+            lines.append(
+                f"    its own turn ceiling: {ceiling:g} s "
+                "(what it allows one turn to take, not what it usually takes)"
+            )
         skills = [
             str(skill.get("name") or skill.get("id") or "?")
             for skill in card.get("skills") or []
@@ -339,12 +406,25 @@ async def list_agents() -> str:
         if skills:
             lines.append(f"    skills: {', '.join(skills)}")
 
-    lines += ["", "Hand one of them work with ask_agent(agent=..., message=...)."]
+    lines += [
+        "",
+        "Hand one of them work with ask_agent(agent=..., message=...). "
+        f"{DEADLINE}",
+    ]
     return "\n".join(lines)
 
 
-@mcp.tool()
-@flatten_docstring
+@mcp.tool(
+    description=(
+        "Send one message to a registered A2A agent and return its answer.\n\n"
+        "The agent is a separate process with its own conversation: it cannot "
+        "see this chat, so give it everything it needs and send work it can "
+        "carry out on its own.\n\n"
+        f"{DEADLINE}\n\n"
+        "Its answer is returned verbatim — quote or summarise it rather than "
+        "inventing what it would say."
+    )
+)
 async def ask_agent(
     agent: Annotated[
         str,
@@ -370,22 +450,34 @@ async def ask_agent(
         Field(
             description=(
                 "Optional. Pass the same value on a later call to continue the "
-                "agent's previous conversation; omit it to start a fresh one."
+                "agent's previous conversation; omit it to start a fresh one. "
+                "This is also how a result that outlived an earlier call is "
+                "collected."
             )
         ),
     ] = None,
 ) -> str:
     """Send one message to a registered A2A agent and return its answer.
 
-    The agent runs its own agent loop and may take minutes, so send it work it
-    can carry out on its own and tell the user it is running. Its answer is
-    returned verbatim — quote or summarise it rather than inventing what it
-    would say.
+    The description shown to the model is built above (it carries the deadline);
+    this docstring is for people reading the source.
     """
     agents = await registry()
     chosen = resolve(agents, agent)  # raises UnknownAgent, which carries the roster
 
-    text = await send(str(chosen.get("agent_id")), message, context_id)
+    try:
+        text = await send(str(chosen.get("agent_id")), message, context_id)
+    except httpx.TimeoutException:
+        # A deadline is not a failure of the agent. Saying so — and saying what
+        # it would take to keep the result — is the difference between a model
+        # that retries the same doomed call and one that changes the ask.
+        return (
+            f"Gave up waiting for {name_of(chosen)} after {TIMEOUT_SECONDS:g} s. "
+            "The turn was not cancelled by this: the agent is most likely still "
+            "working, with nobody listening. If the task is a long one, send it "
+            "again (same context_id to stay in the same conversation) and ask it "
+            "to write its result down where you can read it, then collect that."
+        )
     if not text.strip():
         return f"{name_of(chosen)} finished the turn without an answer."
     return text

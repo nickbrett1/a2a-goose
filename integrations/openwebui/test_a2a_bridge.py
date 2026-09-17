@@ -11,9 +11,12 @@ including the second, empty `answer` artifact that the agent emits and that a
 parser reading `artifacts[0]` by index would survive by luck.
 """
 
+import asyncio
 import os
 import sys
 import unittest
+
+import httpx
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -179,6 +182,35 @@ class Context(unittest.TestCase):
         second = Pipe._context_id({}, {})
         self.assertTrue(first and second)
         self.assertNotEqual(first, second)
+
+
+class Deadline(unittest.TestCase):
+    """A call that gives up is not a turn that failed."""
+
+    def setUp(self):
+        self.pipe = Pipe()
+        self.pipe.valves.TIMEOUT_SECONDS = 42
+
+    def _reply(self):
+        async def too_slow(*_args, **_kwargs):
+            raise httpx.ReadTimeout("no answer in time")
+
+        self.pipe._call = too_slow
+        body = {
+            "model": "a2a_goose.0a2d93c6-2b0e-471b-9507-a055b5cfe97d",
+            "messages": [{"role": "user", "content": "do a long thing"}],
+        }
+        return asyncio.run(self.pipe.pipe(body, {"chat_id": "c-1"}))
+
+    def test_a_timeout_names_the_deadline_and_that_the_turn_survives(self):
+        reply = self._reply()
+        self.assertIn("42 s", reply)
+        self.assertIn("not cancelled", reply)
+
+    def test_a_timeout_points_at_the_durable_workaround(self):
+        # The measured failure mode: the caller gives up, the agent keeps
+        # working, and the result is lost only because nobody wrote it down.
+        self.assertIn("write its result down", self._reply())
 
 
 if __name__ == "__main__":

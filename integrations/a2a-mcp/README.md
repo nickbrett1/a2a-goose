@@ -204,10 +204,23 @@ sudo docker run --rm --network ai_proxy -e MCP_URL=http://mcphub:3000/mcp/core \
   LiteLLM's route, so it depends on the agent row's `static_headers` carrying the
   bearer. On the NAS that is currently a hand-made admin `PUT`; nothing in the
   repo restores it. `registry.rs` owes that, and now three surfaces depend on it.
-- **A tool call blocks for the whole turn.** `TIMEOUT_SECONDS` is 300 by default,
-  but the caller's ceiling is lower: mcphub's and Open WebUI's tool-call timeouts
-  were not measured. A turn measured here took 2.1 s warm, 14.7 s cold — how a
-  multi-minute turn behaves through a hub is untested.
+- **A tool call blocks for the whole turn, and now says so.** `TIMEOUT_SECONDS`
+  is 300 s, and both tool descriptions, `list_agents`' footer and the server's
+  `instructions` carry that number and the advice that goes with it: these calls
+  are for **relatively short-lived work**. Each agent line in `list_agents` also
+  carries the ceiling that agent's *own* card advertises
+  ([`docs/turn-deadline.md`](../../docs/turn-deadline.md)), because a caller that
+  can only see one of the two numbers is guessing. The caller's ceiling is usually
+  lower still (Open WebUI's bridge valve defaults to 180 s; mcphub's own tool-call
+  timeout is still unmeasured), so the number advertised is the one this process
+  enforces, and the guidance is about *what to send*. A call that gives up does
+  **not** cancel the turn — measured, the agent carries on with nobody listening
+  — so `ask_agent` now returns that fact as an answer instead of an exception,
+  and points at the durable workaround: ask for the result to be written down
+  and collect it on a later call with the same `context_id`. What the deadline is
+  **not** is a warm-up: a new conversation on a running agent answers in ~2 s, the
+  first turn after a restart in ~2 s, three simultaneous turns in ~3 s
+  (`spikes/S18.md`). Size for the task, not for the agent waking up.
 - **A turn is unary.** Nothing streams; `SendStreamingMessage` exists on the agent
   and the route would forward it, but relaying a stream is unmeasured.
 - **The parse-and-call code is a copy of the bridge's**, not an import. The bridge
