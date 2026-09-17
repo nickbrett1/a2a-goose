@@ -93,6 +93,12 @@ const READY_POLL: Duration = Duration::from_millis(25);
 /// How long the child gets to exit after `SIGTERM` before it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
+/// How long [`Tap::drained`] waits for the readers after the child is gone.
+///
+/// Not a grace period for goose: the pipe is already closed. it bounds the one
+/// case that is not - a process that inherited the pipe and outlived the child.
+const OUTPUT_DRAIN: Duration = Duration::from_millis(500);
+
 /// How long the conflict check waits for a connection to the address.
 ///
 /// Aimed at a *listening* server, so a refusal to connect is immediate and this
@@ -478,7 +484,7 @@ impl Supervisor {
                 return Err(ServeError::ExitedBeforeReady {
                     path: goose.path.clone(),
                     status: exit.to_string(),
-                    output: tap.tail(),
+                    output: tap.drained().await,
                 });
             }
             // A child that never answers is stopped here rather than left to the
@@ -490,7 +496,7 @@ impl Supervisor {
                     url: acp.url.clone(),
                     waited_secs: waited,
                     last,
-                    output: tap.tail(),
+                    output: tap.drained().await,
                 });
             }
             Readiness::Refused { reason } => {
@@ -498,7 +504,7 @@ impl Supervisor {
                 return Err(ServeError::Refused {
                     url: acp.url.clone(),
                     reason,
-                    output: tap.tail(),
+                    output: tap.drained().await,
                 });
             }
             Readiness::Cancelled => {
@@ -507,7 +513,7 @@ impl Supervisor {
                     url: acp.url.clone(),
                     waited_secs: 0,
                     last: "the start was cancelled".to_string(),
-                    output: tap.tail(),
+                    output: tap.drained().await,
                 });
             }
         }
@@ -606,12 +612,15 @@ async fn supervise(
                 };
                 status.gone();
                 match exit {
-                    Ok(exit) => tracing::error!(
-                        pid,
-                        %exit,
-                        output = %tap.tail(),
-                        "the goose serve this agent started has exited"
-                    ),
+                    Ok(exit) => {
+                        let output = tap.drained().await;
+                        tracing::error!(
+                            pid,
+                            %exit,
+                            %output,
+                            "the goose serve this agent started has exited"
+                        )
+                    }
                     Err(err) => tracing::error!(pid, %err, "lost the goose serve child"),
                 }
                 if note_failure(&mut failures, &policy, &status, &mut stop).await {
@@ -662,23 +671,24 @@ async fn supervise(
                         // that is up but mute would otherwise hold the port
                         // while the next attempt tries to bind it.
                         stop_child(&mut child).await;
+                        let output = child_tap.drained().await;
                         match &outcome {
                             Readiness::Exited(exit) => tracing::error!(
                                 pid,
                                 %exit,
-                                output = %child_tap.tail(),
+                                %output,
                                 "goose serve exited before it answered initialize"
                             ),
                             Readiness::NotReady { last, .. } => tracing::error!(
                                 pid,
                                 %last,
-                                output = %child_tap.tail(),
+                                %output,
                                 "goose serve came up but did not answer initialize"
                             ),
                             Readiness::Refused { reason } => tracing::error!(
                                 pid,
                                 %reason,
-                                output = %child_tap.tail(),
+                                %output,
                                 "goose serve answered initialize and refused it"
                             ),
                             _ => {}
@@ -923,10 +933,10 @@ async fn spawn_child(
     let mut child = command.spawn()?;
     let tap = Tap::default();
     if let Some(stdout) = child.stdout.take() {
-        echo(stdout, "stdout", tap.clone());
+        tap.reading(echo(stdout, "stdout", tap.clone()));
     }
     if let Some(stderr) = child.stderr.take() {
-        echo(stderr, "stderr", tap.clone());
+        tap.reading(echo(stderr, "stderr", tap.clone()));
     }
     Ok((child, tap))
 }
@@ -981,9 +991,49 @@ fn pid_of(child: &Child) -> u32 {
 /// *startup* failure can quote it, since the refusal is what the operator is
 /// reading at that moment.
 #[derive(Clone, Default)]
-struct Tap(Arc<StdMutex<VecDeque<String>>>);
+struct Tap(
+    Arc<StdMutex<VecDeque<String>>>,
+    Arc<StdMutex<Vec<JoinHandle<()>>>>,
+);
 
 impl Tap {
+    /// The reader tasks that feed this tap, so their handles can be awaited.
+    fn reading(&self, reader: JoinHandle<()>) {
+        let mut readers = match self.1.lock() {
+            Ok(readers) => readers,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        readers.push(reader);
+    }
+
+    /// The tail, after giving the readers a bounded moment to finish.
+    ///
+    /// The pipe closes when the child exits, so this is normally instant: both
+    /// readers see EOF and end, and the lines are already here. It is bounded
+    /// anyway because a *grandchild* can inherit the pipe and hold it open — a
+    /// goose that spawned something of its own, or an `sh -c` that outlived it —
+    /// and nothing about a startup refusal is worth waiting on indefinitely.
+    ///
+    /// What this exists to fix: the tail used to be read on the same tick that
+    /// `try_wait` reported the exit, with no await in between, so a goose that
+    /// printed its reason and died at once could be refused with *"it printed
+    /// nothing"* — the one sentence the refusal exists to carry (build 54, a
+    /// loaded macOS agent). Reading the tail without this can be a lie; with it,
+    /// it is what the child said.
+    async fn drained(&self) -> String {
+        let readers: Vec<JoinHandle<()>> = match self.1.lock() {
+            Ok(mut readers) => readers.drain(..).collect(),
+            Err(poisoned) => poisoned.into_inner().drain(..).collect(),
+        };
+        let _ = tokio::time::timeout(OUTPUT_DRAIN, async move {
+            for reader in readers {
+                let _ = reader.await;
+            }
+        })
+        .await;
+        self.tail()
+    }
+
     fn push(&self, line: String) {
         let mut lines = match self.0.lock() {
             Ok(lines) => lines,
@@ -1010,12 +1060,14 @@ impl Tap {
     }
 }
 
-/// Copies a child's stream into the log and the [`Tap`].
+/// Copies a child's stream into the log and the [`Tap`], and hands back the task.
 ///
-/// The task is detached and ends when the stream does, which is when the child
-/// exits and its pipe closes. Nothing joins it: a reader task that outlives its
-/// child for a few milliseconds is not worth a handle nobody would ever await.
-fn echo<R>(reader: R, stream: &'static str, tap: Tap)
+/// The task ends when the stream does, which is when the child exits and its
+/// pipe closes. The handle is kept by the [`Tap`] so that a refusal can wait for
+/// the last line instead of reading whatever happened to be in the buffer
+/// ([`Tap::drained`]); it is not a task anything joins on the normal path, where
+/// the child outlives it.
+fn echo<R>(reader: R, stream: &'static str, tap: Tap) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -1025,7 +1077,7 @@ where
             tracing::info!(target: "goose_serve", stream, line = %line, "");
             tap.push(line);
         }
-    });
+    })
 }
 
 #[cfg(test)]
