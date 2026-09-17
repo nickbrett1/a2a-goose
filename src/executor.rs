@@ -126,6 +126,7 @@ impl GooseExecutor {
             context: None,
             cwd,
             prompt,
+            skill: resolved.skill_id.clone(),
             wall_clock: wall_clock(&self.config),
         })
     }

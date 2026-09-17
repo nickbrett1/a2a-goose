@@ -212,6 +212,34 @@ impl<S> Pool<S> {
             .map(|(context, _)| context.clone())
     }
 
+    /// Takes one context's session out, for a caller that means to close it:
+    /// the control surface's `DELETE /sessions/{contextId}`.
+    ///
+    /// The pool has no opinion about closing — it does no I/O — so the session
+    /// comes back to be closed by whoever asked for it, exactly as the eviction
+    /// paths do it.
+    pub fn take(&mut self, context: &str) -> Option<Idle<S>> {
+        self.idle.remove(context)
+    }
+
+    /// Whether a turn is running for this context right now.
+    ///
+    /// The control surface needs the distinction, and cannot get it from
+    /// [`Self::take`]: a checked-out session looks exactly like one that never
+    /// existed, and "your conversation is running" is not the same answer as
+    /// "you have no conversation" (rule 1).
+    pub fn is_claimed(&self, context: &str) -> bool {
+        self.claimed.contains(context)
+    }
+
+    /// Every session being held, with the context holding it. Read-only, for
+    /// `GET /sessions`; the pool is never modified by a listing.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Idle<S>)> {
+        self.idle
+            .iter()
+            .map(|(context, idle)| (context.as_str(), idle))
+    }
+
     /// How many sessions are being held. `/status` reads this.
     pub fn len(&self) -> usize {
         self.idle.len()
