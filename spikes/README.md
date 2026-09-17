@@ -39,7 +39,7 @@ assumption as **false**, and with it the reason it was assumed.
 | [S12](S12.md) | Does the published binary run on the target host? | **PASS on DSM** — the x86_64 musl static-PIE payload execs, `check-goose.sh` passes on the host, the version refusal precedes the bind, `/status` names the host's real goose, the manifest→tarball→running-payload digests agree, and a real turn answers `TASK_STATE_COMPLETED` with the host's name on LiteLLM's row; the darwin half was seen on mac-studio in S11/S14 |
 | [S13](S13.md) | Is `a2a-rs` wire-compatible with LiteLLM's A2A routes? | **PASS** — the framing agrees; the *card* needs work on our side |
 | [S14](S14.md) | Does the agent really own `goose serve`? | **PASS, box and darwin host** — starts, gates, restarts, refuses; DSM is [S8](S8.md) |
-| [S15](S15.md) | Can Open WebUI reach the agent through LiteLLM? | **SPLIT** — LiteLLM's `/a2a/{agent_id}` route reaches it and a real turn came back (`pong`), but the path an OpenAI-compatible client can use — an agent as a **model** (`a2a/<name>`) — is blocked: LiteLLM 1.103.0 sends the A2A **0.3** dialect (`message/send`) while `a2a-lf` speaks **1.0** (`SendMessage`), with no negotiation and no fallback. Decided: a small Open WebUI bridge onto the route |
+| [S15](S15.md) | Can Open WebUI reach the agent through LiteLLM? | **SPLIT** — LiteLLM's `/a2a/{agent_id}` route reaches it and a real turn came back (`pong`), but the path an OpenAI-compatible client can use — an agent as a **model** (`a2a/<name>`) — is blocked: LiteLLM 1.103.0 sends the A2A **0.3** dialect (`message/send`) while `a2a-lf` speaks **1.0** (`SendMessage`), with no negotiation and no fallback. Decided **and built the same day**: a small Open WebUI bridge onto the route (`integrations/openwebui/`), which answered a real turn through Open WebUI's own API — `zeta`, remembered on the second turn of the same chat (§7) |
 
 ## What the spikes changed
 
@@ -141,7 +141,9 @@ worth reading:
   `parts[{"kind":"text"}]` — hardcoded, card not consulted, no fallback on
   `method not found` — while `a2a-lf`/`a2a-server-lf` accept only the 1.0 names
   (`SendMessage`, `ROLE_USER`). So "the agent appears as a model in the proxy" is
-  not available to us, and Open WebUI needs one small function onto the route.
+  not available to us, and Open WebUI needs one small function onto the route —
+  which now exists (`integrations/openwebui/`), and answered a turn through Open
+  WebUI's own API on the NAS the same day.
   Two faults on the way: the proxy sends **no** credential unless told to
   (`static_headers` are honoured on the route, ignored by the model paths;
   `litellm_params.api_key` is stored and ignored everywhere), and the NAS agent
@@ -178,4 +180,4 @@ worth reading:
 | ----- | ---------- |
 | [S8](S8.md) | not blocked — the reboot is done. One measurement is still un-run but nothing gates on it: a real DSM **package** upgrade, whose answer ("cannot orphan the wrapper, because its `ppid` is 1") is structural. §5's registry lockout is a `registry.rs` fix, tracked there, not a spike blocker. |
 | S11 | item 4 (a bad download on a host) and the launcher **self-update's swap** — the verify-then-`cmp` path now runs on every start on both hosts, but no host has yet had a launcher actually replaced. The DSM half is no longer blocked: S8 ran the launcher there. |
-| [S15](S15.md) | not blocked — LiteLLM's route reaches the agent today. Owed rather than blocked: the Open WebUI bridge (**decided**, [S15](S15.md) §5), `static_headers` in `registry.rs` so the route has a credential, and a LiteLLM bug report (its A2A *model* paths send 0.3 method names to a card that advertises 1.0). |
+| [S15](S15.md) | not blocked — LiteLLM's route reaches the agent today, and the bridge onto it is built and measured ([S15](S15.md) §7, `integrations/openwebui/`). Owed rather than blocked: `static_headers` in `registry.rs` so the route's credential comes from the agent row rather than an admin's `PUT`, and a LiteLLM bug report (its A2A *model* paths send 0.3 method names to a card that advertises 1.0). |
