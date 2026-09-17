@@ -53,10 +53,14 @@
 #
 # S8 ran this on the box (v0.1.25, 2026-09-17): the task fires, the loop is
 # started, the payload and goose come up under it, a SIGTERM to the payload is
-# restarted, and the whole thing comes back from a cold start through the real
-# boot-up event. spikes/S8.md has the evidence and the two limits that remain (a
-# real reboot; a SIGKILLed payload leaves an orphaned goose the payload refuses
-# to adopt, so that one is a human's or a reboot's to fix).
+# restarted, and the whole thing comes back from a **real reboot** - one wrapper,
+# ppid 1, 2m27s from kernel boot to /healthz 200, with /volume1 mounted before the
+# boot-up task ran (esynoscheduler-bootup.service is After=basic.target). One
+# limit remains: a SIGKILLed payload leaves an orphaned goose the payload refuses
+# to adopt, so that is a human's or a reboot's to fix. spikes/S8.md has the
+# evidence, and §5 there records the one fault the reboot exposed that this script
+# cannot fix - the agent coming back healthy but permanently unregistered when the
+# proxy starts late (a registration-path bug, not a host-process one).
 #
 # What is run is the LAUNCHER, not the agent (hard constraint #14): the fetch
 # happens first, and the launcher ends in `exec`, so the payload replaces this

@@ -14,7 +14,8 @@ run on the **NAS** on 2026-09-17 against the live proxy (`litellm 1.103.0`), and
 **re-probed** the same day once the NAS's tailnet was fixed — the re-probe
 moved `card.url` to `http://100.77.144.14:10001`. S8 and S12 were run on the
 **NAS** on 2026-09-17 as well, against a published release (v0.1.25) — the first
-time either half of the DSM deployment has been exercised on the box. S12's run
+time either half of the DSM deployment has been exercised on the box, and S8 was
+then closed by a **real reboot** of the NAS. S12's run
 went past `/status` to a real A2A turn on the host (`TASK_STATE_COMPLETED`), the
 M3 control surface against a real runner, and a spend-log row naming the host.
 
@@ -27,7 +28,7 @@ M3 control surface against a real runner, and a spend-log row naming the host.
 | [S5](S5.md) | Does `DELETE /v1/agents/{id}` 404 on an already-deleted id? | **PASS** — 404; the sweeper's guard #3 holds |
 | [S6](S6.md) | Does the deployed goose advertise `sessionCapabilities.close`? | **PASS** — `close`, `list` and `delete` are all advertised |
 | [S7](S7.md) | Does `protocolVersion: "1.0"` survive a caller with no `a2a-version` header? | **PASS** — the server never reads the header |
-| [S8](S8.md) | Can the agent run as a host process on DSM 7? | **PASS** — one boot-up task, created by CLI, owned by init (`ppid 1`), bringing the agent up from a cold box; a real reboot is the one measurement outstanding |
+| [S8](S8.md) | Can the agent run as a host process on DSM 7? | **PASS** — one boot-up task, created by CLI, owned by init (`ppid 1`), bringing the agent up from a cold box **and from a real reboot** (2m27s kernel-boot→`/healthz`, `/volume1` mounted before the task ran). The reboot exposed a registry-lockout fault (§5) that is owed to `registry.rs`, not to this question |
 | [S9](S9.md) | Can the LiteLLM container reach the agent at its `card.url`? | **SPLIT** — addressing **PASS**, re-probed the same day: the **tailnet IP literal** `100.77.144.14:10001` works (the LAN literal it first passed on was a 24 h DHCP lease; the tailnet was unreachable when that was measured, then fixed); card fetch **FAIL** — LiteLLM 1.103.0 never fetches the card, 🚩 escalated, then **decided**: register the card ourselves |
 | [S10](S10.md) | Recipe mining: where do recipes live, and is the shape stable? | **PASS, with one correction to §6.1** |
 | [S11](S11.md) | Does the emitted launcher resolve the right triple, fail open, and *upgrade*? | **PASS on mac-studio** — the flip was a no-op on every upgrade, then fixed and proven by two real upgrades; item 4 and the DSM host pending |
@@ -37,7 +38,7 @@ M3 control surface against a real runner, and a spend-log row naming the host.
 
 ## What the spikes changed
 
-Nine spikes changed the plan, this repo, or the launcher. They are the ones
+Ten spikes changed the plan, this repo, or the launcher. They are the ones
 worth reading:
 
 - **S2** — cost control changes shape, twice over. goose 1.50.x cannot carry a
@@ -107,6 +108,23 @@ worth reading:
   answers a real ACP `initialize`, so the agent **correctly** declined to start
   (the check is a *dial*, and a forwarded port is indistinguishable from a local
   goose); the host moved `goose.acp.url` to `:3285`.
+- **S8** — the DSM half of the host-process deployment, closed by a **real
+  reboot**: one boot-up task created by CLI, owned by init (`ppid 1`), the agent
+  up 2m27s after kernel boot with `/volume1` already mounted (the boot-up unit is
+  `After=basic.target`). It corrected two of its own claims: the `while :` loop is
+  **not** a backstop for a late-mounting volume (the launcher existence check is
+  before the loop and `exit 1`s), and the wrapper's `logger` lines are **not**
+  reliably in the journal after a real boot — `boot.log` (the task's redirect) is
+  the log of record. The reboot also exposed a **registry lockout**, and this one
+  is not a host-process question: a node that beats its proxy at boot makes four
+  fast registration attempts, gives up, and never retries; and the previous run's
+  stale `LiteLLM_AgentsTable` row then turns every later attempt into
+  `500 Unique constraint failed on the fields: (agent_name)`. `GET /v1/agents`
+  returns `[]`, so the "update in place" path never fires. Net: an agent healthy
+  but **permanently** unregistered until the row is deleted by hand — the same
+  shape as S14, one level out: not "a healthy agent nobody can talk to" but "a
+  healthy agent nobody is registered to route to". The fix (bounded retry,
+  treat an `agent_name` conflict as an update) is owed to `registry.rs`.
 - **S7** — `A2A-Version` is **decorative**: the pinned server never reads it, so
   a caller without the header is indistinguishable from one with it. That voids
   the risk it was gating — and also voids the plan's implied "a wrong version
@@ -134,5 +152,5 @@ worth reading:
 
 | Spike | Blocked on |
 | ----- | ---------- |
-| S8 | one measurement: a real reboot of the NAS (the boot-up event itself has been fired for real, against a cold box). |
+| [S8](S8.md) | not blocked — the reboot is done. One measurement is still un-run but nothing gates on it: a real DSM **package** upgrade, whose answer ("cannot orphan the wrapper, because its `ppid` is 1") is structural. §5's registry lockout is a `registry.rs` fix, tracked there, not a spike blocker. |
 | S11 | item 4 (a bad download on a host) and the launcher **self-update's swap** — the verify-then-`cmp` path now runs on every start on both hosts, but no host has yet had a launcher actually replaced. The DSM half is no longer blocked: S8 ran the launcher there. |
