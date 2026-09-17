@@ -19,7 +19,7 @@ integrations/a2a-mcp/
 ├── wire_mcphub.py     registers the server in mcphub and offers it in every group
 ├── requirements.txt   pinned to what Open WebUI 0.11.3 itself runs
 ├── Dockerfile         python:3.12-slim, one dependency tree, unprivileged
-└── compose.yaml       the NAS stack (source of truth for the deployed copy)
+└── compose.yaml       the NAS stack: pulls the GHCR image, no local build
 ```
 
 ## The two tools
@@ -48,12 +48,17 @@ Three things are deliberately *not* done here, each for a measured reason
 
 ## Deploying on the NAS
 
+The image is built and published by CI — merging to `main` runs `:docker: Build
+and publish image (GHCR, a2a-mcp)` (after `:python: Test (a2a-mcp tools)`
+passes), which pushes `ghcr.io/nickbrett1/a2a-mcp:latest` for `linux/amd64`. The
+box only pulls it:
+
 ```bash
 sudo mkdir -p /volumeUSB1/usbshare/docker/a2a-mcp
 cd /volumeUSB1/usbshare/docker/a2a-mcp
-# copy server.py, test_server.py, smoke.py, requirements.txt, Dockerfile, compose.yaml
+# copy compose.yaml — the image comes from GHCR, nothing is built here
 umask 077 && printf 'LITELLM_API_KEY=%s\n' 'sk-…' > .env     # a **virtual** key
-sudo docker compose up -d --build
+sudo docker compose pull && sudo docker compose up -d
 ```
 
 `LITELLM_API_KEY` must be a LiteLLM virtual key, not the agent's bearer and not
@@ -64,9 +69,23 @@ The container joins the external `ai_proxy` network, which is where `litellm` an
 `mcphub` live too, so `http://litellm:4000/a2a` and the container's own name
 resolve without a published port. Traefik publishes it at
 **`http://100.82.223.13:8092/a2a-mcp/mcp`** for MCP clients elsewhere on the
-Tailnet. The image is built on the NAS rather than pushed, so
-`watchtower.enable=false`: after editing `server.py`, re-run
-`sudo docker compose up -d --build`.
+Tailnet.
+
+### Updating it
+
+Nothing to do by hand. The stack carries
+`com.centurylinklabs.watchtower.scope=nick`, so **watchtower-nick** (60s) pulls
+the new `latest` within a minute of the publish step finishing. To take a
+release immediately instead of waiting: `sudo docker compose pull`.
+`:latest` is retagged on every publish, so a bad one is fixed by publishing a
+good one rather than by rolling a tag back.
+
+To work on `server.py` on the box without publishing, add `build: .` to the NAS
+copy of `compose.yaml` and `sudo docker compose up -d --build` — a local override,
+not something to leave in the repo copy, which is the source of truth.
+
+The image is `linux/amd64` because the NAS is x86_64 while the CI agents are
+Apple silicon; the build step pins the platform rather than inheriting it.
 
 ## Wiring it in
 
