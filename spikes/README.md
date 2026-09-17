@@ -22,7 +22,7 @@ run on the **NAS** on 2026-09-17 against the live proxy (`litellm 1.103.0`).
 | [S6](S6.md) | Does the deployed goose advertise `sessionCapabilities.close`? | **PASS** — `close`, `list` and `delete` are all advertised |
 | [S7](S7.md) | Does `protocolVersion: "1.0"` survive a caller with no `a2a-version` header? | **PASS** — the server never reads the header |
 | [S8](S8.md) | Can the agent run as a host process on DSM 7? | **NOT RUN** — needs the NAS shell |
-| [S9](S9.md) | Can the LiteLLM container reach the agent at its `card.url`? | **SPLIT** — addressing **PASS** (LAN literal; no tailnet); card fetch **FAIL** — LiteLLM 1.103.0 never fetches the card, 🚩 escalated |
+| [S9](S9.md) | Can the LiteLLM container reach the agent at its `card.url`? | **SPLIT** — addressing **PASS** (LAN literal; no tailnet); card fetch **FAIL** — LiteLLM 1.103.0 never fetches the card, 🚩 escalated, then **decided**: register the card ourselves |
 | [S10](S10.md) | Recipe mining: where do recipes live, and is the shape stable? | **PASS, with one correction to §6.1** |
 | [S11](S11.md) | Does the emitted launcher resolve the right triple, fail open, and *upgrade*? | **PASS on mac-studio** — the flip was a no-op on every upgrade, then fixed and proven by two real upgrades; item 4 and the DSM host pending |
 | [S12](S12.md) | Does the published binary run on the target host? | **NOT RUN** — needs both hosts and a release |
@@ -73,7 +73,11 @@ worth reading:
   (`HTTP 400: URL targets a blocked address (192.168.1.33)`) until the host is in
   `user_url_allowed_hosts`. 🚩 §12.6: getting our skills into the registry is a
   decision (send the assembled card, add a discover+PUT reconciler, or fork
-  LiteLLM), not a workaround.
+  LiteLLM), not a workaround. **Decided: send the assembled card** — the
+  registration body now carries the card `card::assemble` builds (commit
+  `e7bffb9`), verified end-to-end against the live proxy (stored `skills:
+  ['ask']`). The reconciler and the fork remain the options only if the registry
+  must track a **live** recipe edit without a restart.
 - **S14** — the deploy tree shipped one unit, the launcher's, and **nothing
   started `goose serve`**: on reboot the agent came back, served a card, accepted
   calls and failed every turn with `connection refused` on `:3284` — a
