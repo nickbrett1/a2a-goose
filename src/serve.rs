@@ -75,6 +75,54 @@ use crate::goose::Goose;
 /// first is mapped onto the second.
 pub const GOOSE_SECRET_ENV: &str = "GOOSE_SERVER__SECRET_KEY";
 
+/// The variable a host's identity rides to LiteLLM.
+///
+/// Not ours and not goose's own either: it is goose's passthrough for
+/// OpenAI-compatible providers, and LiteLLM turns the `User-Agent` in it into
+/// `metadata.user_agent` on every spend-log row. It is read here for one reason —
+/// the value has to be *parseable by goose*, and the spellings that are not are
+/// the two everyone writes first.
+pub const CUSTOM_HEADERS_ENV: &str = "LITELLM_CUSTOM_HEADERS";
+
+/// Refuses an inherited `LITELLM_CUSTOM_HEADERS` that goose cannot read.
+///
+/// The child goose is handed this process's environment whole, deliberately (see
+/// [`spawn_child`]), so a value that merely *looks* like headers is a value that
+/// costs every turn this host will ever answer. Two shapes are known-bad, both
+/// measured on the NAS against goose 1.50.0 (`spikes/S12.md`):
+///
+/// - a **JSON object** — `{"User-Agent":"a2a-goose/nas"}` — which is the spelling
+///   every template shipped: goose exits `Error invalid HTTP header name`, so
+///   every turn answers `-32603 … "Provider not set"`, a message that points at
+///   the provider rather than at the header;
+/// - **`name=value`**, which goose accepts and drops: the host answers turns, and
+///   LiteLLM's rows come back with an empty `user_agent`. The quiet version of
+///   the same mistake, and the reason this is a refusal rather than a warning.
+///
+/// A refusal at startup, before a port is bound, for the same reason the version
+/// gate is: an agent that advertises skills and then fails every turn is worse
+/// than one that does not start.
+pub fn check_child_env(read: impl Fn(&str) -> Option<String>) -> Result<(), ServeError> {
+    let Some(value) = read(CUSTOM_HEADERS_ENV) else {
+        return Ok(());
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    if trimmed.starts_with('{') {
+        return Err(ServeError::UnusableCustomHeaders {
+            shape: "a JSON object",
+        });
+    }
+    if !value.contains(':') && value.contains('=') {
+        return Err(ServeError::UnusableCustomHeaders {
+            shape: "`name=value`",
+        });
+    }
+    Ok(())
+}
+
 /// goose's own refusal, quoted in ours so an operator reads it once, in the
 /// place they were already looking.
 const GOOSE_ON_MISSING_KEY: &str = "GOOSE_SERVER__SECRET_KEY must be set to start `goose serve`; \
@@ -288,6 +336,17 @@ pub enum ServeError {
          goose.acp.serve to \"external\" if that server is yours to manage"
     )]
     AlreadyRunning { address: String, detail: String },
+
+    #[error(
+        "{CUSTOM_HEADERS_ENV} is not something goose can read - it is {shape}. goose parses that \
+         variable as `Name: value` lines (newline-separated when there is more than one header). \
+         A JSON object makes goose exit `Error invalid HTTP header name`, so every turn of a host \
+         started on one answers -32603 … \"Provider not set\"; a `name=value` spelling is \
+         accepted and silently drops the header, so the host answers turns and LiteLLM's rows \
+         carry no user_agent. Write it as, for example, 'User-Agent: a2a-goose/<host>' \
+         (spikes/S12.md measured both)"
+    )]
+    UnusableCustomHeaders { shape: &'static str },
 
     #[error("could not start {path}: nothing was spawned, so nothing is running: {source}")]
     Spawn {
@@ -1086,6 +1145,51 @@ mod tests {
 
     fn address(url: &str) -> AcpAddress {
         acp_address(url).expect("test url")
+    }
+
+    /// The two spellings goose will not read, and the two it will.
+    ///
+    /// Measured on the NAS (spikes/S12.md): the JSON one cost a host every turn
+    /// it answered, with an error naming the *provider*; the `name=value` one
+    /// cost it the attribution it was deployed for, silently. Both were in the
+    /// templates.
+    #[test]
+    fn a_header_value_goose_cannot_parse_is_refused_before_anything_binds() {
+        let env = |value: &'static str| {
+            move |name: &str| (name == CUSTOM_HEADERS_ENV).then(|| value.to_string())
+        };
+
+        for bad in [
+            r#"{"User-Agent":"a2a-goose/nas"}"#,
+            r#"  {"User-Agent":"a2a-goose/nas"}"#,
+            "User-Agent=a2a-goose/nas",
+        ] {
+            let err = check_child_env(env(bad)).expect_err(bad);
+            assert!(
+                matches!(err, ServeError::UnusableCustomHeaders { .. }),
+                "{bad}: {err}"
+            );
+            // The message has to name the mistake and the cure, because the
+            // symptom it replaces names neither.
+            assert!(err.to_string().contains("Name: value"), "{err}");
+            assert!(
+                err.to_string().contains("User-Agent: a2a-goose/<host>"),
+                "{err}"
+            );
+        }
+
+        for good in [
+            "User-Agent: a2a-goose/nas",
+            "User-Agent:a2a-goose/nas",
+            "x-a: 1\nx-b: 2",
+            "",
+            "   ",
+        ] {
+            check_child_env(env(good)).unwrap_or_else(|err| panic!("{good}: {err}"));
+        }
+
+        // No launcher, no variable: an unmanaged host is not a broken one.
+        check_child_env(|_| None).expect("unset is fine");
     }
 
     #[test]

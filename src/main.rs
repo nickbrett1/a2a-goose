@@ -7,10 +7,10 @@
 //! Everything that can be known wrong at startup is refused here, in the order
 //! that fails fastest: goose (a host prerequisite that is verified and never
 //! installed, constraint #8), then the configuration and the skill catalogue,
-//! then the bearer token, then the listen address. Nothing binds a port until
-//! all of them are good, because an agent that starts and then cannot serve is
-//! worse than one that does not start: it advertises skills in the LiteLLM
-//! registry and fails every turn.
+//! then the bearer token, then the environment the child goose will inherit,
+//! then the listen address. Nothing binds a port until all of them are good,
+//! because an agent that starts and then cannot serve is worse than one that does
+//! not start: it advertises skills in the LiteLLM registry and fails every turn.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,7 +19,7 @@ use a2a_goose::acp::AcpTurns;
 use a2a_goose::config::{Config, ServeMode};
 use a2a_goose::goose::{Goose, MIN_GOOSE_VERSION};
 use a2a_goose::registry::Registry;
-use a2a_goose::serve::{ServeState, ServeStatus, Supervisor};
+use a2a_goose::serve::{ServeState, ServeStatus, Supervisor, check_child_env};
 use a2a_goose::server::Agent;
 use a2a_goose::skills::SkillSet;
 use a2a_goose::turn::Turns;
@@ -76,7 +76,13 @@ async fn run() -> anyhow::Result<()> {
     // which is exactly what the first host did after a reboot (nothing had
     // started `goose serve`, and nothing said so).
     let supervisor = match config.goose.acp.serve {
-        ServeMode::Own => Some(Supervisor::start(&config, &goose).await?),
+        ServeMode::Own => {
+            // The child inherits this environment whole, so a host's identity
+            // line has to be one goose can parse - the two spellings it cannot
+            // are both refused here rather than discovered per turn.
+            check_child_env(|name| std::env::var(name).ok())?;
+            Some(Supervisor::start(&config, &goose).await?)
+        }
         ServeMode::External => {
             tracing::info!(
                 acp = %config.goose.acp.url,
