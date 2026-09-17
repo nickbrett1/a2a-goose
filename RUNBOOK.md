@@ -119,11 +119,18 @@ which is why the card's `url` is the tailnet address. Treat "the port is taken
 and nothing is listening" as *the editor's*, and check `lsof -nP -iTCP:<port>`
 before believing `ps`.
 
-**Turn latency is not one number.** Measured through `/a2a/{agent_id}` on this
-host: **~8 minutes** for the first turn on a fresh `contextId` (a new goose
-session — session and extension startup), **2 s** for the next turn on the same
-one. A caller that times out at 90 s or 240 s loses a turn that did run. Prefer
-reusing a `contextId`; treat the first turn per context as the expensive one.
+**Turn latency is the task, and nothing else.** S17 briefly recorded **~8
+minutes** for the first turn on a fresh `contextId` and blamed session startup;
+[S18](spikes/S18.md) overturns that by measurement on this host. A brand-new
+`contextId` on a warm payload answers in **1.9 s**, the first turn after a
+`SIGTERM` restart in **2.4 s**, three simultaneous turns on three new contexts
+on a just-restarted payload in **2.4–2.8 s** each, and a substantive tool-using
+turn in **3.9 s**. There is no warm-up to buy: size a caller's timeout to the
+task, not to startup. Keep the two habits that are still worth it — reuse a
+`contextId` for continuity, and make a long-running agent **write its result
+down** before it explains, so a caller that gives up at 90 s loses the reply and
+not the work. Note also that **`agent_id` changes on every payload restart**:
+resolve agents by name, never hold a literal id.
 
 ## The three framings that keep being asked for
 
