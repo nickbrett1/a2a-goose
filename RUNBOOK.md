@@ -130,7 +130,56 @@ task, not to startup. Keep the two habits that are still worth it — reuse a
 `contextId` for continuity, and make a long-running agent **write its result
 down** before it explains, so a caller that gives up at 90 s loses the reply and
 not the work. Note also that **`agent_id` changes on every payload restart**:
-resolve agents by name, never hold a literal id.
+resolve agents by name, never hold a literal id. The agent does keep the last id
+it registered under (`registry.agentIdPath`) and checks it by id when the listing
+does not show it, but that is a validated hint and not an identity — after a
+graceful restart the id it remembers is usually a `404`, and the right answer
+there is a fresh create (see "The registry entry can be present and invisible").
+
+## The registry entry can be present and invisible
+
+Measured 2026-09-18, on the live proxy, after a LiteLLM upgrade.
+
+**The symptom is a lie the roster tells.** `list_agents` (and `GET /v1/agents`)
+returned `[]` while all three agents answered `200` at their own addresses, the
+proxy was healthy, and `/status` on a restarted host said registration had
+failed with `Unique constraint failed on the fields: (agent_name)`. Nothing was
+lost: every row was still there, still callable through `/a2a/{id}`, and still
+readable with `GET /v1/agents/{id}`.
+
+**The cause is the listing's owner filter, not `is_public`.** `GET /v1/agents`
+returns only what the calling key owns — every row carries
+`created_by`/`updated_by` (all `default_user_id` here). Rows written by the
+build that ran before the upgrade carried no such stamp, so the list omitted
+them while the by-id read, which is *not* filtered, returned them. The
+`is_public` explanation that fits the shape is wrong, and was disproved by
+probe: a row lists with `litellm_params: {}`, with `litellm_params`
+populated, and with `is_public` absent. It is worth knowing which half of the
+API is a view and which is the record.
+
+**A restart used to make it worse, and no longer can.** Registration asks the
+listing "am I already here?" — so a hidden row read as absent, the host `POST`ed
+a name that was taken, and it needed the listing to find the id of the entry it
+could not see. It now remembers the id it registered under
+(`registry.agentIdPath`, default `~/.local/share/a2a-goose/registry-agent-id`)
+and falls back to `GET /v1/agents/{id}` when the listing comes up empty. The
+fallback is validated, not trusted: a `404` means the row is genuinely gone (a
+graceful restart deregisters, so this is the *normal* case) and a row that now
+carries another name is never adopted. Either way the resolution is announced at
+`warn`, because this is the class of failure a green "registered" log line
+cannot see.
+
+**What an operator does when it fires.** The row has to be made visible again,
+with an **admin** key: `PUT /v1/agents/{id}` with the stored
+`agent_card_params` and `static_headers` (the row's own token is readable from
+the row, so resupply it and nothing is lost). Note that `internal_user` keys
+cannot touch agents at all — `403 {"detail":{"error":"Only proxy admins can
+create, update, or delete agents. Your role=internal_user"}}` — which is a
+second reason registration needs the master key and not a scoped virtual one.
+
+**Do not read the roster as a liveness check.** It is a listing, and the listing
+can be wrong in both directions; the callable thing is the card, and the only
+proof an agent works is a turn.
 
 ## The three framings that keep being asked for
 

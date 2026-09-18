@@ -147,6 +147,13 @@ registry:
   litellmBaseUrl: "http://nas:4000"
   masterKeyEnv: "LITELLM_MASTER_KEY"
   agentName: "mac-studio-goose"
+  # Where the agent id LiteLLM assigned is remembered between runs. Not
+  # bookkeeping: GET /v1/agents is filtered by the calling key's owner, so a row
+  # written before that filter existed (or by another key) is absent from the
+  # listing while remaining present and addressable by GET /v1/agents/{id}. The
+  # remembered id is how "not listed" is told apart from "not registered" - see
+  # RUNBOOK.md, "The registry entry can be present and invisible".
+  agentIdPath: "~/.local/share/a2a-goose/registry-agent-id"
   # Hash the assembled card at boot and compare with the last registered hash;
   # on change, DELETE then POST. Skills do not auto-propagate through LiteLLM,
   # so this is how "edit a recipe, restart" converges the registry.
