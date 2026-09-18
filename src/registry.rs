@@ -11,6 +11,26 @@
 //! DELETE /v1/agents/{id}
 //! ```
 //!
+//! **The listing is a view, and it can hide us.** `GET /v1/agents` is filtered
+//! by the calling key's owner: measured 2026-09-18 against the live proxy, every
+//! row carries `created_by`/`updated_by`, and the listing shows what that key
+//! owns. (The same measurement rules out what first looked like the cause: a row
+//! lists with `litellm_params: {}`, with `litellm_params` populated, and with
+//! `is_public` absent, so `is_public` is not the filter — and `GET
+//! /v1/agents/{id}`, which is *not* filtered, answers for a row the listing
+//! omits.) After an upgrade, rows written by the older build carried no owner
+//! stamp and disappeared from the listing while remaining present, callable and
+//! addressable by id. Because the lookup below *is* that listing, a restarted
+//! host read itself as absent, `POST`ed a name that was already taken, and had
+//! no way back: its entry was there, working, and unreachable from here.
+//!
+//! So the id is remembered ([`crate::config::Registry::agent_id_path`], beside
+//! `sessions.db`) and the lookup degrades: the listing first, then `GET
+//! /v1/agents/{id}` with the id this host registered under. A proxy that changes
+//! what the listing shows can no longer wedge a host that has registered once,
+//! and the recovery is announced rather than silent — this is exactly the class
+//! of failure that a green "registered" line in a log cannot detect.
+//!
 //! **Why a lookup first, and a PUT rather than a second POST.** `POST
 //! /v1/agents` with a name that is already taken is a hard `400 {"detail":
 //! "Agent with name ... already exists"}` (measured, [S13](../../spikes/S13.md)),
@@ -116,8 +136,26 @@ impl RegistryState {
 pub enum RegistryError {
     NotConfigured,
     Request(reqwest::Error),
-    Status { status: u16, body: String },
-    NoAgentId { body: String },
+    Status {
+        status: u16,
+        body: String,
+    },
+    NoAgentId {
+        body: String,
+    },
+    /// The name is taken, but this host could not learn the id of the entry
+    /// holding it — so the entry cannot be rewritten or adopted, and retrying
+    /// only repeats the refusal.
+    ///
+    /// Distinct from a plain [`RegistryError::Status`] on purpose: the proxy
+    /// answering "duplicate name" is *proof the entry exists*, and reporting
+    /// that as a generic 500 makes a recoverable identity problem read like a
+    /// proxy fault. The honest report is "you are registered and this host
+    /// cannot see or manage its own entry", which is a listing problem.
+    NameTakenUnresolvable {
+        name: String,
+        body: String,
+    },
 }
 
 impl std::fmt::Display for RegistryError {
@@ -135,6 +173,15 @@ impl std::fmt::Display for RegistryError {
                 f,
                 "LiteLLM accepted the registration but returned no agent_id, so it cannot be \
                  deleted later: {body}"
+            ),
+            Self::NameTakenUnresolvable { name, body } => write!(
+                f,
+                "LiteLLM refused to create `{name}` because the name is already taken, and its \
+                 listing does not show the entry that holds it, so the id cannot be read: \
+                 {body}. The entry exists and may be serving; this host simply cannot see it. \
+                 That is a listing-filter problem, not a proxy fault — see RUNBOOK.md, \
+                 \"the roster is filtered by owner\". Restoring visibility of the row (an admin \
+                 PUT, from an admin key) is what clears it."
             ),
         }
     }
@@ -188,6 +235,10 @@ struct Client {
     /// the existing entry and leaves its card alone, for a host whose registry
     /// entry is managed from elsewhere.
     re_register_on_card_change: bool,
+    /// Where the id LiteLLM assigned is remembered between runs. The one handle
+    /// a filtered listing cannot take away; see the module comment. `None` only
+    /// in tests that do not exercise the persistence.
+    agent_id_path: Option<std::path::PathBuf>,
     http: reqwest::Client,
 }
 
@@ -215,6 +266,7 @@ impl Registry {
                 agent_name: config.registry.agent_name.clone(),
                 bearer_token: config.bearer_token().ok(),
                 re_register_on_card_change: config.registry.re_register_on_card_change,
+                agent_id_path: Some(config.registry.agent_id_path.clone()),
                 http: reqwest::Client::new(),
             })
         });
@@ -498,7 +550,17 @@ impl Client {
     /// The agent id already listed under this host's name, if any.
     ///
     /// A list scan rather than a query, because LiteLLM's `GET /v1/agents` takes
-    /// no name filter. One host has one entry, so the scan is over a handful.
+    /// no usable name filter (`?query=` wants an embedding model configured;
+    /// `?agent_name=` is ignored). One host has one entry, so the scan is over a
+    /// handful.
+    ///
+    /// **The scan is not authoritative.** The listing is filtered by owner, so a
+    /// row this host owns but the calling key cannot see reads as absent — see
+    /// the module comment. When the scan comes up empty, the id this host
+    /// remembered from its last registration is checked directly with `GET
+    /// /v1/agents/{id}`, which is not filtered. That is the whole point: "not
+    /// listed" and "not registered" are different, and only one of them is a
+    /// reason to create.
     async fn find_agent_id(&self) -> Result<Option<String>, RegistryError> {
         let response = self
             .http
@@ -516,7 +578,109 @@ impl Client {
             });
         }
 
-        find_by_name(&text, &self.agent_name)
+        if let Some(id) = find_by_name(&text, &self.agent_name)? {
+            return Ok(Some(id));
+        }
+
+        self.agent_id_by_remembered_id().await
+    }
+
+    /// The id remembered from a previous registration, if the proxy still holds
+    /// a row under it and that row is still ours.
+    ///
+    /// Three answers, and each has a different consequence:
+    /// a row that is ours — taken, so the caller updates it in place;
+    /// a row that is gone (404) — `None`, so the caller creates;
+    /// a row that is now *someone else's name* — `None`, so the caller creates
+    /// and the proxy refuses the name, which is reported honestly rather than
+    /// silently adopting a row that is not ours.
+    async fn agent_id_by_remembered_id(&self) -> Result<Option<String>, RegistryError> {
+        let Some(remembered) = self.remembered_agent_id() else {
+            return Ok(None);
+        };
+
+        let response = self
+            .http
+            .get(format!("{}/v1/agents/{remembered}", self.base_url))
+            .bearer_auth(&self.master_key)
+            .send()
+            .await?;
+
+        let status = response.status();
+        let text = response.text().await?;
+        if status.as_u16() == 404 {
+            tracing::debug!(agent_id = %remembered, "the remembered agent id is gone; creating");
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(RegistryError::Status {
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+
+        let listed = serde_json::from_str::<Value>(&text).ok().and_then(|value| {
+            value
+                .get("agent_name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+        if listed.as_deref() != Some(self.agent_name.as_str()) {
+            tracing::warn!(
+                agent_id = %remembered,
+                listed = ?listed,
+                ours = %self.agent_name,
+                "the remembered id now names a different agent; not adopting it"
+            );
+            return Ok(None);
+        }
+
+        // Loud on purpose. This is the path that a proxy upgrade silently
+        // creates: the host IS registered, the listing just does not say so,
+        // and every symptom from here on (a duplicate-name POST, an entry that
+        // cannot be rewritten) is a consequence. Called out so the cause is not
+        // mistaken for it.
+        tracing::warn!(
+            agent_id = %remembered,
+            "the LiteLLM agent listing does not show this host, but the by-id read does; \
+             resolving by remembered id. The listing is filtered — see RUNBOOK.md"
+        );
+        Ok(Some(remembered))
+    }
+
+    /// Persists the id, so a filtered listing cannot hide this host next boot.
+    ///
+    /// Failure is logged and swallowed: un-writable state costs a stale-looking
+    /// `/status` after a restart, which is not a reason to fail a registration
+    /// that otherwise succeeded.
+    fn remember_agent_id(&self, agent_id: &str) {
+        let Some(path) = &self.agent_id_path else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                tracing::warn!(path = %parent.display(), error = %err, "could not create the state directory for the remembered agent id");
+                return;
+            }
+        }
+        // Written to a sibling and renamed, so a reader never sees a half-written
+        // id (the file is read at boot, while another process may be writing it).
+        let temporary = path.with_extension("writing");
+        if let Err(err) = std::fs::write(&temporary, format!("{agent_id}\n")) {
+            tracing::warn!(path = %temporary.display(), error = %err, "could not remember the agent id");
+            return;
+        }
+        if let Err(err) = std::fs::rename(&temporary, path) {
+            tracing::warn!(path = %path.display(), error = %err, "could not remember the agent id");
+        }
+    }
+
+    /// The id remembered from a previous registration, if any.
+    fn remembered_agent_id(&self) -> Option<String> {
+        let path = self.agent_id_path.as_ref()?;
+        let id = std::fs::read_to_string(path).ok()?;
+        let id = id.trim();
+        (!id.is_empty()).then(|| id.to_string())
     }
 
     async fn register(&self, card: &AgentCard) -> Result<Registration, RegistryError> {
@@ -527,17 +691,22 @@ impl Client {
         let body = registration_body(&self.agent_name, card, self.bearer_token.as_deref());
 
         let existing = self.find_agent_id().await?;
-        match plan(existing, self.re_register_on_card_change) {
+        let registration = match plan(existing, self.re_register_on_card_change) {
             Plan::Create => match self.send(reqwest::Method::POST, "/v1/agents", &body).await {
                 Ok(text) => parse_registration(&text),
                 // The name is taken although the listing did not show it: the
                 // entry appeared between the scan and the POST, or the listing
-                // was filtered by the key we registered with. Either way we now
+                // is filtered by the key we registered with. Either way we now
                 // know an id exists for our name, so the reclaim is another
-                // scan and an in-place rewrite — the same `Plan::Update` the
+                // lookup and an in-place rewrite — the same `Plan::Update` the
                 // happy path would have taken, reached one request later.
                 Err(err) if err.is_duplicate_name() => {
-                    let agent_id = self.find_agent_id().await?.ok_or(err)?;
+                    let agent_id = self.find_agent_id().await?.ok_or(
+                        RegistryError::NameTakenUnresolvable {
+                            name: self.agent_name.clone(),
+                            body: err.to_string(),
+                        },
+                    )?;
                     tracing::warn!(
                         %agent_id,
                         "the name was already taken on POST; reclaiming the existing entry"
@@ -578,7 +747,13 @@ impl Client {
                 let text = self.get_agent(&agent_id).await?;
                 parse_registration_with(&text, Some(&agent_id))
             }
-        }
+        }?;
+
+        // Kept so that a listing which later stops showing this host cannot make
+        // it look unregistered — the failure this file was taught about the hard
+        // way. Cheap, and the only thing here that survives the process.
+        self.remember_agent_id(&registration.agent_id);
+        Ok(registration)
     }
 
     /// One authenticated request, returning the body or a status error.
@@ -852,6 +1027,217 @@ mod tests {
         );
     }
 
+    /// A stub whose listing **never** shows our entry, whatever happens — the
+    /// live failure: `GET /v1/agents` filters by owner, so a row the proxy holds
+    /// and serves is absent from the listing for good, not just for a moment.
+    /// `by_id` is the row behind the remembered id, or `None` for the 404 that
+    /// means "genuinely gone". `name_taken` is whether a create is refused.
+    #[derive(Clone)]
+    struct Filtered {
+        calls: Arc<Mutex<Vec<String>>>,
+        by_id: Option<&'static str>,
+        name_taken: bool,
+    }
+
+    async fn filtered_stub(
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+        axum::extract::State(stub): axum::extract::State<Filtered>,
+    ) -> (axum::http::StatusCode, axum::Json<Value>) {
+        use axum::http::StatusCode;
+
+        let path = uri.path().to_string();
+        stub.calls
+            .lock()
+            .expect("call log")
+            .push(format!("{method} {path}"));
+
+        let row = |name: &str| {
+            serde_json::json!({
+                "agent_id": "id-1",
+                "agent_name": name,
+                "agent_card_params": {"name": name, "skills": []},
+            })
+        };
+
+        match (method.as_str(), path.as_str()) {
+            ("GET", "/v1/agents") => (StatusCode::OK, axum::Json(serde_json::json!([]))),
+            ("GET", "/v1/agents/id-1") => match stub.by_id {
+                Some(name) => (StatusCode::OK, axum::Json(row(name))),
+                None => (
+                    StatusCode::NOT_FOUND,
+                    axum::Json(serde_json::json!({"detail": "Agent with ID id-1 not found"})),
+                ),
+            },
+            ("PUT", "/v1/agents/id-1") => (StatusCode::OK, axum::Json(row("mac-studio-goose"))),
+            ("POST", "/v1/agents") if stub.name_taken => (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "detail": "Agent with name mac-studio-goose already exists"
+                })),
+            ),
+            ("POST", "/v1/agents") => (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "agent_id": "id-2",
+                    "agent_name": "mac-studio-goose",
+                    "agent_card_params": {"name": "mac-studio-goose", "skills": []},
+                })),
+            ),
+            _ => (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({}))),
+        }
+    }
+
+    async fn stub_filtered(
+        by_id: Option<&'static str>,
+        name_taken: bool,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .fallback(filtered_stub)
+            .with_state(Filtered {
+                calls: calls.clone(),
+                by_id,
+                name_taken,
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        (format!("http://{addr}"), calls)
+    }
+
+    /// A path in a per-test temporary directory, with the file already holding
+    /// `contents` (the id a previous run remembered).
+    fn remembered_id_path(test: &str, contents: Option<&str>) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("a2a-goose-registry-{test}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("registry-agent-id");
+        match contents {
+            Some(text) => std::fs::write(&path, text).expect("seed the remembered id"),
+            None => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        path
+    }
+
+    #[tokio::test]
+    async fn a_listing_that_hides_us_is_resolved_by_the_id_we_remembered() {
+        // The live failure, 2026-09-18: the proxy holds the row, the listing
+        // does not show it, and the by-id call does. Without this fallback the
+        // host reads itself as absent, POSTs a duplicate name, and reports
+        // itself unregistered while callers reach it perfectly well.
+        let (base, calls) = stub_filtered(Some("mac-studio-goose"), true).await;
+        let path = remembered_id_path("hides-us", Some("id-1\n"));
+
+        let registration = client_with_state(base, true, Some(path))
+            .register(&test_card("http://mac-studio.tail86fd19.ts.net:10099"))
+            .await
+            .expect("the remembered id resolves the entry the listing hides");
+
+        assert_eq!(registration.agent_id, "id-1");
+        assert_eq!(
+            *calls.lock().expect("call log"),
+            vec![
+                "GET /v1/agents",
+                "GET /v1/agents/id-1",
+                "PUT /v1/agents/id-1"
+            ],
+            "a filtered listing, the by-id lookup that replaces it, then the rewrite"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remembered_id_the_proxy_no_longer_holds_does_not_stop_a_create() {
+        // A 404 is the honest "gone": the row was swept, or the proxy was
+        // rebuilt. Falling back to create — rather than treating a stale local
+        // file as truth — is what keeps this from becoming its own wedge.
+        let (base, calls) = stub_filtered(None, false).await;
+        let path = remembered_id_path("id-gone", Some("id-1\n"));
+
+        let registration = client_with_state(base, true, Some(path.clone()))
+            .register(&test_card("http://mac-studio.tail86fd19.ts.net:10099"))
+            .await
+            .expect("a gone id means create");
+
+        assert_eq!(registration.agent_id, "id-2");
+        assert_eq!(
+            *calls.lock().expect("call log"),
+            vec!["GET /v1/agents", "GET /v1/agents/id-1", "POST /v1/agents"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("remembered").trim(),
+            "id-2",
+            "the new id replaces the stale one, so the next boot resolves"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remembered_id_that_now_names_someone_else_is_never_adopted() {
+        // Ids are the proxy's to reassign; a remembered one is a hint, not an
+        // identity. Adopting a row under another agent's name would rewrite
+        // *their* card with ours — worse than failing.
+        let (base, calls) = stub_filtered(Some("someone-else"), true).await;
+        let path = remembered_id_path("someone-else", Some("id-1\n"));
+
+        let err = client_with_state(base, true, Some(path))
+            .register(&test_card("http://mac-studio.tail86fd19.ts.net:10099"))
+            .await
+            .expect_err("a row that is not ours cannot be adopted");
+
+        assert!(
+            matches!(err, RegistryError::NameTakenUnresolvable { .. }),
+            "the honest report is `name taken and unresolvable`, not a proxy fault: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("listing does not show"),
+            "the message names the cause, so the fix is not looked for in the proxy: {err}"
+        );
+        assert!(
+            !calls
+                .lock()
+                .expect("call log")
+                .iter()
+                .any(|call| call.starts_with("PUT")),
+            "and nothing of ours was written over it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_registration_remembers_the_id_it_was_given() {
+        // The other half of the fix: a host that has registered once can always
+        // resolve itself, whatever the listing decides to show tomorrow.
+        let (base, _calls) = stub_litellm(false).await;
+        let path = remembered_id_path("remembers", None);
+
+        client_with_state(base, true, Some(path.clone()))
+            .register(&test_card("http://mac-studio.tail86fd19.ts.net:10099"))
+            .await
+            .expect("register");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("remembered").trim(),
+            "id-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_registration_with_nowhere_to_remember_still_succeeds() {
+        // Persistence is an improvement, not a precondition: an unwritable or
+        // unconfigured state path must not fail a registration that worked.
+        let (base, _calls) = stub_litellm(false).await;
+        let registration = client_against(base, true)
+            .register(&test_card("http://mac-studio.tail86fd19.ts.net:10099"))
+            .await
+            .expect("register");
+        assert_eq!(registration.agent_id, "id-1");
+    }
+
     #[test]
     fn the_registration_body_carries_our_skills_not_a_stub() {
         // S9: LiteLLM never fetches `card.url`, so a body without skills means
@@ -1117,12 +1503,24 @@ mod tests {
     }
 
     fn client_against(base_url: String, may_rewrite: bool) -> Client {
+        client_with_state(base_url, may_rewrite, None)
+    }
+
+    /// A client that also has somewhere to remember its agent id. `None` is the
+    /// no-persistence case, which is what most tests want; the tests that
+    /// exercise the fallback pass a real path in a temporary directory.
+    fn client_with_state(
+        base_url: String,
+        may_rewrite: bool,
+        agent_id_path: Option<PathBuf>,
+    ) -> Client {
         Client {
             base_url,
             master_key: "sk-test".to_string(),
             agent_name: "mac-studio-goose".to_string(),
             bearer_token: Some("agent-serving-token".to_string()),
             re_register_on_card_change: may_rewrite,
+            agent_id_path,
             http: reqwest::Client::new(),
         }
     }

@@ -352,6 +352,18 @@ pub struct Registry {
     pub master_key_env: String,
     #[serde(default = "default_card_name")]
     pub agent_name: String,
+    /// Where this host remembers the `agent_id` LiteLLM gave it.
+    ///
+    /// Not bookkeeping: the id is the only handle a filtered listing cannot take
+    /// away. `GET /v1/agents` is a *view* — LiteLLM 1.103.x returns only the rows
+    /// the calling key owns, so a row written before that filter existed (or by
+    /// another key) is absent from the listing while remaining present, callable
+    /// and addressable by `GET /v1/agents/{id}`. Without the id, such a host
+    /// cannot find itself, `POST`s a duplicate name, and reports itself
+    /// unregistered while the proxy still holds a working entry. With it, the
+    /// lookup degrades to the by-id call and converges.
+    #[serde(default = "default_registry_agent_id_path")]
+    pub agent_id_path: PathBuf,
     /// Whether this process may **rewrite** a registry entry that already exists
     /// under this host's name. On (the default) a restart converges the entry
     /// onto the card this process is serving — `PUT /v1/agents/{id}`, in place,
@@ -382,6 +394,7 @@ impl Default for Registry {
             litellm_base_url: default_litellm_base_url(),
             master_key_env: default_master_key_env(),
             agent_name: default_card_name(),
+            agent_id_path: default_registry_agent_id_path(),
             re_register_on_card_change: true,
             limits: Limits::default(),
             attribution: Attribution::default(),
@@ -613,6 +626,12 @@ fn default_master_key_env() -> String {
     "LITELLM_MASTER_KEY".to_string()
 }
 
+/// Beside `sessions.db`: this is state this process owns, not configuration an
+/// operator edits.
+fn default_registry_agent_id_path() -> PathBuf {
+    PathBuf::from("~/.local/share/a2a-goose/registry-agent-id")
+}
+
 fn default_trace_id_header() -> String {
     "x-litellm-trace-id".to_string()
 }
@@ -842,6 +861,7 @@ impl Config {
             .map(|path| expand_tilde(path))
             .collect();
         self.goose.sessions.db_path = expand_tilde(&self.goose.sessions.db_path);
+        self.registry.agent_id_path = expand_tilde(&self.registry.agent_id_path);
         self.goose.defaults.cwd = expand_tilde(&self.goose.defaults.cwd);
         self.goose.defaults.allowed_roots = self
             .goose
