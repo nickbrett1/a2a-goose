@@ -151,7 +151,7 @@ extensions:
     type: streamable_http
     uri: http://nas:8092/a2a-mcp/mcp
     enabled: true
-    timeout: 300
+    timeout: 900
 ```
 
 The hub route is the better default: it is one place to change, and every session
@@ -205,7 +205,7 @@ sudo docker run --rm --network ai_proxy -e MCP_URL=http://mcphub:3000/mcp/core \
   bearer. On the NAS that is currently a hand-made admin `PUT`; nothing in the
   repo restores it. `registry.rs` owes that, and now three surfaces depend on it.
 - **A tool call blocks for the whole turn, and now says so.** `TIMEOUT_SECONDS`
-  is 300 s, and both tool descriptions, `list_agents`' footer and the server's
+  is 900 s, and both tool descriptions, `list_agents`' footer and the server's
   `instructions` carry that number and the advice that goes with it: these calls
   are for **relatively short-lived work**. Each agent line in `list_agents` also
   carries the ceiling that agent's *own* card advertises
