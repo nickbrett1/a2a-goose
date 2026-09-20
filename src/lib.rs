@@ -10,6 +10,7 @@
 //! You lose the label, not the conversation.
 
 pub mod acp;
+pub mod activity;
 pub mod card;
 pub mod config;
 pub mod executor;

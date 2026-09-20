@@ -132,6 +132,13 @@ pub struct TurnRequest {
     /// given context may reuse one. Today every turn still gets a fresh
     /// session; this is what a reuse policy would key on.
     pub context: Option<String>,
+    /// The A2A `taskId` this turn belongs to, when the caller had one.
+    ///
+    /// Carried for the same reason `context` is, and no more: the ACP layer
+    /// stamps it onto every activity event (`crate::activity`) so an operator
+    /// watching a context that is running more than one turn can tell the turns
+    /// apart. It is display data — nothing routes on it.
+    pub task: Option<String>,
     pub cwd: PathBuf,
     pub prompt: String,
     /// The skill this turn runs under.

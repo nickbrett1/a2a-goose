@@ -18,6 +18,7 @@ use a2a::{AgentCard, Message, Part, Role, SendMessageRequest, SendMessageRespons
 use a2a_client::A2AClientFactory;
 use a2a_client::auth::AuthInterceptor;
 use a2a_client::client::SendMessageExt;
+use a2a_goose::activity::ActivityHub;
 use a2a_goose::card;
 use a2a_goose::config::Config;
 use a2a_goose::goose::{Goose, Version};
@@ -25,6 +26,7 @@ use a2a_goose::registry::Registry;
 use a2a_goose::server::{self, Agent};
 use a2a_goose::skills::SkillSet;
 use a2a_goose::turn::{SessionClose, SessionInfo, TurnError, TurnEvent, TurnRequest, Turns, Usage};
+use futures::StreamExt;
 use futures::future::BoxFuture;
 use serde_json::Value;
 
@@ -166,6 +168,15 @@ async fn boot() -> Fixture {
     let card = card::assemble(&config, &skills);
     let card_hash = card::hash(&card);
     let turns = Arc::new(FakeTurns::default());
+    // Enabled, so a test can watch it; the hub is shared by the `Agent` and the
+    // executor the router builds from it.
+    let activity = Arc::new(ActivityHub::default());
+
+    // From *this* config, so the registry reads the unset `master_key_env` the
+    // fixture set above and is `unconfigured` here — not `LITELLM_MASTER_KEY`,
+    // which a dev container exports, making `/status` report `unregistered` and
+    // this test fail on a developer's machine while passing in CI.
+    let registry = Registry::new(&config);
 
     let agent = Arc::new(Agent {
         config,
@@ -176,9 +187,10 @@ async fn boot() -> Fixture {
             path: "/usr/local/bin/goose".into(),
             version: Version::new(1, 50, 0),
         },
-        registry: Registry::new(&Config::default()),
+        registry,
         turns: turns.clone(),
         serve: None,
+        activity: Arc::clone(&activity),
         started: Instant::now(),
     });
 
@@ -643,5 +655,86 @@ async fn deleting_a_session_maps_the_outcome_onto_the_status_code() {
             .expect("message")
             .contains("tasks/cancel"),
         "the refusal must say what to do instead: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_activity_feed_is_behind_the_token_and_reports_a_turn() {
+    // `GET /events` is the operator's view (§activity): it names working
+    // directories and mirrors answer sizes, so it sits behind the same bearer
+    // layer as the session routes - not in the open control group with
+    // `/status`. What it *reports* is the other half: a turn the executor ran,
+    // from the request it accepted to how it ended.
+    let fixture = boot().await;
+
+    let open = reqwest::Client::new()
+        .get(format!("{}/events", fixture.base))
+        .send()
+        .await
+        .expect("GET /events without a token");
+    assert_eq!(open.status(), 401, "the feed must 401 without a token");
+
+    // One turn, so the feed has something to report. FakeTurns contributes no
+    // steps (it is not an ACP runner); the request and the outcome come from the
+    // executor, which is what this file is pinning.
+    let card = dial_card(&fixture.base).await;
+    let factory = A2AClientFactory::builder()
+        .with_interceptor(Arc::new(AuthInterceptor::bearer(TOKEN)))
+        .build();
+    let client = factory.create_from_card(&card).await.expect("client");
+    client.send_text("watch this").await.expect("send");
+
+    let response = reqwest::Client::new()
+        .get(format!("{}/events", fixture.base))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .expect("GET /events");
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream"),
+        "the feed is SSE"
+    );
+
+    // Read the backlog a fresh subscriber is owed, and stop once both ends of
+    // the turn are seen - the stream is otherwise open forever.
+    let mut stream = response.bytes_stream();
+    let mut seen = String::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(std::time::Duration::from_secs(1), stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                seen.push_str(&String::from_utf8_lossy(&chunk));
+                if seen.contains("\"type\":\"request_received\"")
+                    && seen.contains("\"type\":\"finished\"")
+                {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    assert!(
+        seen.contains("\"type\":\"request_received\""),
+        "the feed must show the request: {seen}"
+    );
+    assert!(
+        seen.contains("\"type\":\"finished\""),
+        "the feed must show the outcome: {seen}"
+    );
+    assert!(
+        seen.contains("\"stopReason\":\"end_turn\""),
+        "the outcome carries goose's stopReason: {seen}"
+    );
+    // The turn's identity travels with every event, which is what lets a viewer
+    // group a live feed by conversation.
+    assert!(
+        seen.contains("\"contextId\""),
+        "the feed names the context: {seen}"
     );
 }

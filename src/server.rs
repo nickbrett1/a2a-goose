@@ -30,6 +30,7 @@
 //! handler errors. A `tower` layer can return whatever status it likes, so the
 //! token check lives there.
 
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -43,11 +44,17 @@ use axum::{
     extract::{Path, Request, State},
     http::{StatusCode, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{delete, get},
 };
+use futures::StreamExt;
 use serde_json::{Value, json};
+use tokio::sync::broadcast;
 
+use crate::activity::{Activity, ActivityHub};
 use crate::config::Config;
 use crate::executor::{ADVERTISED_METHODS, GooseExecutor};
 use crate::goose::{Goose, MIN_GOOSE_VERSION};
@@ -75,6 +82,10 @@ pub struct Agent {
     /// which `/status` says out loud rather than leaving a reader to infer it
     /// from a missing field.
     pub serve: Option<Arc<ServeStatus>>,
+    /// The activity feed `GET /events` streams (§`crate::activity`). Held here so
+    /// the route and the writers share one instance: the executor and the ACP
+    /// runner are handed clones of *this* hub at construction (`crate::main`).
+    pub activity: Arc<ActivityHub>,
     pub started: Instant,
 }
 
@@ -87,11 +98,15 @@ pub fn router(agent: Arc<Agent>, bearer_token: Arc<str>) -> Router {
     let card = agent_card_router(Arc::new(StaticAgentCard::new(agent.card.clone())));
 
     let handler = Arc::new(DefaultRequestHandler::new(
+        // The executor is where a request is first understood, so it is one of
+        // the two places that writes to the activity feed; the other is the ACP
+        // runner, which `agent.turns` already carries a handle to.
         GooseExecutor::new(
             agent.skills.clone(),
             Arc::new(agent.config.clone()),
             agent.turns.clone(),
-        ),
+        )
+        .with_activity(Arc::clone(&agent.activity)),
         InMemoryTaskStore::new(),
     ));
     let a2a = jsonrpc_router(handler).layer(middleware::from_fn_with_state(
@@ -116,6 +131,11 @@ pub fn router(agent: Arc<Agent>, bearer_token: Arc<str>) -> Router {
     let sessions = Router::new()
         .route("/sessions", get(list_sessions))
         .route("/sessions/{context_id}", delete(close_session))
+        // The live activity feed carries working directories and answer sizes
+        // (and, for a debugging tool, is *meant* to be followed), so it sits
+        // behind the token with the session routes rather than in the open
+        // control group with `/status`.
+        .route("/events", get(events))
         .layer(middleware::from_fn_with_state(bearer_token, require_bearer))
         .with_state(agent);
 
@@ -238,6 +258,16 @@ pub fn status_payload(agent: &Agent) -> Value {
         // release shipped, which nothing else here can see.
         "launcher": launcher(),
         "registry": agent.registry.state(),
+        // Where a viewer goes for the live feed, and whether there is one. The
+        // `url` is relative on purpose: the agent's public address is already
+        // `card.url`, and a second absolute spelling here would be one more thing
+        // to keep in step.
+        "activity": {
+            "enabled": agent.activity.enabled(),
+            "backlog": agent.activity.backlog_cap(),
+            "subscribers": agent.activity.subscribers(),
+            "url": "/events",
+        },
         "sessions": {
             "count": agent.turns.in_flight(),
             // Sessions held for a context, so that reuse is visible rather than
@@ -335,6 +365,81 @@ async fn close_session(
         )
             .into_response(),
     }
+}
+
+/// `GET /events` — the live activity feed (§`crate::activity`), as SSE.
+///
+/// Two phases, one stream: the backlog a new subscriber is owed, then the live
+/// events. A consumer must drop any live event whose `seq` it has already seen,
+/// because [`crate::activity::ActivityHub::subscribe`] takes the receiver *before*
+/// the backlog, so the seam duplicates rather than gaps (deliberate — a duplicate
+/// is visible, a gap is silent). This handler does the dropping, so a browser-side
+/// `EventSource` needs no `seq` bookkeeping of its own.
+///
+/// `403` rather than an empty stream when the feed is disabled: a feed that has
+/// been switched off and a feed with nothing to say are different answers, and
+/// only one of them is a thing to fix.
+async fn events(State(agent): State<Arc<Agent>>) -> Response {
+    if !agent.activity.enabled() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "activity_disabled",
+                "message": "this host has observability.activity.enabled: false, so nothing is \
+                            recorded and there is nothing to stream",
+            })),
+        )
+            .into_response();
+    }
+
+    let (backlog, receiver) = agent.activity.subscribe();
+    let last_replayed = backlog.last().map(|activity| activity.seq);
+
+    let backlog_stream = futures::stream::iter(backlog.into_iter().map(activity_event));
+    let live = futures::stream::unfold(
+        (receiver, last_replayed),
+        |(mut receiver, mut last)| async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(activity) => {
+                        // Skip the duplicate at the seam; a `seq` is never reused,
+                        // so `<=` also drops anything already replayed.
+                        if last.is_some_and(|seen| activity.seq <= seen) {
+                            continue;
+                        }
+                        last = Some(activity.seq);
+                        return Some((activity_event(activity), (receiver, last)));
+                    }
+                    // A slow subscriber dropped frames but the stream is still
+                    // live: keep reading rather than ending it.
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        },
+    );
+
+    Sse::new(backlog_stream.chain(live))
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+/// One activity as one SSE frame. Infallible by construction: an `Activity` is
+/// owned plain data, so the fallback comment is unreachable rather than a plan.
+///
+/// The SSE `id` is the event's `seq`: a browser `EventSource` that reconnects
+/// sends it back as `Last-Event-ID`, so a client can pick up where it left off
+/// rather than re-reading the whole backlog. (The route does not *serve*
+/// per-`Last-Event-ID` replay yet — the backlog covers the common case — but
+/// emitting the id now means a client that wants resume can be written against
+/// a stable contract.)
+fn activity_event(activity: Activity) -> Result<Event, Infallible> {
+    let id = activity.seq.to_string();
+    Ok(Event::default()
+        .id(id)
+        .event("activity")
+        .json_data(activity)
+        .unwrap_or_else(|_| Event::default().comment("activity serialization failed")))
 }
 
 /// The variable names the launcher exports on the way to its `exec`.
@@ -442,9 +547,18 @@ mod tests {
         let mut config = Config::default();
         config.server.public_url = "http://mac-studio.tail86fd19.ts.net:10001".to_string();
         config.goose.defaults.allowed_roots = vec![PathBuf::from("/tmp")];
+        // Name a variable nothing sets, so the registry is `unconfigured`
+        // regardless of what the environment running the tests happens to hold.
+        // The default name is `LITELLM_MASTER_KEY`, which a dev container has —
+        // and a test whose result depends on that is a test that fails on a
+        // developer's machine and passes in CI, which is the wrong way round.
+        config.registry.master_key_env = "A2A_GOOSE_TEST_UNSET_MASTER_KEY".to_string();
         let skills = SkillSet::load(&config.skills).expect("skills");
         let card = crate::card::assemble(&config, &skills);
         let card_hash = crate::card::hash(&card);
+        // Built before the move into `Agent`, and from *this* config, so it
+        // reads the unset key env above rather than the ambient environment.
+        let registry = Registry::new(&config);
         Agent {
             config,
             skills: Arc::new(skills),
@@ -454,11 +568,14 @@ mod tests {
                 path: "/usr/local/bin/goose".into(),
                 version: crate::goose::Version::new(1, 50, 0),
             },
-            registry: Registry::new(&Config::default()),
+            registry,
             // `/status` must not need a `goose serve` to answer, so a fake is
             // the right thing for a status test: it is the *unavailable* case.
             turns: Arc::new(crate::turn::NoTurns),
             serve: None,
+            // A disabled hub: `/status` reports the feed's shape without a
+            // running subscriber, and nothing in these tests records.
+            activity: Arc::new(ActivityHub::disabled()),
             started: Instant::now(),
         }
     }
@@ -610,5 +727,60 @@ mod tests {
     #[tokio::test]
     async fn healthz_is_liveness_only() {
         assert_eq!(healthz().await, "ok");
+    }
+
+    #[test]
+    fn status_advertises_the_activity_feed_and_where_to_follow_it() {
+        let payload = status_payload(&agent());
+        // `agent()` installs a disabled hub, so the shape is reported without a
+        // running subscriber: the feed's existence, its bound, and its route.
+        assert_eq!(payload["activity"]["enabled"], false);
+        assert_eq!(payload["activity"]["url"], "/events");
+        assert_eq!(payload["activity"]["subscribers"], 0);
+        assert!(payload["activity"]["backlog"].as_u64().unwrap_or(0) >= 1);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_feed_is_refused_rather_than_streamed_empty() {
+        // A feed that has been switched off and a feed with nothing to say are
+        // different answers; only one is a thing to fix, so `/events` says which
+        // rather than serving an empty stream that reads like quiet.
+        let response = events(State(Arc::new(agent()))).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(payload["error"], "activity_disabled");
+    }
+
+    #[test]
+    fn an_activity_serialises_with_a_type_tag_and_the_turns_identity() {
+        let hub = ActivityHub::new(true, 8);
+        hub.record(
+            Some("ctx-1"),
+            Some("task-1"),
+            Some("sess_1"),
+            Some("ask"),
+            crate::activity::ActivityEvent::ToolCall {
+                id: "call_1".to_string(),
+                title: Some("Read a file".to_string()),
+                tool_kind: Some("read".to_string()),
+                status: Some("in_progress".to_string()),
+            },
+        );
+        let activity = hub.recent().pop().expect("one event");
+        let json = serde_json::to_value(&activity).expect("serialises");
+
+        // The discriminator a viewer switches on, the camelCase envelope, and the
+        // flattened step fields - the shape `/events` promises.
+        assert_eq!(json["type"], "tool_call");
+        assert_eq!(json["contextId"], "ctx-1");
+        assert_eq!(json["taskId"], "task-1");
+        assert_eq!(json["sessionId"], "sess_1");
+        assert_eq!(json["skill"], "ask");
+        assert_eq!(json["id"], "call_1");
+        assert_eq!(json["toolKind"], "read");
     }
 }

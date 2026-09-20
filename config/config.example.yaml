@@ -228,3 +228,15 @@ observability:
   phoenix:
     enabled: false
     endpoint: ""
+
+  # The activity feed served by `GET /events` (bearer): a live, ordered stream of
+  # what this agent is doing - requests received, sessions reused, tool calls,
+  # thoughts, answers, and how each turn finished. It is an in-memory ring buffer
+  # (nothing is written to disk; goose's own sessions.db is the record of a
+  # conversation), and it never blocks a turn. On by default; set `enabled: false`
+  # to record nothing and have `/events` refuse with 403.
+  activity:
+    enabled: true
+    # How many past events a viewer attaching mid-flight is handed before it goes
+    # live. Clamped to 1..=10000.
+    backlog: 512

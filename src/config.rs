@@ -539,6 +539,40 @@ impl Default for Tracing {
 pub struct Observability {
     #[serde(default)]
     pub phoenix: Phoenix,
+    #[serde(default)]
+    pub activity: Activity,
+}
+
+/// The activity feed `GET /events` serves (see `crate::activity`).
+///
+/// On by default because it is bounded, in-memory and behind the bearer token:
+/// the whole point is that an operator can *see* a turn while it is running, and
+/// a viewer that has to be switched on first is a viewer nobody has when the
+/// thing they need to watch is misbehaving. Off is for a host that would rather
+/// not have prompt-adjacent detail in the process memory at all, or one being
+/// profiled.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Activity {
+    /// When false, nothing is recorded and `GET /events` is refused with `403`
+    /// rather than silently serving an empty stream — a disabled feed and a feed
+    /// with nothing to say are different answers, and only one of them is a
+    /// problem.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// How many past events a newly attached viewer is handed. Clamped to
+    /// `1..=crate::activity::MAX_BACKLOG`.
+    #[serde(default = "default_activity_backlog")]
+    pub backlog: usize,
+}
+
+impl Default for Activity {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            backlog: default_activity_backlog(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -630,6 +664,10 @@ fn default_master_key_env() -> String {
 /// operator edits.
 fn default_registry_agent_id_path() -> PathBuf {
     PathBuf::from("~/.local/share/a2a-goose/registry-agent-id")
+}
+
+fn default_activity_backlog() -> usize {
+    crate::activity::DEFAULT_BACKLOG
 }
 
 fn default_trace_id_header() -> String {

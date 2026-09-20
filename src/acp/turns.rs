@@ -43,6 +43,7 @@ use tokio::sync::{Mutex, Semaphore, mpsc};
 use crate::acp::client::{AcpClient, Session};
 use crate::acp::pool::{Acquired, Claim, Idle, Pool};
 use crate::acp::transport::AcpError;
+use crate::activity::{ActivityEvent, ActivityHub, TurnObserver};
 use crate::config::Config;
 use crate::turn::{
     ContextUsage, Limit, SessionClose, SessionInfo, TurnError, TurnEvent, TurnHealth, TurnRequest,
@@ -69,6 +70,10 @@ pub struct AcpTurns {
     connection: Arc<Connection>,
     permits: Arc<Semaphore>,
     capacity: usize,
+    /// The activity feed (`crate::activity`), when installed. `None` in the
+    /// tests that are not about activity, so `new` keeps its shape; production
+    /// installs it with [`AcpTurns::with_activity`].
+    activity: Option<Arc<ActivityHub>>,
 }
 
 /// A session kept for a context, and the stream its updates arrive on.
@@ -130,7 +135,15 @@ impl AcpTurns {
             connection: Arc::new(Connection::default()),
             permits: Arc::new(Semaphore::new(capacity)),
             capacity,
+            activity: None,
         }
+    }
+
+    /// Installs the activity feed. This is the ACP runner's half of it: the place
+    /// that knows the session, the tool calls and the answer deltas.
+    pub fn with_activity(mut self, activity: Arc<ActivityHub>) -> Self {
+        self.activity = Some(activity);
+        self
     }
 
     /// How many turns could run at once.
@@ -145,11 +158,14 @@ impl Turns for AcpTurns {
         let config = Arc::clone(&self.config);
         let connection = Arc::clone(&self.connection);
         let permits = Arc::clone(&self.permits);
+        let activity = self.activity.clone();
 
         // The turn runs in its own task because `execute` is synchronous: the
         // SDK asks for a stream *now* and reads it as the turn proceeds.
         tokio::spawn(async move {
-            if let Err(err) = run_turn(&config, &connection, &permits, request, &events).await {
+            if let Err(err) =
+                run_turn(&config, &connection, &permits, request, activity, &events).await
+            {
                 // The terminal error is the last thing the caller sees. A send
                 // failure here means the caller is already gone, which is not
                 // worth a log line.
@@ -336,8 +352,19 @@ async fn run_turn(
     connection: &Connection,
     permits: &Semaphore,
     request: TurnRequest,
+    activity: Option<Arc<ActivityHub>>,
     events: &mpsc::Sender<Result<TurnEvent, TurnError>>,
 ) -> Result<(), TurnError> {
+    // Every event this turn records is stamped with the identity the executor
+    // already knew: the context, the task and the skill. The session is added
+    // once it exists. See `crate::activity::TurnObserver`.
+    let observer = TurnObserver::new(
+        activity,
+        request.context.clone(),
+        request.task.clone(),
+        Some(request.skill.clone()),
+    );
+
     // The concurrency bound waits, and the wait is bounded by the turn's own
     // ceiling: an unbounded queue in front of a bounded pool hides the overload
     // it exists to make visible.
@@ -354,7 +381,7 @@ async fn run_turn(
             )
         })?;
 
-    let client = connect_or_reuse(config, connection).await?;
+    let client = connect_or_reuse(config, connection, &observer).await?;
 
     // A turn belongs to a context only if the caller named one and this host
     // keeps sessions at all. Otherwise it is exactly the turn M1 ran: a fresh
@@ -389,6 +416,11 @@ async fn run_turn(
         }
     }
 
+    // Whether this turn continues the context's conversation (its own session)
+    // or starts a fresh one. Captured before `acquired` is consumed, because it
+    // is the difference an operator watching a context's memory needs to see.
+    let reused = acquired.is_some();
+
     // This turn's session: the context's, or a fresh one. A retained session
     // arrives with its update stream, so nothing is re-subscribed.
     let (session, mut updates) = match acquired {
@@ -411,9 +443,22 @@ async fn run_turn(
         },
     };
 
+    let observer = observer.with_session(session.id());
+    tracing::info!(
+        target: "turn",
+        context = request.context.as_deref().unwrap_or("-"),
+        session_id = %session.id(),
+        reused,
+        "session ready, prompting goose"
+    );
+    observer.record(ActivityEvent::TurnStarted {
+        session_id: session.id().to_string(),
+        reused,
+    });
+
     let outcome = match tokio::time::timeout(
         request.wall_clock,
-        pump(&session, &mut updates, &request, events),
+        pump(&session, &mut updates, &request, events, &observer),
     )
     .await
     {
@@ -484,6 +529,7 @@ async fn pump(
     updates: &mut mpsc::Receiver<Value>,
     request: &TurnRequest,
     events: &mpsc::Sender<Result<TurnEvent, TurnError>>,
+    observer: &TurnObserver,
 ) -> Result<(), PumpError> {
     // Whatever is already buffered belongs to the turn *before* this one, and
     // must not be reported as this turn's news. This is not hypothetical: the
@@ -515,8 +561,42 @@ async fn pump(
             }
             update = updates.recv(), if stream_open => match update {
                 Some(frame) => {
+                    // The caller's view: the answer and the token readings.
                     for event in update_events(&frame, session.id()) {
+                        match &event {
+                            TurnEvent::Text(text) => {
+                                tracing::debug!(
+                                    target: "turn",
+                                    session_id = %session.id(),
+                                    bytes = text.len(),
+                                    "answer chunk"
+                                );
+                                observer.record(ActivityEvent::Answer {
+                                    delta_bytes: text.len(),
+                                });
+                            }
+                            TurnEvent::ContextUsage(usage) => {
+                                observer.record(ActivityEvent::Usage {
+                                    used: usage.used,
+                                    size: usage.size,
+                                });
+                            }
+                            TurnEvent::Finished { .. } => {}
+                        }
                         emit(events, event).await?;
+                    }
+
+                    // The operator's view: the steps A2A cannot carry. Before
+                    // this, a tool call was read for nothing and dropped.
+                    for step in step_events(&frame, session.id()) {
+                        tracing::info!(
+                            target: "turn",
+                            context = request.context.as_deref().unwrap_or("-"),
+                            session_id = %session.id(),
+                            step = %serde_json::to_value(&step).unwrap_or(serde_json::Value::Null),
+                            "agent step"
+                        );
+                        observer.record(step);
                     }
                 }
                 // The session stream ended without the reply. Keep waiting on
@@ -541,6 +621,7 @@ async fn emit(
 async fn connect_or_reuse(
     config: &Config,
     connection: &Connection,
+    observer: &TurnObserver,
 ) -> Result<Arc<AcpClient>, TurnError> {
     let mut slot = connection.client.lock().await;
     if let Some(client) = slot.as_ref() {
@@ -561,6 +642,9 @@ async fn connect_or_reuse(
         *slot = None;
         connection.live.store(false, Ordering::Relaxed);
         discard_sessions(connection);
+        observer.record(ActivityEvent::Connection {
+            event: "reconnecting".to_string(),
+        });
     }
     // Held across the connect on purpose: two turns arriving on a cold cache
     // should produce one connection, not two racing `initialize`s. Nothing needs
@@ -573,6 +657,9 @@ async fn connect_or_reuse(
     );
     *slot = Some(Arc::clone(&client));
     connection.live.store(true, Ordering::Relaxed);
+    observer.record(ActivityEvent::Connection {
+        event: "connected".to_string(),
+    });
     Ok(client)
 }
 
@@ -621,6 +708,85 @@ pub fn update_events(frame: &Value, session_id: &str) -> Vec<TurnEvent> {
                 }
                 _ => Vec::new(),
             }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The *steps* a `session/update` frame carries for a given session.
+///
+/// These are the frames A2A has no shape for — a tool call, a reasoning chunk, a
+/// plan — and until this existed the agent read them for nothing and dropped
+/// them (`update_events` matches only the answer and the token reading). They are
+/// deliberately not [`TurnEvent`]s: a caller is never shown a tool call, so they
+/// belong to `crate::activity`, which is the operator's view. That separation is
+/// the whole reason `/events` exists rather than the agent leaning on the A2A
+/// answer stream to carry it.
+///
+/// Keyed by the same session guard as `update_events`, and returns nothing for an
+/// update kind this build does not recognise — a goose that adds one is a viewer
+/// that has nothing new to show, not an error.
+pub fn step_events(frame: &Value, session_id: &str) -> Vec<ActivityEvent> {
+    if frame.pointer("/params/sessionId").and_then(Value::as_str) != Some(session_id) {
+        return Vec::new();
+    }
+    let Some(update) = frame.pointer("/params/update") else {
+        return Vec::new();
+    };
+    let text_field = |name: &str| update.get(name).and_then(Value::as_str).map(str::to_string);
+
+    match update.get("sessionUpdate").and_then(Value::as_str) {
+        // A tool call beginning. An id is the one field without which the event
+        // is not actionable — a viewer cannot pair it with its update — so it is
+        // required rather than defaulted.
+        Some("tool_call") => match text_field("toolCallId") {
+            Some(id) => vec![ActivityEvent::ToolCall {
+                id,
+                title: text_field("title"),
+                tool_kind: text_field("kind"),
+                status: text_field("status"),
+            }],
+            None => Vec::new(),
+        },
+        // A state change on a call already announced. Kept separate so a viewer
+        // renders one call once and then updates it.
+        Some("tool_call_update") => match text_field("toolCallId") {
+            Some(id) => vec![ActivityEvent::ToolCallUpdate {
+                id,
+                status: text_field("status"),
+                title: text_field("title"),
+            }],
+            None => Vec::new(),
+        },
+        // A reasoning chunk. Only text content is taken, for the same reason
+        // `update_events` refuses a non-text answer chunk: a viewer must not be
+        // handed a base64 blob where it expected prose.
+        Some("agent_thought_chunk") => {
+            let content = update.get("content");
+            let is_text = content
+                .and_then(|content| content.get("type"))
+                .and_then(Value::as_str)
+                == Some("text");
+            match content
+                .and_then(|content| content.get("text"))
+                .and_then(Value::as_str)
+            {
+                Some(text) if is_text => vec![ActivityEvent::Thought {
+                    text: text.to_string(),
+                }],
+                _ => Vec::new(),
+            }
+        }
+        // A plan, summarised by its length: the entries themselves are the
+        // model's working, and mirroring them here would be a second copy of
+        // something the live turn already shows.
+        Some("plan") => {
+            let entries = update
+                .get("entries")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            vec![ActivityEvent::Plan { entries }]
         }
         _ => Vec::new(),
     }
@@ -738,6 +904,122 @@ mod tests {
             });
             assert!(update_events(&frame, "sess_0001").is_empty(), "{kind}");
         }
+    }
+
+    #[test]
+    fn a_tool_call_and_its_update_become_steps_and_need_an_id() {
+        // The frames A2A has no shape for, and which this build used to drop.
+        let call = serde_json::json!({
+            "method": "session/update",
+            "params": { "sessionId": "sess_0001", "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_1",
+                "title": "Read src/lib.rs",
+                "kind": "read",
+                "status": "pending"
+            }}
+        });
+        assert_eq!(
+            step_events(&call, "sess_0001"),
+            vec![ActivityEvent::ToolCall {
+                id: "call_1".to_string(),
+                title: Some("Read src/lib.rs".to_string()),
+                tool_kind: Some("read".to_string()),
+                status: Some("pending".to_string()),
+            }]
+        );
+
+        let update = serde_json::json!({
+            "method": "session/update",
+            "params": { "sessionId": "sess_0001", "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_1",
+                "status": "completed"
+            }}
+        });
+        assert_eq!(
+            step_events(&update, "sess_0001"),
+            vec![ActivityEvent::ToolCallUpdate {
+                id: "call_1".to_string(),
+                status: Some("completed".to_string()),
+                title: None,
+            }]
+        );
+
+        // No id: a viewer could not pair this with its update, so nothing is
+        // emitted rather than an event with an invented key.
+        let anonymous = serde_json::json!({
+            "method": "session/update",
+            "params": { "sessionId": "sess_0001", "update": { "sessionUpdate": "tool_call" }}
+        });
+        assert!(step_events(&anonymous, "sess_0001").is_empty());
+    }
+
+    #[test]
+    fn a_thought_is_a_step_and_a_non_text_thought_is_not_faked() {
+        let thought = serde_json::json!({
+            "method": "session/update",
+            "params": { "sessionId": "sess_0001", "update": {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": { "type": "text", "text": "let me look" }
+            }}
+        });
+        assert_eq!(
+            step_events(&thought, "sess_0001"),
+            vec![ActivityEvent::Thought {
+                text: "let me look".to_string()
+            }]
+        );
+
+        let image = serde_json::json!({
+            "method": "session/update",
+            "params": { "sessionId": "sess_0001", "update": {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": { "type": "image", "data": "aGk=" }
+            }}
+        });
+        assert!(step_events(&image, "sess_0001").is_empty());
+    }
+
+    #[test]
+    fn a_plan_is_summarised_and_the_other_kinds_are_not_steps() {
+        let plan = serde_json::json!({
+            "method": "session/update",
+            "params": { "sessionId": "sess_0001", "update": {
+                "sessionUpdate": "plan",
+                "entries": [ { "content": "a" }, { "content": "b" } ]
+            }}
+        });
+        assert_eq!(
+            step_events(&plan, "sess_0001"),
+            vec![ActivityEvent::Plan { entries: 2 }]
+        );
+
+        // The answer and token kinds belong to `update_events`; this must not
+        // double-report them.
+        for kind in [
+            "agent_message_chunk",
+            "usage_update",
+            "session_info_update",
+            "available_commands_update",
+        ] {
+            let frame = serde_json::json!({
+                "method": "session/update",
+                "params": { "sessionId": "sess_0001", "update": { "sessionUpdate": kind } }
+            });
+            assert!(step_events(&frame, "sess_0001").is_empty(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_step_for_another_session_is_not_this_turns() {
+        let frame = serde_json::json!({
+            "method": "session/update",
+            "params": { "sessionId": "sess_other", "update": {
+                "sessionUpdate": "tool_call", "toolCallId": "call_1"
+            }}
+        });
+        assert!(step_events(&frame, "sess_0001").is_empty());
     }
 
     #[test]

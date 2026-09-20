@@ -27,6 +27,7 @@ use futures::stream::BoxStream;
 use serde_json::{Value, json};
 
 use crate::acp::resolve_cwd;
+use crate::activity::{ActivityEvent, ActivityHub, TurnObserver};
 use crate::config::Config;
 use crate::skills::{Dispatch, SkillSet};
 use crate::turn::{Limit, TurnError, TurnEvent, TurnRequest, Turns, Usage, prompt_for, wall_clock};
@@ -87,6 +88,10 @@ pub struct GooseExecutor {
     skills: Arc<SkillSet>,
     config: Arc<Config>,
     turns: Arc<dyn Turns>,
+    /// The activity feed (§`crate::activity`), when one is installed. `None` in
+    /// the unit tests that are not about activity, so `new` keeps its shape and
+    /// the wiring is opt-in via [`GooseExecutor::with_activity`].
+    activity: Option<Arc<ActivityHub>>,
 }
 
 impl GooseExecutor {
@@ -95,7 +100,15 @@ impl GooseExecutor {
             skills,
             config,
             turns,
+            activity: None,
         }
+    }
+
+    /// Installs the activity feed. This is the executor's half of it: the place
+    /// that knows a request arrived and how it ended.
+    pub fn with_activity(mut self, activity: Arc<ActivityHub>) -> Self {
+        self.activity = Some(activity);
+        self
     }
 
     /// What the executor does about `metadata.skillId`, exposed so the routing
@@ -122,8 +135,10 @@ impl GooseExecutor {
         let cwd = resolve_cwd(&self.config, requested_cwd)?;
         let prompt = prompt_for(&resolved.skill_id, &resolved.dispatch, text)?;
         Ok(TurnRequest {
-            // Filled in by `execute`, which is where the A2A context is known.
+            // Filled in by `execute`, which is where the A2A context and task
+            // are known.
             context: None,
+            task: None,
             cwd,
             prompt,
             skill: resolved.skill_id.clone(),
@@ -147,6 +162,23 @@ impl AgentExecutor for GooseExecutor {
         let task_id = ctx.task_id.clone();
         let context_id = ctx.context_id.clone();
 
+        // An empty context id is the SDK's "no context", and treating it as a
+        // key would pool every contextless turn together — the opposite of what
+        // it means. The requested skill is read before routing so a *refusal* is
+        // still attributed to the place that asked for it.
+        let context = Some(context_id.clone()).filter(|id| !id.is_empty());
+        let requested_skill = metadata
+            .as_ref()
+            .and_then(|meta| meta.get(SKILL_ID_KEY))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let observer = TurnObserver::new(
+            self.activity.clone(),
+            context.clone(),
+            Some(task_id.clone()),
+            requested_skill,
+        );
+
         let request = self.resolve(metadata.as_ref()).and_then(|resolved| {
             self.prepare(&resolved, metadata.as_ref(), &text)
                 .map_err(refusal_to_a2a)
@@ -157,13 +189,41 @@ impl AgentExecutor for GooseExecutor {
             // Nothing has been claimed to the caller yet, so a refusal is the
             // JSON-RPC error the SDK turns into a non-2xx-coded reply rather
             // than a task that starts and then fails.
-            Err(err) => return Box::pin(futures::stream::once(async move { Err(err) })),
+            Err(err) => {
+                tracing::info!(
+                    target: "turn",
+                    task = %task_id,
+                    context = context.as_deref().unwrap_or("-"),
+                    reason = %err,
+                    "request refused before it started"
+                );
+                observer.record(ActivityEvent::Refused {
+                    reason: err.to_string(),
+                });
+                return Box::pin(futures::stream::once(async move { Err(err) }));
+            }
         };
 
-        // An empty context id is the SDK's "no context", and treating it as a
-        // key would pool every contextless turn together — the opposite of what
-        // it means.
-        request.context = Some(context_id.clone()).filter(|id| !id.is_empty());
+        request.context = context;
+        request.task = Some(task_id.clone());
+
+        // The one line that answers "what is the agent doing right now?": the
+        // request landed, here is the skill, the directory and how big the ask
+        // was. Before this, the A2A entry point logged nothing at all.
+        let observer = observer.with_skill(request.skill.clone());
+        tracing::info!(
+            target: "turn",
+            task = %task_id,
+            context = request.context.as_deref().unwrap_or("-"),
+            skill = %request.skill,
+            cwd = %request.cwd.display(),
+            prompt_bytes = request.prompt.len(),
+            "turn accepted"
+        );
+        observer.record(ActivityEvent::RequestReceived {
+            cwd: request.cwd.display().to_string(),
+            prompt_bytes: request.prompt.len(),
+        });
 
         let events = self.turns.run(request);
         let state = TurnState::new(
@@ -177,34 +237,59 @@ impl AgentExecutor for GooseExecutor {
         let opening_frame = state.opening_frame();
         let opening = futures::stream::once(async move { Ok::<_, A2AError>(opening_frame) });
 
-        let body = futures::stream::unfold((events, state), |(mut events, mut state)| async move {
-            loop {
-                if state.done {
-                    return None;
-                }
-                match events.next().await {
-                    None => return None,
-                    // A turn-level failure arrives as an error frame. It is
-                    // already past the point where a JSON-RPC error is
-                    // expressible, so it becomes a `failed` task: visible, and
-                    // terminal, which is what the caller needs.
-                    Some(Err(err)) => {
-                        state.done = true;
-                        return Some((
-                            vec![Ok(state.failed_frame(&err.to_string()))],
-                            (events, state),
-                        ));
+        let body = futures::stream::unfold(
+            (events, state, observer),
+            |(mut events, mut state, observer)| async move {
+                loop {
+                    if state.done {
+                        return None;
                     }
-                    Some(Ok(event)) => {
-                        let frames = state.apply(event);
-                        if frames.is_empty() {
-                            continue;
+                    match events.next().await {
+                        None => return None,
+                        // A turn-level failure arrives as an error frame. It is
+                        // already past the point where a JSON-RPC error is
+                        // expressible, so it becomes a `failed` task: visible, and
+                        // terminal, which is what the caller needs.
+                        Some(Err(err)) => {
+                            state.done = true;
+                            let message = err.to_string();
+                            tracing::info!(
+                                target: "turn",
+                                task = %state.task_id,
+                                error = %message,
+                                "turn failed"
+                            );
+                            observer.record(ActivityEvent::Failed {
+                                error: message.clone(),
+                            });
+                            return Some((
+                                vec![Ok(state.failed_frame(&message))],
+                                (events, state, observer),
+                            ));
                         }
-                        return Some((frames, (events, state)));
+                        Some(Ok(event)) => {
+                            let frames = state.apply(event);
+                            // The terminal event is decided by `apply` (a clean
+                            // finish, or a bound) and published here, once, so a
+                            // viewer sees one end per turn.
+                            if let Some(terminal) = state.terminal.take() {
+                                tracing::info!(
+                                    target: "turn",
+                                    task = %state.task_id,
+                                    outcome = %terminal_outcome(&terminal),
+                                    "turn ended"
+                                );
+                                observer.record(terminal);
+                            }
+                            if frames.is_empty() {
+                                continue;
+                            }
+                            return Some((frames, (events, state, observer)));
+                        }
                     }
                 }
-            }
-        })
+            },
+        )
         .flat_map(futures::stream::iter);
 
         Box::pin(opening.chain(body))
@@ -249,6 +334,9 @@ struct TurnState {
     done: bool,
     /// Emitted once, before the status that ends the turn.
     answered: bool,
+    /// The activity to publish when the turn ends, set once by whatever ended
+    /// it, and taken by the executor's stream loop. `None` until then.
+    terminal: Option<ActivityEvent>,
 }
 
 impl TurnState {
@@ -261,6 +349,7 @@ impl TurnState {
             usage: Usage::default(),
             done: false,
             answered: false,
+            terminal: None,
         }
     }
 
@@ -290,12 +379,22 @@ impl TurnState {
                     allowed: self.max_tokens,
                     observed: self.peak_context,
                 };
+                self.terminal = Some(ActivityEvent::Failed {
+                    error: err.to_string(),
+                });
                 vec![Ok(self.failed_frame(&err.to_string()))]
             }
             TurnEvent::Finished { stop_reason, usage } => {
                 self.usage = usage;
                 self.done = true;
                 let (state, message) = terminal_state(&stop_reason);
+                self.terminal = Some(ActivityEvent::Finished {
+                    stop_reason: stop_reason.clone(),
+                    total_tokens: usage.total,
+                    input_tokens: usage.input,
+                    output_tokens: usage.output,
+                    context_tokens: self.peak_context,
+                });
                 let mut frames = Vec::with_capacity(2);
                 if self.answered {
                     // Closes the streamed artifact, so a caller that only reads
@@ -395,6 +494,16 @@ fn terminal_state(stop_reason: &str) -> (TaskState, Option<String>) {
              finished one"
         )),
     )
+}
+
+/// A one-word outcome for the "turn ended" log line, so `tail -f` reads as a
+/// sequence of `turn ended outcome=...` and not as a wall of JSON.
+fn terminal_outcome(event: &ActivityEvent) -> &'static str {
+    match event {
+        ActivityEvent::Finished { .. } => "finished",
+        ActivityEvent::Failed { .. } => "failed",
+        _ => "ended",
+    }
 }
 
 /// A refusal *before* the turn starts, as a JSON-RPC error.
@@ -851,6 +960,72 @@ mod tests {
         assert_eq!(ADVERTISED_METHODS[0], "SendMessage");
         assert_eq!(ADVERTISED_METHODS[1], "SendStreamingMessage");
         assert_eq!(UNKNOWN_SKILL_CODE, error_code::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn a_turn_is_recorded_from_request_to_outcome() {
+        // The executor is one of the two writers to the activity feed (§activity);
+        // this pins its half: the request as it was accepted, and how the turn
+        // ended, in that order, with the turn's identity attached.
+        let scratch = Scratch::new("activity");
+        let turns = Arc::new(FakeTurns::answering(vec![
+            TurnEvent::Text("ok".to_string()),
+            TurnEvent::Finished {
+                stop_reason: "end_turn".to_string(),
+                usage: Usage {
+                    total: 9,
+                    input: 7,
+                    output: 2,
+                },
+            },
+        ]));
+        let activity = Arc::new(ActivityHub::default());
+        let executor = GooseExecutor::new(
+            Arc::new(skills()),
+            Arc::new(config(&scratch.0)),
+            Arc::clone(&turns) as Arc<dyn Turns>,
+        )
+        .with_activity(Arc::clone(&activity));
+
+        // Drive the whole stream, so the terminal event is published.
+        let _ = frames(&executor, context(None, "hi")).await;
+
+        let recorded = activity.recent();
+        let cwd = scratch
+            .0
+            .canonicalize()
+            .expect("canonical")
+            .display()
+            .to_string();
+        let events: Vec<ActivityEvent> = recorded.iter().map(|a| a.event.clone()).collect();
+        assert_eq!(
+            events,
+            vec![
+                ActivityEvent::RequestReceived {
+                    cwd,
+                    prompt_bytes: 2,
+                },
+                ActivityEvent::Finished {
+                    stop_reason: "end_turn".to_string(),
+                    total_tokens: 9,
+                    input_tokens: 7,
+                    output_tokens: 2,
+                    context_tokens: 0,
+                },
+            ]
+        );
+        // And every event names the turn it belongs to.
+        assert!(
+            recorded
+                .iter()
+                .all(|a| a.task_id.as_deref() == Some("task-1"))
+        );
+        assert!(
+            recorded
+                .iter()
+                .all(|a| a.context_id.as_deref() == Some("ctx-1"))
+        );
+        assert!(recorded.iter().all(|a| a.skill.as_deref() == Some("ask")));
     }
 
     #[test]

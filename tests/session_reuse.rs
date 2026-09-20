@@ -327,6 +327,7 @@ impl World {
         let request = TurnRequest {
             context: context.map(str::to_string),
             cwd: PathBuf::from("/tmp"),
+            task: None,
             prompt: prompt.to_string(),
             skill: "ask".to_string(),
             wall_clock: Duration::from_secs(20),
@@ -433,6 +434,7 @@ async fn a_turn_that_finds_its_context_busy_runs_alone_and_gives_up_its_session(
             let request = TurnRequest {
                 context: Some("c1".to_string()),
                 cwd: PathBuf::from("/tmp"),
+                task: None,
                 prompt: "the long one".to_string(),
                 skill: "ask".to_string(),
                 wall_clock: Duration::from_secs(60),
@@ -691,6 +693,7 @@ async fn closing_a_context_mid_turn_is_refused_and_succeeds_once_the_turn_is_don
             let request = TurnRequest {
                 context: Some("c1".to_string()),
                 cwd: PathBuf::from("/tmp"),
+                task: None,
                 prompt: "the long one".to_string(),
                 skill: "ask".to_string(),
                 wall_clock: Duration::from_secs(60),

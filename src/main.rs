@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use a2a_goose::acp::AcpTurns;
+use a2a_goose::activity::ActivityHub;
 use a2a_goose::config::{Config, ServeMode};
 use a2a_goose::goose::{Goose, MIN_GOOSE_VERSION};
 use a2a_goose::registry::Registry;
@@ -115,8 +116,18 @@ async fn run() -> anyhow::Result<()> {
     // never converges. The first turn connects; `/status` reports which state
     // that is in. The url is logged so a misconfigured one is visible at boot
     // rather than at the first caller's expense.
+    // The activity feed (§`activity`): one hub, shared by the ACP runner here and
+    // the executor built in `server::router` from `agent.activity`. It is the
+    // operator's view of a turn — requests, steps, outcomes — and it is what
+    // `GET /events` streams.
+    let activity = Arc::new(ActivityHub::new(
+        config.observability.activity.enabled,
+        config.observability.activity.backlog,
+    ));
+
     let config = Arc::new(config);
-    let turns: Arc<dyn Turns> = Arc::new(AcpTurns::new(Arc::clone(&config)));
+    let turns: Arc<dyn Turns> =
+        Arc::new(AcpTurns::new(Arc::clone(&config)).with_activity(Arc::clone(&activity)));
     tracing::info!(
         acp = %config.goose.acp.url,
         serve = config.goose.acp.serve.as_str(),
@@ -144,6 +155,7 @@ async fn run() -> anyhow::Result<()> {
         registry: registry.clone(),
         turns,
         serve: serve_status,
+        activity,
         started: Instant::now(),
     });
 
