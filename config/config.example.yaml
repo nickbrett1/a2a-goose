@@ -240,3 +240,28 @@ observability:
     # How many past events a viewer attaching mid-flight is handed before it goes
     # live. Clamped to 1..=10000.
     backlog: 512
+
+# The roost mission-control hub (M2a). Off by default.
+#
+# roost is a router, not a store: this agent dials *out* to it over one
+# long-lived WebSocket and pushes its activity feed, so the hub needs no inbound
+# surface on this host. The hub shows the fleet, follows a live turn, and asks
+# `status.get` / `sessions.list` back down the same connection. An unreachable
+# hub is a retry and never blocks serving, so nothing here is a startup refusal.
+hub:
+  # When false, no tunnel is opened and nothing is dialled.
+  enabled: false
+  # The hub's agent endpoint. Must be ws:// or wss://; a wrong scheme is a
+  # warning at boot, not a failure.
+  url: "ws://roost.tail86fd19.ts.net:3000/agent/ws"
+  # NAME of the variable holding this agent's hub credential, never the value.
+  # The credential is the whole auth boundary between an agent and its hub
+  # (there is no browser login), and it is sent as `Authorization: Bearer ...`
+  # on the WebSocket handshake. With `enabled: true` and this unset, the tunnel
+  # refuses to dial rather than connect anonymously.
+  credentialEnv: "A2A_GOOSE_HUB_TOKEN"
+  # What the hub shows in its `kind` column. `a2a-goose` is a real agent;
+  # roost's own fake agent uses `devcontainer`.
+  kind: "a2a-goose"
+  # How long to wait for the hub handshake before backing off and retrying.
+  connectTimeoutSecs: 10

@@ -55,6 +55,24 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 # Card hashing, for the card-change re-registration in registry.rs.
 sha2 = "0.11"
 
+# The roost tunnel client (M2a). The hub is a router, not a store: this agent
+# dials *out* to it over one long-lived WebSocket and pushes its activity feed,
+# so the hub needs no inbound surface on the host. `tokio-tungstenite` is the
+# same crate roost itself uses, and the rustls feature (not native-tls) keeps
+# the musl build free of OpenSSL for the `wss://` case - the same reason the
+# ACP hop uses `reqwest`'s rustls feature (hard constraint #17 for the *A2A*
+# wire does not apply here: the roost wire is not A2A, and roost is not
+# published as a crate, so the frame types are mirrored in `src/tunnel/`).
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
+    "connect",
+    "handshake",
+    "rustls-tls-webpki-roots",
+] }
+
+# The per-process boot id. A restart mints a new one, which is what lets the
+# hub's ordering key be `(agentId, bootId, seq)` even though `seq` resets.
+uuid = { version = "1", features = ["v4"] }
+
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"

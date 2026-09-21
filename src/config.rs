@@ -63,6 +63,10 @@ pub struct Config {
     pub tracing: Tracing,
     #[serde(default)]
     pub observability: Observability,
+    /// The roost mission-control hub this agent dials out to (M2a). Off by
+    /// default: a host with no hub configured must not dial one.
+    #[serde(default)]
+    pub hub: Hub,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -584,6 +588,55 @@ pub struct Phoenix {
     pub endpoint: String,
 }
 
+/// The roost mission-control hub this agent tunnels out to (`docs/roost-tunnel.md`).
+///
+/// The hub is a **router, not a store**: this agent dials *out* over one
+/// long-lived WebSocket and pushes its activity feed, so nothing here opens an
+/// inbound surface. The whole block is optional and off by default, and an
+/// unreachable hub is a retry and never a crash — so a `hub` mistake costs a log
+/// line, not the agent's ability to serve.
+///
+/// Secrets follow the repo's rule (constraint #3): `credentialEnv` holds the
+/// **name** of an environment variable, never the value.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Hub {
+    /// Whether this agent dials a hub at all. When false, no tunnel task is
+    /// started and nothing about the hub is dialled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The hub's agent WebSocket endpoint, e.g. `ws://roost:3000/agent/ws`.
+    /// Must be `ws://` or `wss://`.
+    #[serde(default)]
+    pub url: String,
+    /// The *name* of the environment variable holding this agent's hub
+    /// credential. The credential is the entire auth boundary between an agent
+    /// and its hub (there is no browser login), so it is a variable name here
+    /// and a value only in the environment.
+    #[serde(default = "default_hub_credential_env")]
+    pub credential_env: String,
+    /// The `kind` the hub shows in its fleet view. The real value is
+    /// `a2a-goose`; roost's `fake_agent` uses `devcontainer`.
+    #[serde(default = "default_hub_kind")]
+    pub kind: String,
+    /// How long to wait for the hub to answer the WebSocket handshake before
+    /// giving up on the attempt and backing off.
+    #[serde(default = "default_hub_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+}
+
+impl Default for Hub {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: String::new(),
+            credential_env: default_hub_credential_env(),
+            kind: default_hub_kind(),
+            connect_timeout_secs: default_hub_connect_timeout_secs(),
+        }
+    }
+}
+
 fn default_bind() -> String {
     DEFAULT_BIND.to_string()
 }
@@ -680,6 +733,18 @@ fn default_trace_id_source() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_hub_credential_env() -> String {
+    "A2A_GOOSE_HUB_TOKEN".to_string()
+}
+
+fn default_hub_kind() -> String {
+    crate::tunnel::identity::DEFAULT_KIND.to_string()
+}
+
+fn default_hub_connect_timeout_secs() -> u64 {
+    10
 }
 
 /// Every way starting can be refused. Each variant names the setting and what is
@@ -973,6 +1038,18 @@ impl Config {
                 self.server.bind, self.server.public_url
             ));
         }
+        // The hub is optional, so a hub mistake is a warning and not a refusal:
+        // an agent that cannot tunnel is still an agent that can serve. But a
+        // `hub.enabled` that cannot possibly connect is worth saying out loud at
+        // boot rather than discovering from a log line every 30 seconds.
+        if self.hub.enabled && !is_websocket_url(&self.hub.url) {
+            warnings.push(format!(
+                "hub.enabled is set but hub.url ({:?}) is not a ws:// or wss:// URL, so no \
+                 tunnel will be opened. Set it to the hub's agent endpoint, e.g. \
+                 ws://roost:3000/agent/ws",
+                self.hub.url
+            ));
+        }
         warnings
     }
 
@@ -1053,6 +1130,21 @@ impl Config {
     pub fn litellm_master_key(&self) -> Option<String> {
         std::env::var(&self.registry.master_key_env).ok()
     }
+
+    /// The hub credential, read from the environment variable `hub.credentialEnv`
+    /// *names*.
+    ///
+    /// `None` when the variable is unset — and an agent with no credential is an
+    /// agent that will not dial the hub with a bogus identity, because the
+    /// tunnel refuses to open without it (`crate::tunnel::spawn`). Read here and
+    /// not stored on `Config` for the same reason [`Self::bearer_token`] is: the
+    /// value must never be serialised, logged, or written beside the sessions.
+    pub fn hub_credential(&self) -> Option<String> {
+        match std::env::var(&self.hub.credential_env) {
+            Ok(value) if !value.trim().is_empty() => Some(value),
+            _ => None,
+        }
+    }
 }
 
 /// Is this URL (or bare address) pointing at the loopback interface?
@@ -1064,6 +1156,13 @@ impl Config {
 ///
 /// Unparseable is `false`: `validate` has already refused anything that is not a
 /// socket address, and a warning is not the place to re-raise that.
+/// Is this a WebSocket URL the tunnel can dial? `ws://` or `wss://` and nothing
+/// else — `http://` would be a plain request, not a tunnel, and is the mistake a
+/// reader of `publicUrl` makes.
+pub fn is_websocket_url(url: &str) -> bool {
+    url.starts_with("ws://") || url.starts_with("wss://")
+}
+
 pub fn bind_is_loopback(bind: &str) -> bool {
     match bind.parse::<std::net::SocketAddr>() {
         Ok(addr) => addr.ip().is_loopback(),
@@ -1472,5 +1571,76 @@ mod tests {
             expand_tilde(Path::new("~other/x")),
             PathBuf::from("~other/x")
         );
+    }
+
+    #[test]
+    fn the_hub_is_off_by_default_and_its_defaults_are_the_safe_ones() {
+        let hub = Hub::default();
+        assert!(!hub.enabled, "a host with no hub must not dial one");
+        assert!(hub.url.is_empty());
+        assert_eq!(hub.kind, "a2a-goose");
+        assert_eq!(hub.credential_env, "A2A_GOOSE_HUB_TOKEN");
+        assert_eq!(hub.connect_timeout_secs, 10);
+        // And it is in the resolved config, not just the type.
+        assert!(!Config::default().hub.enabled);
+    }
+
+    #[test]
+    fn a_hub_enabled_with_a_non_websocket_url_is_warned_not_refused() {
+        let mut config = valid();
+        config.hub.enabled = true;
+        config.hub.url = "http://roost:3000/agent/ws".to_string();
+        // Still a config that serves: the hub is optional, so this is a warning.
+        config
+            .validate()
+            .expect("a hub mistake must not stop the agent serving");
+        let hub_warning = |config: &Config| {
+            config
+                .warnings()
+                .into_iter()
+                .find(|w| w.contains("hub.url"))
+        };
+        assert!(hub_warning(&config).is_some(), "{:?}", config.warnings());
+
+        // The right scheme is silent, and so is no hub at all.
+        config.hub.url = "ws://roost:3000/agent/ws".to_string();
+        assert!(hub_warning(&config).is_none(), "{:?}", config.warnings());
+        config.hub.enabled = false;
+        config.hub.url = "http://roost:3000/agent/ws".to_string();
+        assert!(hub_warning(&config).is_none(), "{:?}", config.warnings());
+    }
+
+    #[test]
+    fn the_hub_credential_is_read_by_name_and_never_stored() {
+        let mut config = Config::default();
+        let name = format!("A2A_GOOSE_TEST_HUB_TOKEN_{}", std::process::id());
+        config.hub.credential_env = name.clone();
+        // SAFETY: a test-only variable, set and cleared within this test.
+        unsafe {
+            std::env::set_var(&name, "s3cret");
+        }
+        assert_eq!(config.hub_credential().as_deref(), Some("s3cret"));
+        // The value is not a field, so it cannot be serialised with the config.
+        let yaml = serde_yaml::to_string(&config).expect("serialises");
+        assert!(!yaml.contains("s3cret"), "the credential leaked into YAML");
+        unsafe {
+            std::env::remove_var(&name);
+        }
+        assert!(config.hub_credential().is_none());
+    }
+
+    #[test]
+    fn a_blank_hub_credential_counts_as_unset() {
+        let mut config = Config::default();
+        let name = format!("A2A_GOOSE_TEST_BLANK_{}", std::process::id());
+        config.hub.credential_env = name.clone();
+        // SAFETY: a test-only variable, set and cleared within this test.
+        unsafe {
+            std::env::set_var(&name, "   ");
+        }
+        assert!(config.hub_credential().is_none());
+        unsafe {
+            std::env::remove_var(&name);
+        }
     }
 }
