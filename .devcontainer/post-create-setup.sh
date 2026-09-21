@@ -114,17 +114,6 @@ if command -v doppler &> /dev/null && doppler whoami &> /dev/null 2>&1; then
     fi
 fi
 
-
-
-echo "INFO: Installing Cursor CLI..."
-curl https://cursor.com/install -fsS | bash
-
-
-
-
-
-
-
 echo "INFO: Configuring git safe directory..."
 git config --global --add safe.directory /workspaces/a2a-goose
 
@@ -203,11 +192,23 @@ sudo chown -R "$CURRENT_USER:$CURRENT_USER" "$USER_HOME_DIR/.agy"
 echo "INFO: Setting up goose configuration and MCP servers..."
 
 CONFIG="$HOME/.config/goose/config.yaml"
-if [ -f "$CONFIG" ]; then
-    echo "INFO: Keeping existing $CONFIG (provider + extensions preserved)."
-else
+mkdir -p "$HOME/.config/goose"
+
+# The managed fragments, written once into a scratch file. The merge below
+# picks the subset the config is missing. A fragment starts at '  <key>:' —
+# exactly two spaces, the child indent under a top-level `extensions:`.
+MANAGED_BODY="$(mktemp)"
+cat > "$MANAGED_BODY" <<'GOOSECFGBODYEOF'
+  mcphub-dev:
+    type: streamable_http
+    name: mcphub-dev
+    enabled: true
+    uri: http://nas:8781/mcp/dev
+    timeout: 300
+GOOSECFGBODYEOF
+
+if [ ! -f "$CONFIG" ]; then
     echo "INFO: No goose config found - writing project goose config (extensions only; provider resolves from Doppler env at runtime)."
-    mkdir -p "$HOME/.config/goose"
     cat > "$CONFIG" <<'GOOSECFGEOF'
 extensions:
   mcphub-dev:
@@ -218,7 +219,74 @@ extensions:
     timeout: 300
 GOOSECFGEOF
     echo "INFO: Wrote project goose config (MCPHub dev group + local/remote exceptions)."
+else
+    MISSING=""
+    for KEY in mcphub-dev; do
+        grep -q "^[[:space:]]*$KEY:" "$CONFIG" || MISSING="$MISSING $KEY"
+    done
+
+    MISSING_BODY="$(mktemp)"
+    awk -v missing=" $MISSING " '
+        /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+            k = $0
+            sub(/^ +/, "", k)
+            sub(/:.*/, "", k)
+            keep = (index(missing, " " k " ") > 0)
+        }
+        keep { print }
+    ' "$MANAGED_BODY" > "$MISSING_BODY"
+
+    if [ -z "$MISSING" ] || [ ! -s "$MISSING_BODY" ]; then
+        echo "INFO: Project goose extensions already present in $CONFIG - leaving it untouched."
+    elif grep -q '^extensions:' "$CONFIG" && ! grep -q '^extensions:[[:space:]]*$' "$CONFIG"; then
+        echo "WARN: $CONFIG declares 'extensions:' inline; genproj will not merge into that form."
+        echo "WARN: add the entry below by hand:"
+        sed 's/^/WARN:   /' "$MISSING_BODY"
+    elif ! grep -q '^extensions:[[:space:]]*$' "$CONFIG"; then
+        echo "INFO: $CONFIG exists without an extensions section (goose's own default) - adding the project extensions."
+        # Nothing to merge with, so a fresh section is safe and idempotent:
+        # the next run finds every managed key already present and stops here.
+        printf '\n' >> "$CONFIG"
+        {
+            printf 'extensions:\n'
+            cat "$MISSING_BODY"
+        } >> "$CONFIG"
+        echo "INFO: Added project goose extensions to $CONFIG."
+    else
+        # Merge under the existing top-level extensions: key. The indentation
+        # of its first child tells us whether a 2-space block can be spliced in.
+        # No child (empty/EOF) or 0 spaces (null section) are fine — our block
+        # becomes the section's content; 4+ spaces would need re-indenting, so
+        # that (and only that) is left to the user.
+        CHILD_INDENT="$(awk '
+            /^extensions:[[:space:]]*$/ { found = 1; next }
+            found && (/^[[:space:]]*$/ || /^[[:space:]]*#/) { next }
+            found { match($0, /^ */); print RLENGTH; exit }
+        ' "$CONFIG")"
+        if [ -n "$CHILD_INDENT" ] && [ "$CHILD_INDENT" != "2" ]; then
+            echo "WARN: $CONFIG has an extensions: section indented by $CHILD_INDENT spaces (not 2)."
+            echo "WARN: add the entry below by hand so the YAML stays valid:"
+            sed 's/^/WARN:   /' "$MISSING_BODY"
+        else
+            MERGED="$(mktemp)"
+            awk -v body="$MISSING_BODY" '
+                /^extensions:[[:space:]]*$/ && !done {
+                    print
+                    while ((getline line < body) > 0) print line
+                    close(body)
+                    done = 1
+                    next
+                }
+                { print }
+            ' "$CONFIG" > "$MERGED"
+            cat "$MERGED" > "$CONFIG"
+            rm -f "$MERGED"
+            echo "INFO: Merged project goose extensions into the existing extensions: section of $CONFIG (added:$MISSING)."
+        fi
+    fi
+    rm -f "$MISSING_BODY"
 fi
+rm -f "$MANAGED_BODY"
 
 echo "INFO: Ensuring goose recipes are available (spec-first development process)..."
 RECIPES_DIR="$HOME/.config/goose/recipes"
