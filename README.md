@@ -1,6 +1,31 @@
 # a2a-goose
 
-A a2a-goose project generated with genproj
+An A2A node agent for goose: it exposes a host's `goose serve` ACP server over the
+A2A protocol, so any caller that speaks A2A — a LiteLLM proxy, another agent — can
+open goose sessions on that host.
+
+One process runs per *host*, not per project: `session/new` carries a working
+directory, so a single `goose serve` behind this binary serves every project on the
+machine, and `cwd` is the namespace.
+
+The agent holds **no conversation state**. goose's own `sessions.db` is the system of
+record; what lives here is a `contextId` → `sessionId` map, recoverable via ACP
+`session/list` if it is lost. You lose the label, not the conversation.
+
+Skills are projected onto the A2A agent card from goose recipes and hand-written skill
+files, and the card is registered with a LiteLLM proxy. Recipes are mined for their
+display fields only — `instructions`, `extensions`, `parameters` and secrets stay on
+disk and are read by goose itself.
+
+Everything knowably wrong is refused at startup, in the order that fails fastest:
+goose on `PATH`, then the configuration and the skill catalogue, then the bearer token,
+then the environment the child goose inherits, then the listen address. Nothing binds a
+port until all of them are good — an agent that starts and then cannot serve is worse
+than one that does not start.
+
+Further reading: [LAUNCHING.md](LAUNCHING.md) (how a host starts),
+[RUNBOOK.md](RUNBOOK.md) (operating a fleet), [RELEASING.md](RELEASING.md) (how code
+reaches a host), [deploy/](deploy/) (why it is shaped that way).
 
 ## Capabilities
 
@@ -15,7 +40,7 @@ This project includes the following capabilities:
 - **Dependabot**: Configures Dependabot for automated dependency updates.
 - **Editor Configuration**: Shared VS Code extensions and workspace settings for consistent tooling across the team.
 - **Shell & Terminal**: Zsh shell with the Powerlevel10k prompt and productivity plugins.
-- **AI Coding Agents**: Sets up the AI coding agents in the devcontainer: goose (config, MCP servers and spec-first recipes) plus the Cursor and Antigravity CLIs.
+- **AI Coding Agents**: Sets up the AI coding agents in the devcontainer: goose (config, MCP servers and spec-first recipes) plus the Antigravity CLI.
 
 ## Setup
 
