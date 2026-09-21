@@ -78,7 +78,7 @@ LITELLM_API_KEY = os.environ.get("LITELLM_API_KEY") or ""
 # *and what to do about it* is in the module docstring; what matters here is
 # that the number is read once and then advertised verbatim, so the tool
 # description cannot drift from the behaviour.
-TIMEOUT_SECONDS = float(os.environ.get("TIMEOUT_SECONDS") or 300)
+TIMEOUT_SECONDS = float(os.environ.get("TIMEOUT_SECONDS") or 900)
 REGISTRY_TIMEOUT_SECONDS = float(os.environ.get("REGISTRY_TIMEOUT_SECONDS") or 15)
 # The deadline is asked of the agent itself, and an agent that is down must not
 # hold up a listing. Five seconds is a card fetch on a tailnet, not a turn.

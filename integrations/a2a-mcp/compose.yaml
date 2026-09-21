@@ -27,7 +27,7 @@ services:
       - LITELLM_API_KEY=${LITELLM_API_KEY:?set LITELLM_API_KEY in the .env beside this file}
       # An agent turn is an agent loop. mcphub and Open WebUI each impose their
       # own ceiling on top of this one; see README.md.
-      - TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-300}
+      - TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-900}
     labels:
       # Reachable from anywhere on the Tailnet/LAN as
       # http://100.82.223.13:8092/a2a-mcp/mcp (Traefik strips the /a2a-mcp
