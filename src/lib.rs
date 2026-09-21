@@ -20,4 +20,5 @@ pub mod registry;
 pub mod serve;
 pub mod server;
 pub mod skills;
+pub mod tunnel;
 pub mod turn;

@@ -159,6 +159,14 @@ async fn run() -> anyhow::Result<()> {
         started: Instant::now(),
     });
 
+    // The roost tunnel (M2a): this agent dials *out* to the mission-control hub
+    // and keeps one long-lived WebSocket open, pushing its activity feed and
+    // answering `status.get`/`sessions.list`. Best-effort and off the serving
+    // path, like registration: an unreachable hub is a retry, never a reason
+    // this host does not serve. `spawn` returns `None` (and says why) when no
+    // hub is configured.
+    let _tunnel = a2a_goose::tunnel::spawn(&config, Arc::clone(&agent));
+
     axum::serve(listener, server::router(agent, token))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
