@@ -114,17 +114,6 @@ if command -v doppler &> /dev/null && doppler whoami &> /dev/null 2>&1; then
     fi
 fi
 
-
-
-echo "INFO: Installing Cursor CLI..."
-curl https://cursor.com/install -fsS | bash
-
-
-
-
-
-
-
 echo "INFO: Configuring git safe directory..."
 git config --global --add safe.directory /workspaces/a2a-goose
 

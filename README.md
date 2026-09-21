@@ -40,7 +40,7 @@ This project includes the following capabilities:
 - **Dependabot**: Configures Dependabot for automated dependency updates.
 - **Editor Configuration**: Shared VS Code extensions and workspace settings for consistent tooling across the team.
 - **Shell & Terminal**: Zsh shell with the Powerlevel10k prompt and productivity plugins.
-- **AI Coding Agents**: Sets up the AI coding agents in the devcontainer: goose (config, MCP servers and spec-first recipes) plus the Cursor and Antigravity CLIs.
+- **AI Coding Agents**: Sets up the AI coding agents in the devcontainer: goose (config, MCP servers and spec-first recipes) plus the Antigravity CLI.
 
 ## Setup
 
