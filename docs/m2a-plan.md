@@ -1,7 +1,15 @@
 # M2a implementation plan — the roost tunnel client
 
-Branch: `feat/roost-tunnel`. Status is kept live in this file (the working
-agreement asks for it): `[ ]` pending, `[~]` in progress, `[x]` done.
+Branch: `feat/roost-tunnel`. Legend: `[ ]` pending, `[~]` in progress, `[x]` done.
+
+**Status (2026-09-21): complete.** All ten steps below are done and verified on
+`feat/roost-tunnel` — `cargo fmt --check`, `cargo clippy --all-targets -- -D
+warnings`, `cargo test` and `cargo test --locked` are green (253 passed, 2
+ignored; both ignored tests need a live `goose`, not a tunnel). Deliberately
+**not** in M2a, and deferred rather than half-done (see `docs/roost-tunnel.md`
+§5): hub-side auth enforcement, `history.*`, `log` frames, and `command`
+handling (reboot is M4). Each is answered with a typed refusal, so the hub is
+told "not yet" instead of being shown an empty body.
 
 Spec: roost `src/protocol.rs` (wire types), `src/fleet.rs` (registration,
 `(bootId, seq)` floor), `src/server.rs` (`/agent/ws`, the queries it sends).
@@ -21,12 +29,12 @@ Design: `docs/roost-tunnel.md`.
    *Test:* parse roost's own `protocol.rs` test vectors — the memo shape for
    `hello`, opaque `event` for `activity`, unknown tag → `Unknown`, malformed
    `hello` → error, `request` round-trip.
-4. **`[x]  `Identity — `src/tunnel/identity.rs`.** `mint_boot_id` (uuid v4),
+4. **`[x]` Identity — `src/tunnel/identity.rs`.** `mint_boot_id` (uuid v4),
    `hostname` (libc `gethostname`, already a dep), `Identity{…}::hello(boot_id,
    started_at)`. `protocolVersion = 1`, `kind = hub.kind`.
    *Test:* two boot ids differ and are non-empty; hello serialises camelCase and
    `protocolVersion == 1`; hostname is non-empty.
-5. **`[x]  `Answers — `src/tunnel/answer.rs`.** `QueryAnswerer` trait and the
+5. **`[x]` Answers — `src/tunnel/answer.rs`.** `QueryAnswerer` trait and the
    dispatch: `status.get` → `status_payload`, `sessions.list` →
    `sessions_payload`, else `Unsupported`. `impl QueryAnswerer for Agent` lives in
    `src/tunnel/mod.rs` so the trait stays free of `Agent`.
