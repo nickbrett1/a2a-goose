@@ -82,7 +82,8 @@ tag; unknown tags parse to `Unknown` and are ignored, never fatal.
   `body.sessions.count`, `activity_enabled` from `body.activity.enabled`.
   "Stuck" = `inFlight > 0` and no new activity for `stuck_after_ms`.
 - `history.*` is **request/response over the tunnel**; roost's fake agent also
-  serves `sessions.list`. M2a answers `status.get` and `sessions.list`.
+  serves `sessions.list`. The agent answers `status.get`, `sessions.list`, and
+  (M2b) `history.*` from goose's own `sessions.db`.
 
 **Auth: there is none yet.** `src/server.rs::agent_ws` reads a `hello` and
 registers whatever `agentId` it is given — no token, header, query or field is
@@ -93,8 +94,8 @@ calls).
 ## 4. M2a design
 
 Four small pieces, in `src/tunnel/`, plus a config block and one `main` wiring
-line. Nothing else in the agent changes; **`history.*` and goose's
-`sessions.db` are untouched**.
+line. Nothing else in the agent changes; goose's `sessions.db` is read-only and
+is touched only by M2b (below).
 
 ```
 src/tunnel/protocol.rs   wire frames, mirrored from roost's protocol.rs
@@ -120,8 +121,9 @@ src/tunnel/mod.rs        the client: dial, hello, replay+live, backoff, respond
   Reconnect replays the backlog; the hub's boot/seq floor drops the overlap.
 - **Answers.** A `request` is dispatched to a `QueryAnswerer`:
   `status.get` → `server::status_payload`, `sessions.list` →
-  `server::sessions_payload`, everything else (`history.*`, `logs.tail`,
-  unknown) → `ok:false, error:"unsupported_method: …"`. A trait (not a direct
+  `server::sessions_payload`, `history.*` → `crate::history` (a read-only window
+  on goose's `sessions.db`), everything else (`logs.tail`, unknown) →
+  `ok:false, error:"unsupported_method: …"`. A trait (not a direct
   `Agent` dependency) so the tunnel is testable without a `goose serve`.
 - **Credential.** `hub.credentialEnv` names the env var (repo convention); the
   value is sent on the WS handshake as `Authorization: Bearer <cred>`. This is
@@ -129,12 +131,34 @@ src/tunnel/mod.rs        the client: dial, hello, replay+live, backoff, respond
 
 ## 5. Out of scope for M2a
 
-- `history.*` (M1/M3) and goose's `sessions.db`. Unsupported answers, so the
-  hub's History tab 502s honestly instead of lying.
 - `log` frames / the log subscription.
 - `command` handling (reboot — M4). Answered `unsupported`.
 - Hub-side auth enforcement. We send the credential; roost must learn to check
   it. Tracked as a call in `docs/m2a-plan.md`.
+
+## 6. M2b: `history.*` from goose's `sessions.db`
+
+The hub's History panel is filled from the agent's own record, not an invented
+one: `crate::history` opens goose's sessions database **read-only** and maps its
+columns onto the four wire shapes.
+
+- **Database.** `$GOOSE_SESSIONS_DB`, else `$XDG_DATA_HOME/goose/sessions/sessions.db`,
+  else `~/.local/share/goose/sessions/sessions.db`.
+- **Schema used.** `sessions(id, name, working_dir, created_at, updated_at)`,
+  `messages(id, session_id, role, content_json, created_timestamp)`,
+  `usage_ledger(session_id, total_tokens, cost)`.
+- **Mapping.** `sessionId←sessions.id`, `name←sessions.name`,
+  `workingDir←sessions.working_dir`, timestamps passed through verbatim,
+  `messageCount←COUNT(messages)`. `tokens`/`cost` are **summed from
+  `usage_ledger`**; a session with no ledger rows is honestly `0`/`0.0`.
+- **Messages.** `content_json` is a JSON array of content blocks; the
+  human-readable `text` of each block is extracted defensively (an unknown blob
+  yields an empty string, never an error), `createdAt` from `created_timestamp`,
+  `index` the row's position in the session.
+- **Pagination.** `history.messages` pages **in SQL** (`ORDER BY id LIMIT/OFFSET`
+  with an opaque decimal cursor), and every `limit` bounds the query.
+- **Fail open.** Missing, locked or unexpected schema → an error for that query
+  only; read-only, `query_only`, no retry loop, no write.
 
 ## 7. Liveness: not believing a socket that has quietly died
 

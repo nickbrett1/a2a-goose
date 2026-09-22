@@ -187,6 +187,7 @@ async fn boot() -> Fixture {
             path: "/usr/local/bin/goose".into(),
             version: Version::new(1, 50, 0),
         },
+        history: a2a_goose::history::HistoryStore::new("/nonexistent/a2a-goose/sessions.db"),
         registry,
         turns: turns.clone(),
         serve: None,

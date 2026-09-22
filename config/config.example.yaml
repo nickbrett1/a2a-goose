@@ -248,6 +248,11 @@ observability:
 # surface on this host. The hub shows the fleet, follows a live turn, and asks
 # `status.get` / `sessions.list` back down the same connection. An unreachable
 # hub is a retry and never blocks serving, so nothing here is a startup refusal.
+#
+# M2b: the hub's `history.*` queries are answered from goose's own sessions
+# database, opened read-only. Its location follows goose (XDG): set
+# `GOOSE_SESSIONS_DB` to override it. A missing or locked database is an error
+# for that query only — never a write, never a crash.
 hub:
   # When false, no tunnel is opened and nothing is dialled.
   enabled: false

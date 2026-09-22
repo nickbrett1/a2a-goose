@@ -73,6 +73,10 @@ pub struct Agent {
     pub card_hash: String,
     pub goose: Goose,
     pub registry: Registry,
+    /// A read-only window onto goose's own `sessions.db`, which answers the
+    /// hub's `history.*` queries (§[`crate::history`]). The conversation record
+    /// is goose's, not this process's; this only maps it onto the wire shape.
+    pub history: crate::history::HistoryStore,
     /// How a turn is actually run. Held here rather than built inside
     /// [`router`] so that `/status` can report on the connection the turns use,
     /// and so an integration test can substitute a fake and pin the A2A wire
@@ -697,6 +701,10 @@ mod tests {
                 path: "/usr/local/bin/goose".into(),
                 version: crate::goose::Version::new(1, 50, 0),
             },
+            // A path that does not exist: these tests never ask for history,
+            // and a store that fails open is exactly what history should do
+            // when there is no database.
+            history: crate::history::HistoryStore::new("/nonexistent/a2a-goose/sessions.db"),
             registry,
             // `/status` must not need a `goose serve` to answer, so a fake is
             // the right thing for a status test: it is the *unavailable* case.
