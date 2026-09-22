@@ -253,7 +253,7 @@ hub:
   enabled: false
   # The hub's agent endpoint. Must be ws:// or wss://; a wrong scheme is a
   # warning at boot, not a failure.
-  url: "ws://roost.tail86fd19.ts.net:3000/agent/ws"
+  url: "ws://roost.tail86fd19.ts.net:3008/agent/ws"
   # NAME of the variable holding this agent's hub credential, never the value.
   # The credential is the whole auth boundary between an agent and its hub
   # (there is no browser login), and it is sent as `Authorization: Bearer ...`
