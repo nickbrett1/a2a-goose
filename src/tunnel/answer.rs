@@ -1,7 +1,7 @@
 //! Answering a hub `request` over the tunnel.
 //!
 //! The hub sends `request {id, method, params}` and waits for
-//! `response {id, ok, body?}`. In M2a the agent answers two methods:
+//! `response {id, ok, body?}`. The agent answers:
 //!
 //! - `status.get` → [`crate::server::status_payload`]. This is the one the hub
 //!   *polls* (every `status_poll_ms`) to fill the fleet view's in-flight count,
@@ -10,11 +10,15 @@
 //! - `sessions.list` → [`crate::server::sessions_payload`], the same retained-ACP
 //!   list `GET /sessions` serves, so the hub and the agent agree on one
 //!   definition of "a session".
+//! - `history.sessions` / `history.session` / `history.messages` /
+//!   `history.search` → [`crate::history`], read from goose's own
+//!   `sessions.db`. A missing or locked database is refused for that query
+//!   alone, never a crash and never a write.
 //!
-//! Everything else — `history.*`, `logs.tail`, anything from a newer hub — is
-//! refused with an explicit error rather than an empty body. A refusal the hub
-//! turns into a `502` is honest; an empty `200` would tell an operator there is
-//! nothing to see.
+//! Everything else — `logs.tail`, anything from a newer hub — is refused with an
+//! explicit error rather than an empty body. A refusal the hub turns into a
+//! `502` is honest; an empty `200` would tell an operator there is nothing to
+//! see.
 //!
 //! The dispatch is behind [`QueryAnswerer`] rather than a direct `&Agent` so the
 //! tunnel is testable without a `goose serve`: the tests in `tests/tunnel_e2e.rs`

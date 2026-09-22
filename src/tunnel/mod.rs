@@ -370,14 +370,24 @@ pub fn activity_frame(boot_id: &str, activity: &Activity) -> ActivityFrame {
 }
 
 impl QueryAnswerer for Agent {
-    fn answer(&self, method: &str, _params: &Value) -> Answer {
+    fn answer(&self, method: &str, params: &Value) -> Answer {
         match method {
             // The hub polls this for the fleet view's in-flight count.
             "status.get" => Answer::Body(crate::server::status_payload(self)),
             // The same retained-session list `GET /sessions` serves.
             "sessions.list" => Answer::Body(crate::server::sessions_payload(self)),
-            // `history.*` and `logs.tail` are M1/M3; refused by name in
-            // `answer::respond` so the hub gets a typed error, not an empty body.
+            // `history.*` is answered from goose's own `sessions.db`, read-only.
+            // A missing or locked database is an error for that query only —
+            // never a crash and never a write — so it becomes a typed refusal
+            // rather than an empty body.
+            "history.sessions" | "history.session" | "history.messages" | "history.search" => {
+                match self.history.answer(method, params) {
+                    Ok(body) => Answer::Body(body),
+                    Err(error) => Answer::Refused(format!("{error:#}")),
+                }
+            }
+            // `logs.tail` is M3; anything else from a newer hub is refused by
+            // name in `answer::respond` so the hub gets a typed error.
             _ => Answer::Unsupported,
         }
     }

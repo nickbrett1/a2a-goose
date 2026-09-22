@@ -15,6 +15,7 @@ pub mod card;
 pub mod config;
 pub mod executor;
 pub mod goose;
+pub mod history;
 pub mod recipes;
 pub mod registry;
 pub mod serve;

@@ -153,6 +153,7 @@ async fn run() -> anyhow::Result<()> {
         card_hash,
         goose,
         registry: registry.clone(),
+        history: a2a_goose::history::HistoryStore::new(a2a_goose::history::default_db_path()),
         turns,
         serve: serve_status,
         activity,
