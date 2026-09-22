@@ -405,6 +405,63 @@ async fn a_goose_that_exits_after_it_is_up_is_started_again() {
 }
 
 #[tokio::test]
+async fn a_goose_that_ignores_sigterm_is_still_stopped_and_reaped() {
+    // The fail-open half of shutdown. A goose that traps `SIGTERM` - or a build
+    // that hangs in it - must not be able to hold this process open. `stop_child`
+    // escalates to `SIGKILL` after the grace; this asserts both that it does and
+    // that the pid is gone rather than orphaned, which is the difference between
+    // a clean stop and a host that has to be `kill -KILL`ed by hand.
+    let stub = Stub::new("ignores-term", |marker| {
+        // `trap '' TERM` ignores SIGTERM outright, and the loop never exits on
+        // its own, so only the escalation can end it. The marker is touched
+        // *after* the trap is installed, because the readiness prober says yes
+        // at once and a shutdown that raced an uninstalled trap would just be
+        // the default action killing the child - a different, easier test.
+        format!(
+            "trap '' TERM\ntouch {}\nwhile :; do sleep 0.1; done",
+            marker.with_file_name("trap-installed").display()
+        )
+    });
+
+    let supervisor = start(
+        &config(&url(free_port().await)),
+        &stub.goose(),
+        RestartPolicy::default(),
+        Arc::new(Up),
+    )
+    .await
+    .expect("a child that is up is a start");
+    let status = supervisor.status();
+    let pid = status.health().pid.expect("the child has a pid");
+
+    // Prove the trap is installed before asking it to stop, so the test is
+    // about a child that *ignores* SIGTERM rather than one that never saw it.
+    until("the child to install its SIGTERM trap", || {
+        stub.beside("trap-installed").exists().then_some(())
+    })
+    .await;
+
+    let started = Instant::now();
+    supervisor.shutdown().await;
+    let took = started.elapsed();
+
+    assert_eq!(status.now(), ServeState::Stopped);
+    // SAFETY: `kill(pid, 0)` only probes for existence, and the pid is one this
+    // supervisor just reported.
+    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    assert_eq!(
+        alive, -1,
+        "the child that ignored SIGTERM was still running, not reaped"
+    );
+    // `stop_child` waits `STOP_GRACE` (5s) then sends SIGKILL; the bound here is
+    // about proving it returned rather than hanging, not about the exact delay.
+    assert!(
+        took <= Duration::from_secs(8),
+        "shutdown escalated to SIGKILL and returned rather than hanging: {took:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_goose_that_will_not_stay_up_is_given_up_on() {
     let stub = Stub::new("crashes", |_marker| "exit 3".to_string());
     let policy = RestartPolicy {
