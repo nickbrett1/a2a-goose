@@ -62,6 +62,12 @@ tag; unknown tags parse to `Unknown` and are ignored, never fatal.
   - `response { type, id, ok, body?, error? }`.
 - hub → agent: `request { type, id, method, params }` and
   `command { type, id, action, mode?, force? }`.
+- **Liveness (M2a follow-up, additive):** hub → agent
+  `ping { type, id? }`; agent → hub `pong { type, id? }` echoing the probe's
+  `id` when it had one. Both are new frame types, so the forward-compatibility
+  rule carries them: an agent that predates `ping` parses it as `Unknown` and
+  ignores it, and a hub that predates `pong` parses *that* as `Unknown` and
+  ignores it. Neither side can be dropped by a heartbeat it does not know.
 
 **Registration and ordering** (`src/fleet.rs`, `src/server.rs`):
 
@@ -129,3 +135,41 @@ src/tunnel/mod.rs        the client: dial, hello, replay+live, backoff, respond
 - `command` handling (reboot — M4). Answered `unsupported`.
 - Hub-side auth enforcement. We send the credential; roost must learn to check
   it. Tracked as a call in `docs/m2a-plan.md`.
+
+## 7. Liveness: not believing a socket that has quietly died
+
+A tunnel can be **half-open**: the peer is gone with no FIN or RST — a killed
+container, a NAT or tailnet path that silently dropped, a suspended host. The
+socket stays "connected" to the local kernel and `read()` parks forever, while
+the hub has long since written the agent off as offline. The agent then vanishes
+from mission control while its log still says it is connected, which is the exact
+silence the hub exists to surface. Two independent mechanisms now bound that:
+
+**Idle deadline (client-side, the backstop).** The read loop advances a deadline
+on **every inbound frame** and treats the socket as dead if nothing arrives
+within `hub.idleTimeoutSecs`. Crucially the clock is *not* advanced by the local
+activity feed: publishing our own activity is no evidence the hub is there, so a
+busy turn cannot mask a dead peer. A missed deadline is an `Err` out of
+`run_once`, which the existing capped-backoff loop redials — fail open, never a
+crash, never an exit.
+
+**Heartbeat (wire, additive).** The hub may send `ping`; the agent answers `pong`
+**from the read loop itself**, not through the answerer and not via the activity
+feed, so the reply does not wait on a turn in flight or a slow subscriber — the
+single job of a heartbeat is to prove the process is alive. Each `ping` is also
+inbound traffic, so on a healthy tunnel it keeps the idle deadline fresh. `ping`
+and `pong` are new frame types handled by the ordinary unknown-tag rule, so
+neither an older hub nor an older agent is affected.
+
+**Why the default is 90 s.** The hub is not quiet on a healthy tunnel: roost
+polls `status.get` every `status_poll_ms` (default **15 s**), with a heartbeat at
+a similar cadence. The window must clear that interval with room to spare, or
+ordinary scheduling jitter would drop healthy tunnels; 90 s is six poll
+intervals. It absorbs a missed poll or two and still notices a dead peer in under
+two minutes, after which the capped backoff (max 30 s) redials. Set
+`hub.idleTimeoutSecs` above the hub's `status_poll_ms` if it polls slower.
+
+Both mechanisms are tested without a real hub: `tests/tunnel_e2e.rs` stands up a
+server that completes the handshake and then goes silent (the client must drop
+and redial within the window) and a server that sends two `ping`s (the client
+must answer both with `pong` while idle).

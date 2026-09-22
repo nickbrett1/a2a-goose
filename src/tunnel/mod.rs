@@ -61,6 +61,21 @@ const BACKOFF_INITIAL: Duration = Duration::from_millis(500);
 /// hammered — one attempt every 30 s is plenty to notice it coming back.
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// How long the tunnel will sit on a read that yields nothing before it treats
+/// the socket as half-open and reconnects.
+///
+/// **Why 90 s.** The hub is not silent on a healthy tunnel: roost polls
+/// `status.get` every `status_poll_ms` (default **15 s**), and a heartbeat
+/// `ping` is expected at a similar cadence. The window therefore has to clear
+/// the poll interval with room to spare — an idle deadline near 15 s would drop
+/// healthy tunnels on ordinary scheduling jitter. Six poll intervals (90 s)
+/// absorbs a missed poll or two and a brief stall, while still surfacing a
+/// genuinely half-open peer in under two minutes; with the capped 30 s backoff
+/// the agent is back within ~2 minutes of the peer dying. A host that wants
+/// faster detection lowers `hub.idleTimeoutSecs`; one whose hub polls slower
+/// raises it above `status_poll_ms`.
+pub const IDLE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(90);
+
 /// Capped exponential reconnect backoff.
 ///
 /// Deterministic, with no jitter: the roost fleet is a handful of hosts, and a
@@ -117,6 +132,9 @@ pub struct Tunnel {
     activity: Arc<ActivityHub>,
     answers: Arc<dyn QueryAnswerer>,
     connect_timeout: Duration,
+    /// The bounded idle deadline on the read loop: no inbound frame for this
+    /// long and the socket is treated as half-open. See [`IDLE_TIMEOUT_DEFAULT`].
+    idle_timeout: Duration,
 }
 
 impl Tunnel {
@@ -136,12 +154,20 @@ impl Tunnel {
             activity,
             answers,
             connect_timeout: Duration::from_secs(10),
+            idle_timeout: IDLE_TIMEOUT_DEFAULT,
         }
     }
 
     /// Override the connect timeout, for a test that would rather not wait.
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
+        self
+    }
+
+    /// Override the idle deadline, for a test that would rather not wait out the
+    /// default. Production sets this from `hub.idleTimeoutSecs`.
+    pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = timeout;
         self
     }
 
@@ -209,6 +235,17 @@ impl Tunnel {
                 .await?;
         }
 
+        // The bounded idle deadline. A half-open TCP connection — the peer gone
+        // with no FIN or RST (a killed container, a dropped NAT/tailnet path, a
+        // suspended host) — leaves `stream.next()` parked forever, and the
+        // client would believe it is connected while the hub has written it off.
+        // The deadline is advanced **only** by an inbound frame, so a busy local
+        // activity feed cannot mask a dead hub: publishing our own activity is
+        // not evidence the hub is there.
+        //
+        // `sleep_until` is rebuilt each iteration but reads the stored deadline,
+        // so an activity event (which does not touch it) cannot reset the clock.
+        let mut idle_deadline = tokio::time::Instant::now() + self.idle_timeout;
         loop {
             tokio::select! {
                 event = live.recv() => match event {
@@ -227,6 +264,10 @@ impl Tunnel {
                     let Some(message) = message else {
                         return Ok(());
                     };
+                    // Any inbound frame is proof the peer is there — a hub
+                    // `request`, a heartbeat `ping`, even a WebSocket-level
+                    // ping — so the whole read resets the idle clock.
+                    idle_deadline = tokio::time::Instant::now() + self.idle_timeout;
                     match message? {
                         Message::Text(text) => {
                             if let Some(response) = self.handle_server_frame(text.as_str()) {
@@ -239,6 +280,13 @@ impl Tunnel {
                         Message::Ping(payload) => sink.send(Message::Pong(payload)).await?,
                         _ => {}
                     }
+                }
+                _ = tokio::time::sleep_until(idle_deadline) => {
+                    anyhow::bail!(
+                        "no frame from the hub in {:?}; treating the tunnel as half-open \
+                         and reconnecting",
+                        self.idle_timeout
+                    );
                 }
             }
         }
@@ -288,6 +336,12 @@ impl Tunnel {
                 let response = answer::refuse_command(&command.id, &command.action);
                 Some(response.to_value())
             }
+            // Answered here, in the read loop, not through the answerer and not
+            // via the activity feed: a heartbeat's only job is to prove the
+            // process is alive, so it must not be gated behind a turn in flight
+            // or a slow subscriber. A `pong` goes back on the same connection at
+            // once.
+            ServerFrame::Ping(ping) => Some(protocol::pong_value(ping.id.as_deref())),
             ServerFrame::Unknown { type_tag } => {
                 tracing::debug!(type_tag, "ignoring an unknown hub frame type");
                 None
@@ -379,7 +433,8 @@ pub fn spawn(config: &Config, agent: Arc<Agent>) -> Option<JoinHandle<()>> {
         Arc::clone(&agent.activity),
         Arc::clone(&agent) as Arc<dyn QueryAnswerer>,
     )
-    .with_connect_timeout(Duration::from_secs(config.hub.connect_timeout_secs.max(1)));
+    .with_connect_timeout(Duration::from_secs(config.hub.connect_timeout_secs.max(1)))
+    .with_idle_timeout(Duration::from_secs(config.hub.idle_timeout_secs.max(1)));
     Some(tokio::spawn(tunnel.run()))
 }
 
@@ -499,6 +554,21 @@ mod tests {
             .unwrap();
         assert_eq!(command["ok"], false);
         assert_eq!(command["error"], "unsupported_action: reboot");
+    }
+
+    #[test]
+    fn a_ping_is_answered_with_a_pong_and_echoes_an_id() {
+        let pong = tunnel()
+            .handle_server_frame(r#"{"type":"ping"}"#)
+            .expect("a bare ping is answered");
+        assert_eq!(pong["type"], "pong");
+        assert!(pong.get("id").is_none(), "a bare ping gets a bare pong");
+
+        let echoed = tunnel()
+            .handle_server_frame(r#"{"type":"ping","id":"p-9"}"#)
+            .expect("a ping with an id is answered");
+        assert_eq!(echoed["type"], "pong");
+        assert_eq!(echoed["id"], "p-9");
     }
 
     #[test]

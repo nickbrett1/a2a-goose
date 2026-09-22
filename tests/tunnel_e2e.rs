@@ -142,6 +142,74 @@ async fn start_reconnect_hub() -> (SocketAddr, JoinHandle<()>, SharedFrames) {
     (addr, task, hellos)
 }
 
+/// A hub that accepts tunnels forever, reads each `hello`, then goes **silent**:
+/// it holds the socket open without ever sending a frame. This is the shape of a
+/// half-open peer as seen from the client — no FIN, no RST, just no data — so
+/// the only thing that can notice it is the idle deadline.
+async fn start_silent_hub() -> (SocketAddr, JoinHandle<()>, SharedFrames) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let hellos: SharedFrames = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&hellos);
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let recorded = Arc::clone(&recorded);
+            tokio::spawn(async move {
+                let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                if let Some(hello) = next_text(&mut socket).await {
+                    recorded.lock().unwrap().push(hello);
+                }
+                // Read (and discard) whatever the client sends, but never write:
+                // the socket stays open and quiet, exactly like a peer that has
+                // vanished from the network's point of view.
+                while socket.next().await.is_some() {}
+            });
+        }
+    });
+    (addr, task, hellos)
+}
+
+/// A hub that accepts one tunnel, sends two heartbeat `ping`s (one with an id,
+/// one bare), and records the `pong`s it gets back.
+async fn start_pinging_hub() -> (SocketAddr, JoinHandle<()>, SharedFrames) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let pongs: SharedFrames = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&pongs);
+    let task = tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
+            return;
+        };
+        if next_text(&mut socket).await.is_none() {
+            return;
+        }
+        let _ = socket
+            .send(Message::Text(
+                json!({ "type": "ping", "id": "hb-1" }).to_string().into(),
+            ))
+            .await;
+        let _ = socket
+            .send(Message::Text(json!({ "type": "ping" }).to_string().into()))
+            .await;
+        while let Some(frame) = next_text(&mut socket).await {
+            recorded.lock().unwrap().push(frame);
+            let seen = recorded.lock().unwrap();
+            if seen.iter().filter(|f| f["type"] == "pong").count() >= 2 {
+                return;
+            }
+        }
+    });
+    (addr, task, pongs)
+}
+
 fn find<'a>(frames: &'a [Value], type_tag: &str, id: Option<&str>) -> Option<&'a Value> {
     frames
         .iter()
@@ -260,4 +328,64 @@ async fn an_unreachable_hub_is_a_retry_and_never_a_crash() {
         "an unreachable hub must not stop the tunnel task"
     );
     client.abort();
+}
+
+/// The failure this fix exists for: a hub that completes the handshake and then
+/// never speaks again must be noticed in bounded time, not parked on forever.
+///
+/// The server here accepts the WebSocket and holds it open without a frame, so
+/// no FIN/RST arrives — the same half-open shape as a killed container or a
+/// dropped NAT path. With a short idle window the client must drop and redial on
+/// its own; a second `hello` is the proof.
+#[tokio::test]
+async fn a_silent_hub_is_dropped_and_retried_within_the_idle_window() {
+    let (addr, hub_task, hellos) = start_silent_hub().await;
+    let (tunnel, _activity) = tunnel_for(addr, Arc::new(Stub));
+    // A 400 ms window instead of the 90 s default: the assertion is about the
+    // mechanism, not the number.
+    let tunnel = tunnel.with_idle_timeout(Duration::from_millis(400));
+    let client = tokio::spawn(tunnel.run());
+
+    let seen = Arc::clone(&hellos);
+    assert!(
+        wait_for(Duration::from_secs(5), || seen.lock().unwrap().len() >= 2).await,
+        "a silent hub must be dropped and retried within the idle window"
+    );
+    assert!(
+        !client.is_finished(),
+        "a half-open socket must be a retry, never a crash"
+    );
+
+    client.abort();
+    hub_task.abort();
+}
+
+/// A `ping` must be answered with a `pong` at once, from the read loop itself —
+/// not through the answerer or the activity feed, which may both be busy with a
+/// turn. No turn is running here, and the activity hub is empty: the only reason
+/// a `pong` can come back is that the tunnel answers the heartbeat directly.
+#[tokio::test]
+async fn a_ping_is_answered_with_a_pong_while_the_tunnel_is_idle() {
+    let (addr, hub_task, pongs) = start_pinging_hub().await;
+    let (tunnel, _activity) = tunnel_for(addr, Arc::new(Stub));
+    let client = tokio::spawn(tunnel.run());
+
+    let seen = Arc::clone(&pongs);
+    assert!(
+        wait_for(Duration::from_secs(5), || {
+            let seen = seen.lock().unwrap();
+            let echoed = seen
+                .iter()
+                .any(|f| f["type"] == "pong" && f["id"] == "hb-1");
+            let bare = seen
+                .iter()
+                .any(|f| f["type"] == "pong" && f.get("id").is_none());
+            echoed && bare
+        })
+        .await,
+        "both pings must be answered: one echoes its id, one stays bare"
+    );
+
+    client.abort();
+    hub_task.abort();
 }

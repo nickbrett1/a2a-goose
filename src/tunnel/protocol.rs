@@ -156,11 +156,53 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// A hub→agent liveness probe: the hub asks "are you still there?", the agent
+/// answers [`pong_value`].
+///
+/// This is **purely additive**, which is the whole point of the design: a hub
+/// that sends `ping` to an agent build that predates this frame is met with
+/// [`ServerFrame::Unknown`] and ignored, and the `pong` this agent sends to a
+/// hub that predates it is a `ClientFrame::Unknown` on the hub's side and
+/// likewise ignored. Neither side can be made to drop a working tunnel by a
+/// heartbeat it does not understand.
+///
+/// `id` is optional so the frame stays minimal on the wire; an agent echoes it
+/// back on the `pong` when present, which lets a future hub correlate a probe
+/// with its answer. Unknown *fields* (a `sentAt`, say) are ignored, so the hub
+/// may attach whatever it likes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PingFrame {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+impl PingFrame {
+    /// The `ping` frame as it goes on the wire: the fields plus the `type` tag.
+    pub fn to_value(&self) -> Value {
+        tagged("ping", self)
+    }
+}
+
+/// The `pong` answering a [`PingFrame`], as it goes on the wire.
+///
+/// Built by hand rather than from a struct because it carries nothing but the
+/// echoed `id` (when the probe had one); a hub that sent a bare
+/// `{"type":"ping"}` gets a bare `{"type":"pong"}` back.
+pub fn pong_value(id: Option<&str>) -> Value {
+    match id {
+        Some(id) => json!({ "type": "pong", "id": id }),
+        None => json!({ "type": "pong" }),
+    }
+}
+
 /// A frame the hub sends an agent.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServerFrame {
     Request(Box<RequestFrame>),
     Command(Box<CommandFrame>),
+    /// A liveness probe, answered with a `pong`.
+    Ping(Box<PingFrame>),
     /// A tag this agent build does not know. Ignored, never fatal.
     Unknown {
         type_tag: String,
@@ -178,6 +220,7 @@ impl ServerFrame {
         Ok(match type_tag {
             "request" => ServerFrame::Request(Box::new(serde_json::from_value(value.clone())?)),
             "command" => ServerFrame::Command(Box::new(serde_json::from_value(value.clone())?)),
+            "ping" => ServerFrame::Ping(Box::new(serde_json::from_value(value.clone())?)),
             _ => ServerFrame::Unknown {
                 type_tag: type_tag.to_string(),
             },
@@ -319,6 +362,42 @@ mod tests {
             ServerFrame::parse(&raw).expect("parses"),
             ServerFrame::Unknown {
                 type_tag: "subscribe_ack".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_ping_parses_with_or_without_an_id_and_ignores_extra_fields() {
+        // The bare probe an older/newer hub may send.
+        assert_eq!(
+            ServerFrame::parse(&json!({ "type": "ping" })).expect("parses"),
+            ServerFrame::Ping(Box::new(PingFrame { id: None }))
+        );
+        // An id, echoed back on the pong, plus a field we do not know: the
+        // heartbeat must stay additive, so an unknown field is ignored.
+        assert_eq!(
+            ServerFrame::parse(&json!({ "type": "ping", "id": "p-1", "sentAt": 123 }))
+                .expect("parses"),
+            ServerFrame::Ping(Box::new(PingFrame {
+                id: Some("p-1".to_string())
+            }))
+        );
+    }
+
+    #[test]
+    fn a_pong_echoes_the_id_only_when_the_ping_had_one() {
+        assert_eq!(pong_value(None), json!({ "type": "pong" }));
+        assert_eq!(
+            pong_value(Some("p-1")),
+            json!({ "type": "pong", "id": "p-1" })
+        );
+        // A `pong` coming the *other* way (a hub echoing us, a bug) is an
+        // unknown server frame, not a fatal one: the additive rule holds for
+        // the reply type too.
+        assert_eq!(
+            ServerFrame::parse(&json!({ "type": "pong" })).expect("parses"),
+            ServerFrame::Unknown {
+                type_tag: "pong".to_string()
             }
         );
     }
