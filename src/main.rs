@@ -13,7 +13,7 @@
 //! not start: it advertises skills in the LiteLLM registry and fails every turn.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use a2a_goose::acp::AcpTurns;
 use a2a_goose::activity::ActivityHub;
@@ -167,23 +167,53 @@ async fn run() -> anyhow::Result<()> {
     // hub is configured.
     let _tunnel = a2a_goose::tunnel::spawn(&config, Arc::clone(&agent));
 
-    axum::serve(listener, server::router(agent, token))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // Bounded graceful drain. `shutdown_signal` closes the listener at once
+    // (so `/healthz` goes to 000 while connections finish), but it does not
+    // wait on them forever: an SSE `/events` subscriber - and an in-flight A2A
+    // turn - is a connection that is meant to stay open, and an unbounded wait
+    // on it is a host that never exits. `serve_until` bounds the drain so the
+    // steps below, which stop the goose child, always run. See `serve_until`.
+    server::serve_until(
+        listener,
+        server::router(agent, token),
+        shutdown_signal(),
+        server::SHUTDOWN_GRACE,
+    )
+    .await?;
 
     // Stop the process this one started, before this one goes. The watcher is
     // what stops it; this is what makes the *attempt*, so a shutdown does not
     // leave a goose holding the port (and the host's recipes) under a dead
-    // agent. `SIGTERM` first, then a grace period - see `serve::stop_child`.
+    // agent. `SIGTERM` first, then a grace period, then `SIGKILL` - so a goose
+    // that ignores `SIGTERM` is still reaped and never holds the exit open (see
+    // `serve::stop_child`).
     if let Some(supervisor) = supervisor {
         supervisor.shutdown().await;
     }
 
     // Clean shutdown only, and never a liveness mechanism: OOM, a host sleep or
     // a wedged process all skip this, which is exactly why the sweeper exists.
-    registry.deregister().await;
+    // Bounded for the same reason as everything above it: a LiteLLM that is
+    // down or unreachable costs a log line, never the process's exit.
+    if tokio::time::timeout(DEREGISTER_GRACE, registry.deregister())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            grace_secs = DEREGISTER_GRACE.as_secs(),
+            "deregistration did not finish in time; exiting anyway"
+        );
+    }
     Ok(())
 }
+
+/// How long the best-effort deregistration gets before the process exits.
+///
+/// Deregistration is a courtesy to the registry, not a condition of exit: the
+/// sweeper reclaims a stale row anyway (see `registry`). A host that will not
+/// exit because the proxy is down is the same un-supervisable failure as a
+/// shutdown held open by a stream.
+const DEREGISTER_GRACE: Duration = Duration::from_secs(3);
 
 /// Ends this process when the goose it started is given up on.
 ///

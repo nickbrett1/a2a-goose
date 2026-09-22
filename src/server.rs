@@ -31,8 +31,9 @@
 //! token check lives there.
 
 use std::convert::Infallible;
+use std::future::Future;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use a2a::AgentCard;
 use a2a_server::agent_card::{StaticAgentCard, agent_card_router};
@@ -149,6 +150,75 @@ pub async fn serve(
     bearer_token: Arc<str>,
 ) -> std::io::Result<()> {
     axum::serve(listener, router(agent, bearer_token)).await
+}
+
+/// How long open HTTP connections get to finish after a shutdown is requested.
+///
+/// Not a grace period for the *caller*: it is the bound that keeps a stream that
+/// is designed never to end from holding the whole process open. See
+/// [`serve_until`].
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
+/// Serves `listener` until `shutdown` resolves, then gives still-open
+/// connections `grace` to finish before returning anyway.
+///
+/// This replaces a bare `axum::serve(..).with_graceful_shutdown(..)`, which
+/// waits for **every** open connection to end before its future resolves.
+/// `GET /events` is an SSE stream that is *meant* to never end, and an in-flight
+/// A2A turn can stream for a long time, so "wait for every connection" is
+/// effectively "wait forever" whenever a client is subscribed. The failure that
+/// produced this function: on `SIGTERM` the host closed its `:10001` listener
+/// (so `/healthz` went to 000) but never exited — the shutdown steps *after* the
+/// server future, which stop the `goose serve` child and deregister, never ran,
+/// and the process sat parked until the SSE client went away. A bounded drain is
+/// what keeps the host supervisable.
+///
+/// The grace begins when `shutdown` resolves, not when this function is called:
+/// the server runs unbounded until then.
+pub async fn serve_until(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    grace: Duration,
+) -> std::io::Result<()> {
+    // A `watch` rather than a `Notify`: the value is stored, so a waiter that
+    // registers *after* the signal still observes it. `Notify::notify_waiters`
+    // wakes only waiters already registered, and that lost wake-up is exactly
+    // the race this function exists to remove.
+    let (stopping, stop) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown.await;
+        let _ = stopping.send(true);
+    });
+
+    let serving = axum::serve(listener, router).with_graceful_shutdown(wait_for_stop(stop.clone()));
+
+    let deadline = async move {
+        wait_for_stop(stop).await;
+        tokio::time::sleep(grace).await;
+    };
+
+    tokio::select! {
+        result = serving => result,
+        _ = deadline => {
+            tracing::warn!(
+                grace_secs = grace.as_secs(),
+                "HTTP connections did not drain after shutdown; stopping anyway"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Resolves once `stop` holds `true`, including if it already did.
+async fn wait_for_stop(mut stop: tokio::sync::watch::Receiver<bool>) {
+    while !*stop.borrow() {
+        if stop.changed().await.is_err() {
+            // The sender went away without signalling. Treat that as a stop:
+            // a dropped task must not be able to turn into a hang.
+            return;
+        }
+    }
 }
 
 /// Liveness only, deliberately (§6.6).
@@ -542,6 +612,65 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::config::ServeMode;
+
+    /// The regression for the `SIGTERM` hang: an SSE subscriber must not hold
+    /// the process open.
+    ///
+    /// `GET /events` is a stream that never ends *by design*, so the bare
+    /// graceful shutdown this replaced waited on it forever. The observed
+    /// failure was a host that closed its `:10001` listener on `SIGTERM` (so
+    /// `/healthz` returned 000) and then sat parked — the goose child was never
+    /// stopped and the process never exited. `serve_until` must return inside
+    /// its grace with the connection still open.
+    #[tokio::test]
+    async fn an_open_sse_subscriber_does_not_hold_the_shutdown_open() {
+        use tokio::io::AsyncWriteExt;
+
+        let app = Router::new().route(
+            "/never",
+            get(|| async { Sse::new(futures::stream::pending::<Result<Event, Infallible>>()) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let (shutdown, wait_for_it) = tokio::sync::oneshot::channel::<()>();
+        let grace = Duration::from_millis(300);
+        let serving = tokio::spawn(serve_until(
+            listener,
+            app,
+            async move {
+                let _ = wait_for_it.await;
+            },
+            grace,
+        ));
+
+        // Subscribe and *hold* the connection: the route answers with an SSE
+        // stream that never yields, so the socket stays open until we drop it.
+        let mut subscriber = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        subscriber
+            .write_all(b"GET /never HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write request");
+        // Let the server accept and start the stream before asking it to stop.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let _ = shutdown.send(());
+        let started = Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(2), serving)
+            .await
+            .expect("serve_until returned despite the open subscriber")
+            .expect("the serving task did not panic");
+        result.expect("a clean return");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the drain was bounded by the grace, not by the subscriber: took {:?}",
+            started.elapsed()
+        );
+
+        drop(subscriber);
+    }
 
     fn agent() -> Agent {
         let mut config = Config::default();
