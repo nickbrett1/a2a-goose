@@ -623,6 +623,14 @@ pub struct Hub {
     /// giving up on the attempt and backing off.
     #[serde(default = "default_hub_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
+    /// The bounded idle deadline on the tunnel read: if no frame arrives from
+    /// the hub for this many seconds the socket is treated as half-open (the
+    /// peer gone with no FIN/RST) and the tunnel reconnects through the normal
+    /// backoff. Must comfortably exceed the hub's `status_poll_ms` (roost's
+    /// default is 15 s) so a healthy tunnel is never dropped on jitter; the
+    /// default of 90 s is six poll intervals. See [`crate::tunnel`].
+    #[serde(default = "default_hub_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
 }
 
 impl Default for Hub {
@@ -633,6 +641,7 @@ impl Default for Hub {
             credential_env: default_hub_credential_env(),
             kind: default_hub_kind(),
             connect_timeout_secs: default_hub_connect_timeout_secs(),
+            idle_timeout_secs: default_hub_idle_timeout_secs(),
         }
     }
 }
@@ -745,6 +754,12 @@ fn default_hub_kind() -> String {
 
 fn default_hub_connect_timeout_secs() -> u64 {
     10
+}
+
+/// Six roost status polls (15 s each): see [`crate::tunnel::IDLE_TIMEOUT_DEFAULT`]
+/// for why the idle window is this size.
+fn default_hub_idle_timeout_secs() -> u64 {
+    90
 }
 
 /// Every way starting can be refused. Each variant names the setting and what is
@@ -1581,6 +1596,9 @@ mod tests {
         assert_eq!(hub.kind, "a2a-goose");
         assert_eq!(hub.credential_env, "A2A_GOOSE_HUB_TOKEN");
         assert_eq!(hub.connect_timeout_secs, 10);
+        // Six roost status polls: a healthy tunnel that misses a poll or two is
+        // not mistaken for a half-open one.
+        assert_eq!(hub.idle_timeout_secs, 90);
         // And it is in the resolved config, not just the type.
         assert!(!Config::default().hub.enabled);
     }

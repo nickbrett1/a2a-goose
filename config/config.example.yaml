@@ -265,3 +265,9 @@ hub:
   kind: "a2a-goose"
   # How long to wait for the hub handshake before backing off and retrying.
   connectTimeoutSecs: 10
+  # The bounded idle deadline on the tunnel read. If no frame arrives from the
+  # hub for this long the socket is treated as half-open (peer gone, no FIN/RST)
+  # and the tunnel reconnects through the normal backoff. Must comfortably
+  # exceed the hub's status_poll_ms (roost's default is 15 s); 90 s is six polls,
+  # so a missed poll or two is not mistaken for a dead peer.
+  idleTimeoutSecs: 90
