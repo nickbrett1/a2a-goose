@@ -65,6 +65,15 @@ COMMON_CONFIG="${A2A_GOOSE_COMMON_CONFIG:-prd}"
 
 CARD_PORT=10001
 ACP_URL="http://127.0.0.1:3284/acp"
+
+# The central hub ("roost") this agent registers with over a websocket tunnel,
+# so it appears in the fleet. A `hub:` block is emitted only when it is enabled
+# AND a URL is set: an EMPTY HUB_URL must mean "no hub block at all", never a
+# block with a blank url that the client would refuse to dial. Setting
+# A2A_GOOSE_HUB_ENABLED=false is how a devcontainer opts out of the fleet. The
+# default host `nas` is the same one LITELLM_BASE_URL already resolves against.
+HUB_URL="${A2A_GOOSE_HUB_URL:-ws://nas:3008/agent/ws}"
+HUB_ENABLED="${A2A_GOOSE_HUB_ENABLED:-true}"
 LITELLM_BASE_URL="http://nas:4000"
 
 # The address the card advertises MUST NOT be loopback - the agent refuses to
@@ -208,6 +217,11 @@ read_secret() {
       doppler secrets get "${key}" --project "${COMMON_PROJECT}" --config "${COMMON_CONFIG}" --plain 2>/dev/null || true
     )"
   fi
+  if [ -z "${value}" ]; then
+    value="$(
+      doppler secrets get "${key}" --project "${PROVIDER_PROJECT}" --config "${PROVIDER_CONFIG}" --plain 2>/dev/null || true
+    )"
+  fi
   printf '%s' "${value}"
 }
 
@@ -236,7 +250,7 @@ read_provider_secret() {
 write_env_file() {
   mkdir -p "${CONFIG_DIR}" || return 1
   local content="" key value
-  for key in A2A_GOOSE_BEARER_TOKEN LITELLM_MASTER_KEY LITELLM_BASE_URL GOOSE_SERVER__SECRET_KEY; do
+  for key in A2A_GOOSE_BEARER_TOKEN A2A_GOOSE_HUB_TOKEN LITELLM_MASTER_KEY LITELLM_BASE_URL GOOSE_SERVER__SECRET_KEY; do
     value="$(read_secret "${key}")"
     if [ -n "${value}" ]; then
       content="${content}${key}=${value}"$'\n'
@@ -291,6 +305,19 @@ write_env_file() {
       "It will register, and then fail every turn with 'Failed to resolve provider'." \
       "Fix: run 'doppler login' (or point A2A_GOOSE_PROVIDER_PROJECT / _CONFIG at the right config) and restart."
   fi
+
+  # The hub client refuses to dial at all when credentialEnv is empty, so a hub
+  # enabled with no token is a silent non-registration rather than a refused
+  # start - say it out loud here, because there is nothing downstream that will.
+  if [ "${HUB_ENABLED}" = "true" ] && [ -n "${HUB_URL}" ]; then
+    if ! grep -q '^A2A_GOOSE_HUB_TOKEN=' "${written}" 2>/dev/null; then
+      loud "The hub is enabled (${HUB_URL}) but no A2A_GOOSE_HUB_TOKEN is available." \
+        "It is looked for in this repo's Doppler config, then ${COMMON_PROJECT}/${COMMON_CONFIG}," \
+        "then ${PROVIDER_PROJECT}/${PROVIDER_CONFIG}." \
+        "The agent will start but refuse to dial the hub, so it will not appear in the fleet." \
+        "Fix: run 'doppler login' (or set A2A_GOOSE_HUB_TOKEN) and restart."
+    fi
+  fi
   return 0
 }
 
@@ -327,6 +354,23 @@ registry:
   # Re-registering by name is what reclaims the row a previous container left.
   reRegisterOnCardChange: true
 YAML
+  # The hub block is appended, not part of the heredoc, because it is conditional.
+  # A `start` MUST NOT drop a tunnel that was there before: this is the only place
+  # the config is rewritten, so a hub block omitted here is one a running client
+  # loses on the next start. Fields match a2a-goose's config schema exactly -
+  # credentialEnv, connectTimeoutSecs, idleTimeoutSecs are case-sensitive.
+  if [ "${HUB_ENABLED}" = "true" ] && [ -n "${HUB_URL}" ]; then
+    cat >>"${CONFIG_FILE}" <<YAML
+
+hub:
+  enabled: true
+  url: "${HUB_URL}"
+  credentialEnv: "A2A_GOOSE_HUB_TOKEN"
+  kind: "a2a-goose"
+  connectTimeoutSecs: 10
+  idleTimeoutSecs: 90
+YAML
+  fi
   chmod 600 "${CONFIG_FILE}" 2>/dev/null || true
   log "wrote ${CONFIG_FILE}"
 }
