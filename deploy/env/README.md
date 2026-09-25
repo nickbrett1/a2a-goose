@@ -14,6 +14,30 @@ so a new host has something to start from; they must never contain a real secret
 which is why every value that is a secret is a *placeholder* here and the real
 one comes from wherever that host already keeps secrets.
 
+## `A2A_GOOSE_HUB_TOKEN` is the fleet's front door
+
+An agent appears in roost mission control ("the fleet") only by dialling the hub,
+and the hub authenticates the WebSocket handshake with `Authorization: Bearer
+<token>` — the token from the variable its `config.yaml` names in
+`hub.credentialEnv`, here `A2A_GOOSE_HUB_TOKEN`. There is no browser login, so
+this one secret is the whole auth boundary between an agent and the fleet, and
+the client **refuses to dial** when it is empty rather than connecting
+anonymously. A hub enabled with no token is therefore a silent
+*non-registration*, not a refused start — the agent comes up, registers with
+LiteLLM, and simply never shows in the fleet.
+
+The value lives in **Doppler — project `goose`, config `prd`, key
+`A2A_GOOSE_HUB_TOKEN`** — and belongs in `ENV_FILE` beside the bearer token. The
+config carries the variable's *name* (`credentialEnv`), never the value, and a
+release never carries either. `deploy/ensure-hub.sh` adds the key (as a
+`REPLACE_ME` placeholder) and the matching `hub:` block when they are missing; it
+cannot add the value, so a host still on the placeholder registers and stays out
+of the fleet — exactly mac-studio's state before 2026-09-25.
+
+| Key | Source | Shape |
+| --- | ------ | ----- |
+| `A2A_GOOSE_HUB_TOKEN` | Doppler `goose/prd`, key `A2A_GOOSE_HUB_TOKEN` | secret string |
+
 ## `bind` and `publicUrl` name the same address
 
 `A2A_GOOSE_PUBLIC_URL` is what goes on the card and what LiteLLM dials;

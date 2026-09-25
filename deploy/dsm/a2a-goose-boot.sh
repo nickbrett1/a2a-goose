@@ -105,6 +105,23 @@ fi
 A2A_GOOSE_DEPLOY_DIR="${A2A_GOOSE_DEPLOY_DIR:-${HOME}/.local/share/a2a-goose}"
 LAUNCHER="${A2A_GOOSE_DEPLOY_DIR}/fetch-launch.sh"
 
+# The hub wiring, made idempotent. An agent only appears in roost mission
+# control if its config.yaml carries a `hub:` block and its ENV_FILE carries
+# A2A_GOOSE_HUB_TOKEN; the devcontainer path wrote both, the host-process path
+# did not, and mac-studio ran for a week registered with LiteLLM but invisible
+# in the fleet as a result (2026-09-25). ensure-hub.sh sits beside this file and
+# ADDS only what is missing - it never regenerates the hand-authored config or
+# env - so running it on every start is safe and self-healing. It is asked for
+# by path relative to this file, so it travels with the checkout this wrapper is
+# already taken from.
+#
+# This is the wiring half only. A host also has to be *restarted* to pick up a
+# release that contains the hub code: the launcher fetches on every start, so
+# the restart below (or the next boot) is what upgrades a stale payload. That is
+# why deploy/README.md says restart the host, never just edit the config.
+SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)"
+ENSURE_HUB="${A2A_GOOSE_ENSURE_HUB:-${SCRIPT_DIR}/../ensure-hub.sh}"
+
 # Seconds between restarts. Long enough that a payload which dies instantly does
 # not spin, short enough that a transient failure is not a night-long outage.
 RESTART_DELAY="${RESTART_DELAY:-30}"
@@ -119,6 +136,18 @@ log() {
 if [ ! -x "$LAUNCHER" ]; then
   log "no launcher at ${LAUNCHER} - run the cold start in LAUNCHING.md, or set A2A_GOOSE_DEPLOY_DIR"
   exit 1
+fi
+
+# Wire the hub before the first start (and on every restart, since this whole
+# script is re-run at boot). A failure here is not fatal to booting - the agent
+# still serves turns - but it means no fleet membership, so it is logged rather
+# than swallowed. ensure-hub.sh is idempotent: on a host already carrying the
+# block and the token this is a no-op.
+if [ -x "$ENSURE_HUB" ]; then
+  "$ENSURE_HUB" ||
+    log "ensure-hub.sh failed - starting anyway; a host with no hub block or token will not appear in the fleet"
+else
+  log "no ensure-hub.sh at ${ENSURE_HUB} - hub wiring not confirmed"
 fi
 
 # The launcher sources ENV_FILE ($HOME/.config/a2a-goose/env, mode 0600) itself,

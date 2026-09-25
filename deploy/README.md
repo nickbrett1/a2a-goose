@@ -16,6 +16,10 @@ restart it when it exits.
 | macOS | `launchd/com.nick.a2a-goose.plist` | `launchd` `KeepAlive` |
 | DSM 7 | `dsm/a2a-goose-boot.sh` | DSM Task Scheduler (boot) + a wrapper loop |
 
+`ensure-hub.sh` is the third file and the fleet's entry point: it makes the
+per-host wiring that puts an agent in roost mission control idempotent. It is not
+a unit and starts nothing — see *Joining the fleet* below.
+
 ## goose is a child process, and this deployment no longer starts it
 
 There are two long-lived processes on a host, and the agent needs both: itself,
@@ -60,9 +64,72 @@ The launcher is itself a **release asset** (S11): the cold start above installs
 it, and every start it replaces itself with whatever the manifest advertises —
 verify the `sha256`, parse-check it, rename it over its own path, fail open. An
 init unit therefore names a fixed path that nothing else owns, not a checkout.
-The DSM *wrapper* is the one file still taken from a checkout, because it is the
-init glue itself; it is thirty lines and changes rarely, which is the property
-the launcher did not have.
+The DSM *wrapper* is the one part still taken from a checkout, because it is
+the init glue itself; it is thirty lines and changes rarely, which is the
+property the launcher did not have. It is also what calls `ensure-hub.sh` on
+every boot (see *Joining the fleet*), which is the same trade: a checkout file,
+but one whose only job is to add a stable block that is missing.
+
+## Joining the fleet: the roost hub
+
+An agent is in roost mission control ("the fleet") only if it dials the hub. The
+devcontainer path always wrote that wiring (`scripts/agent-dev.sh`); the
+host-process path in this directory did not. On 2026-09-25 mac-studio was found
+running for **over a week** with neither half of it — no `hub:` block in
+`~/.config/a2a-goose/config.yaml`, no `A2A_GOOSE_HUB_TOKEN` in its env, and a
+payload (0.1.41) that predated the hub code entirely. It registered with LiteLLM
+on every start, so every health signal said *fine*, and it never appeared in the
+fleet.
+
+Two things are needed, and `ensure-hub.sh` is how the host-process path gets
+them:
+
+1. a `hub:` block in the agent's `config.yaml`
+
+   ```yaml
+   hub:
+     enabled: true
+     url: "ws://nas:3008/agent/ws"
+     credentialEnv: "A2A_GOOSE_HUB_TOKEN"
+     kind: "a2a-goose"
+     connectTimeoutSecs: 10
+     idleTimeoutSecs: 90
+   ```
+
+   Field names are case-sensitive: the config is camelCase and
+   `deny_unknown_fields`, so a misspelled key is a parse error, not a default.
+   `url` is the hub's agent endpoint; `credentialEnv` is the **name** of the
+   variable holding the token, never the token itself.
+2. `A2A_GOOSE_HUB_TOKEN` in `ENV_FILE`, holding the secret the block names. It
+   lives in Doppler — project `goose`, config `prd`.
+
+Both files are **hand-authored** on a host, so `deploy/` never regenerates them.
+`ensure-hub.sh` is additive and idempotent: it appends the block only when the
+config has no top-level `hub:`, appends the token only when the env has no
+`A2A_GOOSE_HUB_TOKEN=`, backs each file up first (`*.bak-<utc-stamp>`), and
+leaves anything already present untouched. Run it as the user that owns goose:
+
+```bash
+deploy/ensure-hub.sh
+```
+
+It cannot supply the secret's *value*, only its *key*: it writes a `REPLACE_ME`
+placeholder and says loudly that the fleet will stay empty until the real value
+is pasted in from Doppler. On DSM the boot wrapper runs it on every start; on
+macOS it is a deploy step, because launchd runs one program and this unit
+deliberately has no shell wrapper.
+
+**A restart is the other half, and it is not optional.** The launcher fetches the
+newest release on every start, so a host that is *edited* but not restarted keeps
+running the payload it already has. mac-studio sat eight days on a hub-less
+0.1.41 for exactly that reason — the launchd job had been up since 2026-09-17
+and only self-updates at start — and the restart is what pulled 0.1.59.
+Restart by the book ([RUNBOOK.md](../RUNBOOK.md)): `kill -TERM <payload pid>`
+and let `KeepAlive` bring it back, or `launchctl kickstart
+gui/<uid>/com.nick.a2a-goose` when the job is already down. **Never `launchctl
+kickstart -k`** — `-k` is a `SIGKILL` and orphans the goose child. On DSM, stop
+the payload and let the wrapper loop relaunch it. Changing a config or env file
+is not a restart and pulls nothing.
 
 ## What is *not* here
 
@@ -73,9 +140,9 @@ the launcher did not have.
   Scheduler own restarts; the agent owns the one process it started (see above),
   and eviction is the liveness sweeper's job (a separate service, out of scope).
 - **No env file.** Every host-local value — the bearer token, `LITELLM_BASE_URL`,
-  the bind address — lives in `ENV_FILE` (`$HOME/.config/a2a-goose/env`, mode
-  `0600`), which the launcher sources on its way to the exec. Secrets never
-  enter a release.
+  the bind address, and the hub token the fleet needs — lives in `ENV_FILE`
+  (`$HOME/.config/a2a-goose/env`, mode `0600`), which the launcher sources on
+  its way to the exec. Secrets never enter a release.
 
 ## Install
 
@@ -94,7 +161,17 @@ curl -fsSL https://github.com/nickbrett1/a2a-goose/releases/latest/download/fetc
   -o "$dir/fetch-launch.sh"
 chmod +x "$dir/fetch-launch.sh"
 
-# 2. The agent, supervised. It starts and supervises goose itself.
+# 2. Wire the fleet into the hand-authored config + env, before first start.
+#    config.yaml and env are yours (deploy/env/*.example are templates);
+#    ensure-hub.sh adds the `hub:` block and the A2A_GOOSE_HUB_TOKEN key only
+#    when they are missing, backs the files up first, and is safe to re-run.
+#    Then paste the real token from Doppler (project goose, config prd) - the
+#    script cannot supply a secret value, only its key.
+deploy/ensure-hub.sh
+
+# 3. The agent, supervised. It starts and supervises goose itself, and the
+#    start above runs the launcher, which fetches the newest release - so the
+#    binary that comes up is one with hub code.
 mkdir -p ~/Library/LaunchAgents ~/Library/Logs/a2a-goose
 cp deploy/launchd/com.nick.a2a-goose.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/"$(id -u)" ~/Library/LaunchAgents/com.nick.a2a-goose.plist
@@ -106,14 +183,19 @@ The plist names `/Users/nick/.local/share/a2a-goose/fetch-launch.sh`; on a host
 with a different user, change that one path in the copy. It must not point back
 at a checkout — a launcher that is a repository file is a launcher that goes
 stale (S11), and the self-update cannot replace a file something else owns.
+Adding a host later is the same steps: edit/enable it, then restart the job so
+the launcher refetches — an edited config alone changes nothing at runtime.
 
 DSM 7, as the user that owns goose:
 
 The task's script is **one line**, not this file's path, and the file lives in a
-*checkout* — the only deployment file that does (the launcher is a release asset,
-S11). Create the boot-up task from the GUI (Control Panel → Task Scheduler →
-Create → Triggered Task, event **Boot-up**, user = the user that owns goose's
-configuration — **not** root) or from the CLI, which is what S8 measured:
+*checkout* — the wrapper and the `ensure-hub.sh` it calls are what live there
+(the launcher is a release asset, S11). `a2a-goose-boot.sh` runs
+`ensure-hub.sh` itself on every start, so on DSM the fleet wiring needs no
+separate step. Create the boot-up task from the GUI (Control Panel → Task
+Scheduler → Create → Triggered Task, event **Boot-up**, user = the user that
+owns goose's configuration — **not** root) or from the CLI, which is what S8
+measured:
 
 ```bash
 sudo /usr/syno/sbin/esynoscheduler --create task_name=a2a-goose event=bootup \

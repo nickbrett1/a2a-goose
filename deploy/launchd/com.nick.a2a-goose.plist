@@ -26,6 +26,31 @@
 
       launchctl bootout gui/"$(id -u)"/com.nick.a2a-goose
 
+  Joining the roost fleet (mission control). A host appears in the fleet only
+  by dialling the hub, which needs a `hub:` block in its config.yaml and
+  A2A_GOOSE_HUB_TOKEN in ENV_FILE. Both files are hand-authored here, so deploy/
+  never regenerates them; ensure-hub.sh only ADDS what is missing and is
+  safe to re-run, as the user that owns goose:
+
+      /path/to/a2a-goose/deploy/ensure-hub.sh
+
+  launchd runs one program and cannot chain, and this unit deliberately has no
+  shell wrapper, so the wiring is a deploy step rather than something this file
+  can do at load. Run it once at install; re-run it after any host rebuild.
+
+  Adding the block is only half of it: the running BINARY must also have hub
+  code, and an old one does not. mac-studio proved the trap - this job ran
+  a2a-goose 0.1.41 (no hub code at all) since 2026-09-17, registered with
+  LiteLLM on every start, and never dialled roost. The restart is what fixes
+  that, because the launcher fetches the newest release on every start:
+
+      kill -TERM <payload pid>     # graceful; KeepAlive relaunches -> fetch-launch -> current release
+      launchctl kickstart gui/"$(id -u)"/com.nick.a2a-goose   # only when the job is already down
+
+  Do NOT use `launchctl kickstart -k`: `-k` is a SIGKILL and orphans the goose
+  child (RUNBOOK.md). Editing the config or env is not a restart and pulls
+  nothing - the job has to come back up for the fetch to run.
+
   There is no ordering dependency on the network. launchd has no
   network-online equivalent, and it does not need one: the launcher fails open
   (hard constraint #13), so a boot with no network installs what is already
