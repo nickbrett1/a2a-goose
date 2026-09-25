@@ -143,6 +143,12 @@ is not a restart and pulls nothing.
   the bind address, and the hub token the fleet needs — lives in `ENV_FILE`
   (`$HOME/.config/a2a-goose/env`, mode `0600`), which the launcher sources on
   its way to the exec. Secrets never enter a release.
+- **No managed `scripts/agent-dev.sh`.** That script belongs to the devcontainer
+  deployment, where it *writes* `env` and `config.yaml`. On a host-process host
+  those files are hand-authored, so the script detects that shape
+  (`is_host_deployed`) and refuses to start, rather than rewrite them. A host
+  running one of these units is started by the unit, never by
+  `agent-dev.sh start`.
 
 ## Install
 
