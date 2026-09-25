@@ -249,32 +249,36 @@ read_provider_secret() {
 # overwrite a working file with emptiness.
 write_env_file() {
   mkdir -p "${CONFIG_DIR}" || return 1
-  local content="" key value
+  # Only fetched SECRETS count towards "did Doppler answer?". GOOSE_DISABLE_KEYRING
+  # below is a constant this script always adds, so it must not be what makes an
+  # empty fetch look like a successful one - that is the difference between
+  # keeping a working file and overwriting it with a stub.
+  local secrets="" key value
   for key in A2A_GOOSE_BEARER_TOKEN A2A_GOOSE_HUB_TOKEN LITELLM_MASTER_KEY LITELLM_BASE_URL GOOSE_SERVER__SECRET_KEY; do
     value="$(read_secret "${key}")"
     if [ -n "${value}" ]; then
-      content="${content}${key}=${value}"$'\n'
+      secrets="${secrets}${key}=${value}"$'\n'
     fi
   done
   # goose's own provider settings, for the goose this script starts.
   for key in GOOSE_PROVIDER GOOSE_MODEL GOOSE_PROVIDER__API_KEY LITELLM_HOST LITELLM_API_KEY; do
     value="$(read_provider_secret "${key}")"
     if [ -n "${value}" ]; then
-      content="${content}${key}=${value}"$'\n'
+      secrets="${secrets}${key}=${value}"$'\n'
     fi
   done
   # There is no keyring in a container, so goose must not go looking for the
   # provider key in one: the env file is the store. An explicit value in the
   # environment wins, so an operator can turn it back on.
-  content="${content}GOOSE_DISABLE_KEYRING=${GOOSE_DISABLE_KEYRING:-1}"$'\n'
+  local content="${secrets}GOOSE_DISABLE_KEYRING=${GOOSE_DISABLE_KEYRING:-1}"$'\n'
   local written="${ENV_FILE}"
-  if [ -z "${content}" ]; then
+  if [ -z "${secrets}" ]; then
     if [ -f "${ENV_FILE}" ]; then
       log "Doppler returned no secrets - keeping the existing ${ENV_FILE}"
       chmod 600 "${ENV_FILE}" 2>/dev/null || true
     else
       umask 077
-      : >"${ENV_FILE}"
+      printf '%s' "${content}" >"${ENV_FILE}"
       chmod 600 "${ENV_FILE}" 2>/dev/null || true
     fi
   else
