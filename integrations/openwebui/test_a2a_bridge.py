@@ -68,7 +68,7 @@ class Answer(unittest.TestCase):
 
     def test_an_unfinished_state_is_named_rather_than_answered_emptily(self):
         # `INPUT_REQUIRED` is actionable and a blank answer is not, so the state
-        # is what the user is shown.
+        # is what the user is shown — as an answer, not an exception.
         payload = {
             "result": {
                 "task": {
@@ -77,9 +77,37 @@ class Answer(unittest.TestCase):
                 }
             }
         }
-        with self.assertRaises(RuntimeError) as caught:
-            Pipe._answer(payload)
-        self.assertIn("TASK_STATE_INPUT_REQUIRED", str(caught.exception))
+        self.assertIn("TASK_STATE_INPUT_REQUIRED", Pipe._answer(payload))
+
+    def test_a_failed_task_renders_immediately_rather_than_raising(self):
+        # A returned task is terminal (`SendMessage` is unary), so a failure is
+        # an answer — "the turn failed: …" — rendered at once, not an error that
+        # leaves the caller waiting out the deadline for a turn already over.
+        payload = {
+            "result": {
+                "task": {
+                    "status": {
+                        "state": "TASK_STATE_FAILED",
+                        "error": "provider returned 500",
+                    },
+                    "artifacts": [],
+                }
+            }
+        }
+        answer = Pipe._answer(payload)
+        self.assertIn("failed", answer.lower())
+        self.assertIn("provider returned 500", answer)
+
+    def test_a_failed_task_with_text_renders_that_text(self):
+        payload = {
+            "result": {
+                "task": {
+                    "status": {"state": "TASK_STATE_FAILED"},
+                    "artifacts": [{"parts": [{"text": "boom"}]}],
+                }
+            }
+        }
+        self.assertEqual(Pipe._answer(payload), "boom")
 
     def test_text_in_a_status_message_is_used_when_there_are_no_artifacts(self):
         payload = {

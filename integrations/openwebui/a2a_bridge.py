@@ -41,9 +41,13 @@ from pydantic import BaseModel, Field
 #     empty `answer` artifact, so the text is collected and filtered rather than
 #     read at a fixed index.
 
-# LiteLLM's route answers `TASK_STATE_COMPLETED` for a good turn; anything else
-# is reported to the user instead of being mistaken for an empty answer.
+# A `SendMessage` is **unary**: the route answers only once the turn has ended,
+# so every task it hands back is already terminal — `TASK_STATE_COMPLETED` and
+# `TASK_STATE_FAILED` alike. Both are rendered and returned at once (the text, or
+# why there is none); a returned task is never treated as "still running", so the
+# bridge cannot sit on `TIMEOUT_SECONDS` waiting for a turn that has arrived.
 COMPLETED = "TASK_STATE_COMPLETED"
+FAILED = "TASK_STATE_FAILED"
 
 # Discovery, and why it is a *manifold*.
 #
@@ -297,14 +301,22 @@ class Pipe:
                 if part.get("text")
             ]
 
-        if state and state != COMPLETED and not texts:
-            # Naming the state is the point: `TASK_STATE_INPUT_REQUIRED` is a
-            # different problem from `TASK_STATE_FAILED`, and the caller can act
-            # on the difference.
-            reason = status.get("error") or status.get("message") or state
-            raise RuntimeError(f"the turn ended {state}: {reason}")
+        if texts:
+            return "\n".join(texts)
 
-        return "\n".join(texts) if texts else ""
+        # No artifact text, but the task is terminal all the same — so say what
+        # happened rather than raising. A raise would surface as an error (not an
+        # answer), and more importantly it would treat a returned task as one
+        # still in flight. Naming the state is the point: `INPUT_REQUIRED` is a
+        # different problem from `FAILED`, and the caller can act on the
+        # difference.
+        if state:
+            reason = status.get("error") or status.get("message") or state
+            if state == FAILED:
+                return f"The turn failed: {reason}"
+            return f"The turn ended {state}: {reason}"
+
+        return ""
 
     @staticmethod
     def _last_user_message(body) -> str:
