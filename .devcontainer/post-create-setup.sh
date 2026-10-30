@@ -175,12 +175,18 @@ fi
 
 
 echo "INFO: Installing Antigravity CLI and Specify CLI..."
+# Node NEVER comes from apt here, even as a last resort. Debian's nodejs ships
+# its own corepack at /usr/share/nodejs/corepack; once that is on PATH, the
+# devcontainer "node" feature's "corepack enable" resolves *that* copy instead
+# of the nvm-bundled one and dies with
+#   EACCES: permission denied, symlink '../share/nodejs/corepack/dist/pnpm.js' -> '/usr/bin/pnpm'
+# which fails the image build. If npm is missing, this session simply does not
+# get the Specify CLI - say so and carry on instead of poisoning the image.
 if ! command -v npm &> /dev/null; then
-    echo "npm not found. Installing nodejs and npm..."
-    sudo apt-get update
-    sudo apt-get install -y nodejs npm
+    echo "WARN: npm not found; skipping the Specify CLI install. Add Node through the devcontainer 'node' feature instead of apt - Debian's nodejs ships an old corepack that breaks the node feature install." >&2
+else
+    sudo npm install -g @specifyapp/cli
 fi
-sudo npm install -g @specifyapp/cli
 curl -fsSL https://antigravity.google/cli/install.sh | bash
 echo "INFO: Antigravity CLI and Specify CLI installation complete."
 

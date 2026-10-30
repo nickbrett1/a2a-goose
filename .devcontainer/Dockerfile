@@ -1,6 +1,16 @@
 FROM mcr.microsoft.com/devcontainers/rust:1-bookworm
+# Node is NOT installed from apt here: devcontainer.json already installs it
+# through the devcontainers "node" feature (nvm). A second, apt-provided Node
+# puts Debian's own corepack at /usr/share/nodejs/corepack, and the feature's
+# `corepack enable` then picks that old corepack up instead of the nvm-bundled
+# one and dies (devcontainer-features-install.sh exit 1) - the whole image
+# build fails:
+#   EACCES: permission denied, symlink '../share/nodejs/corepack/dist/pnpm.js'
+#     -> '/usr/bin/pnpm'
+# The node feature's PATH entry is what makes node/npm available to the
+# post-create scripts, so nothing here needs the apt package.
 RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
-    && apt-get -y install --no-install-recommends git socat curl gnupg nodejs npm openssh-server mosh micro libevent-dev libncurses-dev pkg-config bison build-essential xclip \
+    && apt-get -y install --no-install-recommends git socat curl gnupg openssh-server mosh micro libevent-dev libncurses-dev pkg-config bison build-essential xclip \
     && curl -sLf --retry 3 --tlsv1.2 --proto "=https" 'https://packages.doppler.com/public/cli/gpg.DE2A7741A397C129.key' | gpg --dearmor -o /usr/share/keyrings/doppler-archive-keyring.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/doppler-archive-keyring.gpg] https://packages.doppler.com/public/cli/deb/debian any-version main" | tee /etc/apt/sources.list.d/doppler-cli.list \
     && apt-get update && apt-get install -y doppler
